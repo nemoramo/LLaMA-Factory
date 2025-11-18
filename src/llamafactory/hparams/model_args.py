@@ -358,6 +358,10 @@ class ProcessorArguments:
         default=16000,
         metadata={"help": "The sampling rate of audio inputs."},
     )
+    audio_padding: Literal["max_length", "longest"] = field(
+        default="max_length",
+        metadata={"help": "Padding strategy used by the audio feature extractor."},
+    )
 
     def __post_init__(self):
         if self.image_max_pixels < self.image_min_pixels:
@@ -365,6 +369,9 @@ class ProcessorArguments:
 
         if self.video_max_pixels < self.video_min_pixels:
             raise ValueError("`video_max_pixels` cannot be smaller than `video_min_pixels`.")
+
+        if self.audio_padding not in ["max_length", "longest"]:
+            raise ValueError("`audio_padding` must be either 'max_length' or 'longest'.")
 
 
 @dataclass
