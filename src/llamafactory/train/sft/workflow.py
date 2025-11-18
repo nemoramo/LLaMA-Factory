@@ -77,31 +77,21 @@ def run_sft(
 
     # Keyword arguments for `model.generate`
     gen_kwargs = generating_args.to_dict(obey_generation_config=True)
-    eos_token_ids = set()
+    eos_token_ids: list[int] = []
     if tokenizer.eos_token_id is not None:
-        eos_token_ids.add(tokenizer.eos_token_id)
-
-    stop_words = getattr(template, "stop_words", None) or []
-    for stop_word in stop_words:
-        try:
-            stop_word_id = tokenizer.convert_tokens_to_ids(stop_word)
-        except Exception:  # noqa: BLE001
-            stop_word_id = tokenizer.unk_token_id
-
-        if (
-            stop_word_id is None
-            or stop_word_id < 0
-            or (tokenizer.unk_token_id is not None and stop_word_id == tokenizer.unk_token_id)
-        ):
-            continue
-
-        eos_token_ids.add(stop_word_id)
+        if isinstance(tokenizer.eos_token_id, (list, tuple)):
+            eos_token_ids.extend(int(stop_id) for stop_id in tokenizer.eos_token_id)
+        else:
+            eos_token_ids.append(int(tokenizer.eos_token_id))
 
     if not eos_token_ids:
-        raise ValueError("Cannot determine `eos_token_id` from tokenizer or template stop words.")
+        raise ValueError("Cannot determine `eos_token_id` from tokenizer.")
 
-    gen_kwargs["eos_token_id"] = list(eos_token_ids)
+    gen_kwargs["eos_token_id"] = eos_token_ids
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+    gen_kwargs.setdefault("min_new_tokens", 1)
+    gen_kwargs.setdefault("max_new_tokens", 256)
+    gen_kwargs.setdefault("do_sample", False)
 
     # Initialize our Trainer
     trainer = CustomSeq2SeqTrainer(
