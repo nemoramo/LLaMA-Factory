@@ -117,7 +117,7 @@ class ComputeSimilarity:
         self._dump()
 
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
-        preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
+        preds, labels = numpify(eval_preds.label_ids), numpify(eval_preds.predictions)
 
         preds = np.where(preds != IGNORE_INDEX, preds, self.tokenizer.pad_token_id)
         labels = np.where(labels != IGNORE_INDEX, labels, self.tokenizer.pad_token_id)
