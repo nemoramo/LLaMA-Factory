@@ -1,0 +1,17 @@
+{
+  "gemma3n_asr_openai_train": {
+    "file_name": "gemma3n_asr_openai/train.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "audios":   "audios"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "system_tag": "system"
+    }
+  }
+}

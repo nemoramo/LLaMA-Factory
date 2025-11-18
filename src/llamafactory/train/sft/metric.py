@@ -79,6 +79,7 @@ class ComputeAccuracy:
 
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
         preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
+        setattr(self, "_printed_examples", False)
         for i in range(len(preds)):
             pred, label = preds[i, :-1], labels[i, 1:]
             label_mask = label != IGNORE_INDEX
@@ -129,10 +130,11 @@ class ComputeSimilarity:
         if self.compute_wer_cer and not getattr(self, "_printed_examples", False):
             num_samples = min(3, len(decoded_preds))
             if num_samples > 0:
+                sample_indices = np.random.choice(len(decoded_preds), size=num_samples, replace=False)
                 logger.info_rank0("Sample predictions for WER/CER evaluation:")
-                for i in range(num_samples):
-                    logger.info_rank0(f"[sample {i}] pred : {decoded_preds[i]}")
-                    logger.info_rank0(f"[sample {i}] label: {decoded_labels[i]}")
+                for rank, sample_idx in enumerate(sample_indices):
+                    logger.info_rank0(f"[sample {rank}] pred : {decoded_preds[sample_idx]}")
+                    logger.info_rank0(f"[sample {rank}] label: {decoded_labels[sample_idx]}")
                 self._printed_examples = True
 
         for pred, label in zip(decoded_preds, decoded_labels):
@@ -186,8 +188,8 @@ def _compute_error_rate(reference: list[str], hypothesis: list[str]) -> float:
         for j in range(1, hyp_len + 1):
             cost = 0 if reference[i - 1] == hypothesis[j - 1] else 1
             dp[i][j] = min(
-                dp[i - 1][j] + 1,      # deletion
-                dp[i][j - 1] + 1,      # insertion
+                dp[i - 1][j] + 1,  # deletion
+                dp[i][j - 1] + 1,  # insertion
                 dp[i - 1][j - 1] + cost,  # substitution
             )
 

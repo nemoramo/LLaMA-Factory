@@ -77,7 +77,30 @@ def run_sft(
 
     # Keyword arguments for `model.generate`
     gen_kwargs = generating_args.to_dict(obey_generation_config=True)
-    gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + tokenizer.additional_special_tokens_ids
+    eos_token_ids = set()
+    if tokenizer.eos_token_id is not None:
+        eos_token_ids.add(tokenizer.eos_token_id)
+
+    stop_words = getattr(template, "stop_words", None) or []
+    for stop_word in stop_words:
+        try:
+            stop_word_id = tokenizer.convert_tokens_to_ids(stop_word)
+        except Exception:  # noqa: BLE001
+            stop_word_id = tokenizer.unk_token_id
+
+        if (
+            stop_word_id is None
+            or stop_word_id < 0
+            or (tokenizer.unk_token_id is not None and stop_word_id == tokenizer.unk_token_id)
+        ):
+            continue
+
+        eos_token_ids.add(stop_word_id)
+
+    if not eos_token_ids:
+        raise ValueError("Cannot determine `eos_token_id` from tokenizer or template stop words.")
+
+    gen_kwargs["eos_token_id"] = list(eos_token_ids)
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
 
     # Initialize our Trainer
