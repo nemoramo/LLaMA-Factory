@@ -77,8 +77,21 @@ def run_sft(
 
     # Keyword arguments for `model.generate`
     gen_kwargs = generating_args.to_dict(obey_generation_config=True)
-    gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + tokenizer.additional_special_tokens_ids
+    eos_token_ids: list[int] = []
+    if tokenizer.eos_token_id is not None:
+        if isinstance(tokenizer.eos_token_id, (list, tuple)):
+            eos_token_ids.extend(int(stop_id) for stop_id in tokenizer.eos_token_id)
+        else:
+            eos_token_ids.append(int(tokenizer.eos_token_id))
+
+    if not eos_token_ids:
+        raise ValueError("Cannot determine `eos_token_id` from tokenizer.")
+
+    gen_kwargs["eos_token_id"] = eos_token_ids
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+    gen_kwargs.setdefault("min_new_tokens", 1)
+    gen_kwargs.setdefault("max_new_tokens", 256)
+    gen_kwargs.setdefault("do_sample", False)
 
     # Initialize our Trainer
     trainer = CustomSeq2SeqTrainer(

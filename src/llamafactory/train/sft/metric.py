@@ -26,7 +26,7 @@ from transformers.utils import is_nltk_available
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ...extras.misc import numpify
-from ...extras.packages import is_jieba_available, is_rouge_available
+from ...extras.packages import is_jieba_available, is_jiwer_available, is_rouge_available
 
 
 if TYPE_CHECKING:
@@ -35,6 +35,10 @@ if TYPE_CHECKING:
 
 if is_jieba_available():
     import jieba  # type: ignore
+
+
+if is_jiwer_available():
+    import jiwer  # type: ignore
 
 
 if is_nltk_available():
@@ -79,6 +83,7 @@ class ComputeAccuracy:
 
     def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
         preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
+        setattr(self, "_printed_examples", False)
         for i in range(len(preds)):
             pred, label = preds[i, :-1], labels[i, 1:]
             label_mask = label != IGNORE_INDEX
@@ -129,15 +134,20 @@ class ComputeSimilarity:
         if self.compute_wer_cer and not getattr(self, "_printed_examples", False):
             num_samples = min(3, len(decoded_preds))
             if num_samples > 0:
+                sample_indices = np.random.choice(len(decoded_preds), size=num_samples, replace=False)
                 logger.info_rank0("Sample predictions for WER/CER evaluation:")
-                for i in range(num_samples):
-                    logger.info_rank0(f"[sample {i}] pred : {decoded_preds[i]}")
-                    logger.info_rank0(f"[sample {i}] label: {decoded_labels[i]}")
+                for rank, sample_idx in enumerate(sample_indices):
+                    logger.info_rank0(f"[sample {rank}] pred : {decoded_preds[sample_idx]}")
+                    logger.info_rank0(f"[sample {rank}] label: {decoded_labels[sample_idx]}")
                 self._printed_examples = True
 
         for pred, label in zip(decoded_preds, decoded_labels):
-            hypothesis = list(jieba.cut(pred))
-            reference = list(jieba.cut(label))
+            if is_jieba_available() and (_has_cjk(pred) or _has_cjk(label)):
+                hypothesis = [t for t in jieba.cut(pred) if t.strip()]
+                reference = [t for t in jieba.cut(label) if t.strip()]
+            else:
+                hypothesis = pred.split()
+                reference = label.split()
 
             if len(" ".join(hypothesis).split()) == 0 or len(" ".join(reference).split()) == 0:
                 result = {"rouge-1": {"f": 0.0}, "rouge-2": {"f": 0.0}, "rouge-l": {"f": 0.0}}
@@ -153,10 +163,15 @@ class ComputeSimilarity:
             self.score_dict["bleu-4"].append(round(bleu_score * 100, 4))
 
             if self.compute_wer_cer:
-                # Word Error Rate (WER) based on segmented tokens
-                wer = _compute_error_rate(reference, hypothesis)
-                # Character Error Rate (CER) based on raw characters
-                cer = _compute_error_rate(list(label), list(pred))
+                if is_jiwer_available():
+                    wer = jiwer.wer(" ".join(reference), " ".join(hypothesis))
+                    cer = jiwer.cer(" ".join(list(label)), " ".join(list(pred)))
+                else:
+                    # Word Error Rate (WER) based on segmented tokens
+                    wer = _compute_error_rate(reference, hypothesis)
+                    # Character Error Rate (CER) based on raw characters
+                    cer = _compute_error_rate(list(label), list(pred))
+
                 self.score_dict["wer"].append(round(wer * 100, 4))
                 self.score_dict["cer"].append(round(cer * 100, 4))
 
@@ -186,9 +201,16 @@ def _compute_error_rate(reference: list[str], hypothesis: list[str]) -> float:
         for j in range(1, hyp_len + 1):
             cost = 0 if reference[i - 1] == hypothesis[j - 1] else 1
             dp[i][j] = min(
-                dp[i - 1][j] + 1,      # deletion
-                dp[i][j - 1] + 1,      # insertion
+                dp[i - 1][j] + 1,  # deletion
+                dp[i][j - 1] + 1,  # insertion
                 dp[i - 1][j - 1] + cost,  # substitution
             )
 
     return float(dp[ref_len][hyp_len]) / float(ref_len)
+
+
+def _has_cjk(text: str) -> bool:
+    for char in text:
+        if "\u4e00" <= char <= "\u9fff":
+            return True
+    return False

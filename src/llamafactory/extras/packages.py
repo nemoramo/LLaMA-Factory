@@ -106,6 +106,10 @@ def is_starlette_available():
     return _is_package_available("sse_starlette")
 
 
+def is_jiwer_available():
+    return _is_package_available("jiwer")
+
+
 @lru_cache
 def is_transformers_version_greater_than(content: str):
     return _get_package_version("transformers") >= version.parse(content)

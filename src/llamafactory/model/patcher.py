@@ -87,6 +87,7 @@ def patch_processor(
     setattr(processor, "video_maxlen", model_args.video_maxlen)
     setattr(processor, "use_audio_in_video", model_args.use_audio_in_video)
     setattr(processor, "audio_sampling_rate", model_args.audio_sampling_rate)
+    setattr(processor, "audio_padding", model_args.audio_padding)
 
 
 def patch_config(

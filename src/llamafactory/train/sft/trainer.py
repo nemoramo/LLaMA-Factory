@@ -177,3 +177,36 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         with open(output_prediction_file, "w", encoding="utf-8") as f:
             for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
+
+    @override
+    def evaluate(
+        self,
+        eval_dataset: Optional["Dataset"] = None,
+        ignore_keys: Optional[list[str]] = None,
+        metric_key_prefix: str = "eval",
+        **gen_kwargs,
+    ) -> dict[str, float]:
+        r"""Overridden to set padding side to left during generation."""
+        if self.args.predict_with_generate:
+            original_padding_side = self.processing_class.padding_side
+            self.processing_class.padding_side = "left"
+
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if (
+            self.args.predict_with_generate
+            and self.finetuning_args.eval_num_samples is not None
+            and eval_dataset is not None
+        ):
+            if self.finetuning_args.eval_num_samples < len(eval_dataset):
+                # Randomly sample a subset of the evaluation dataset
+                # Use a fixed generator to ensure the same subset is used for every evaluation
+                rng = np.random.default_rng(self.args.seed)
+                eval_dataset = eval_dataset.select(
+                    rng.choice(len(eval_dataset), self.finetuning_args.eval_num_samples, replace=False)
+                )
+
+        try:
+            return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+        finally:
+            if self.args.predict_with_generate:
+                self.processing_class.padding_side = original_padding_side

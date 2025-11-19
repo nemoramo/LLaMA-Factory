@@ -540,16 +540,18 @@ class MMPluginMixin:
 
         if len(audios) != 0:
             feature_extractor: SequenceFeatureExtractor = getattr(processor, "feature_extractor", None)
+            audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
+            audio_padding = getattr(processor, "audio_padding", "max_length")
             audios = self._regularize_audios(
                 audios,
-                sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                sampling_rate=audio_sampling_rate,
             )["audios"]
             mm_inputs.update(
                 feature_extractor(
                     audios,
-                    sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                    sampling_rate=audio_sampling_rate,
                     return_attention_mask=True,
-                    padding="max_length",
+                    padding=audio_padding,
                     return_tensors="pt",
                 )
             )
@@ -1994,16 +1996,18 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
             )
 
         if len(audios) != 0:
+            audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
+            audio_padding = getattr(processor, "audio_padding", "max_length")
             audios = self._regularize_audios(
                 audios,
-                sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                sampling_rate=audio_sampling_rate,
             )["audios"]
             mm_inputs.update(
                 feature_extractor(
                     audios,
-                    sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                    sampling_rate=audio_sampling_rate,
                     return_attention_mask=True,
-                    padding="max_length",
+                    padding=audio_padding,
                     return_tensors="pt",
                 )
             )

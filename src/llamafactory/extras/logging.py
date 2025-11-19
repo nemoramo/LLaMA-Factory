@@ -70,11 +70,17 @@ class _Logger(logging.Logger):
     def info_rank0(self, *args, **kwargs) -> None:
         self.info(*args, **kwargs)
 
+    def debug_rank0(self, *args, **kwargs) -> None:
+        self.debug(*args, **kwargs)
+
     def warning_rank0(self, *args, **kwargs) -> None:
         self.warning(*args, **kwargs)
 
     def warning_rank0_once(self, *args, **kwargs) -> None:
         self.warning(*args, **kwargs)
+
+    def debug_rank0_once(self, *args, **kwargs) -> None:
+        self.debug(*args, **kwargs)
 
 
 def _get_default_logging_level() -> "logging._Level":
@@ -154,6 +160,19 @@ def warning_rank0_once(self: "logging.Logger", *args, **kwargs) -> None:
         self.warning(*args, **kwargs)
 
 
+def debug_rank0(self: "logging.Logger", *args, **kwargs) -> None:
+    if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        self.debug(*args, **kwargs)
+
+
+@lru_cache(None)
+def debug_rank0_once(self: "logging.Logger", *args, **kwargs) -> None:
+    if int(os.getenv("LOCAL_RANK", "0")) == 0:
+        self.debug(*args, **kwargs)
+
+
 logging.Logger.info_rank0 = info_rank0
 logging.Logger.warning_rank0 = warning_rank0
 logging.Logger.warning_rank0_once = warning_rank0_once
+logging.Logger.debug_rank0 = debug_rank0
+logging.Logger.debug_rank0_once = debug_rank0_once

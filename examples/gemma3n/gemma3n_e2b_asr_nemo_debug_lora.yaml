@@ -6,15 +6,26 @@ finetuning_type: lora
 
 trust_remote_code: true
 
-torch_dtype: bfloat16
+do_sample: false
+temperature: 0.0
+top_p: 1.0
+num_beams: 1
+max_new_tokens: 256
+
+bf16: true
 flash_attn: auto
+do_train: true
+
+freeze_vision_tower: false # 允许在 vision_tower + audio_tower 上挂 LoRA
+freeze_multi_modal_projector: false
 
 ### data
 dataset: gemma3n_asr_nemo_train # 对应 data/dataset_info.json 的 key
-dataset_dir: ./data
-val_size: 0.01 # 随机抽 1% 做验证
+eval_dataset: gemma3n_asr_nemo_dev
+dataset_dir: /home/sagemaker-user/llama_data/
+val_size: 0.0 # 随机抽 1% 做验证
 cutoff_len: 1024 # 音频转写 1-30s + 简单 prompt，1024 足够
-max_samples: 2000 # 单卡 debug：最多用 2000 条样本；后面全量可以去掉这个限制
+# max_samples: 2000 # 单卡 debug：最多用 2000 条样本；后面全量可以去掉这个限制
 overwrite_cache: true
 preprocessing_num_workers: 8
 dataloader_num_workers: 4
@@ -25,15 +36,32 @@ packing: false # audio 场景不要 pack，避免多个 <audio> 串在一起
 lora_rank: 16 # debug 可以小一点
 lora_alpha: 32
 lora_dropout: 0.05
-lora_target: all # 先简单 all，后面可以精简到 q_proj,k_proj,v_proj,o_proj 等
+lora_target:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - subsample_conv_projection.input_proj_linear
+  - ffw_layer_start.ffw_layer_1
+  - ffw_layer_start.ffw_layer_2
+  - ffw_layer_end.ffw_layer_1
+  - ffw_layer_end.ffw_layer_2
+  - attention.attn.q_proj
+  - attention.attn.k_proj
+  - attention.attn.v_proj
+  # - attention.post
+  - lconv1d.linear_start
+  - lconv1d.linear_end
+  # - lconv1d.depthwise_conv1d
+  - embed_audio.embedding_projection
 
 ### training
 output_dir: saves/gemma3n-e2b-asr-nemo/lora_debug
 overwrite_output_dir: true
 
 # 单卡快速 debug，用 max_steps 限制训练步数
-max_steps: 200
-num_train_epochs: 1.0 # 和 max_steps 二者取其一生效，保留 1.0 也没问题
+# max_steps: 600
+num_train_epochs: 2.0 # 和 max_steps 二者取其一生效，保留 1.0 也没问题
 
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1
@@ -45,13 +73,13 @@ warmup_ratio: 0.03
 weight_decay: 0.01
 adam_beta2: 0.95
 max_grad_norm: 1.0
-gradient_checkpointing: true
+gradient_checkpointing: false
 
 logging_steps: 10
 eval_strategy: steps
-evaluation_strategy: steps # 兼容老字段
+# evaluation_strategy: steps # 兼容老字段
 eval_steps: 100
-save_steps: 200
+save_steps: 1000
 save_total_limit: 2
 load_best_model_at_end: false # debug 阶段无所谓 best model
 

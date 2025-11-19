@@ -526,6 +526,14 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
+    eval_num_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "Maximum number of samples to use for evaluation."},
+    )
+    eval_max_new_tokens: Optional[int] = field(
+        default=None,
+        metadata={"help": "Maximum number of new tokens to generate for evaluation."},
+    )
 
     def __post_init__(self):
         def split_arg(arg):
