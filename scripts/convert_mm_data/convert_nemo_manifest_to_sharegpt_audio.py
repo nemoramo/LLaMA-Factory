@@ -27,9 +27,6 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from botocore.utils import S3_ACCELERATE_WHITELIST
-from huggingface_hub.inference._generated.types.audio_classification import AudioClassificationOutputTransform
-
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -94,6 +91,8 @@ def convert_manifest(
     n_in = 0
     n_out = 0
 
+    prefix = "" if s3_prefix is None else str(s3_prefix)
+
     with open(input_path, "r", encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
         for line in fin:
             line = line.strip()
@@ -107,13 +106,15 @@ def convert_manifest(
                 print(f"[WARN] 跳过无法解析的行 {n_in}: {e}")
                 continue
 
-            audio_path = obj.get(audio_key)
-            audio_path = s3_prefix + audio_path.strip()
+            raw_audio_path = obj.get(audio_key)
+            audio_path = raw_audio_path.strip() if isinstance(raw_audio_path, str) else None
             text = obj.get(text_key)
 
             if not audio_path or not text:
                 # 没有音频或没有文本的样本直接丢弃
                 continue
+
+            audio_path = prefix + audio_path
 
             sample = {
                 "messages": [
