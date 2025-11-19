@@ -18,6 +18,8 @@
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
+import re
+import string
 
 import numpy as np
 import torch
@@ -165,14 +167,24 @@ class ComputeSimilarity:
             self.score_dict["bleu-4"].append(round(bleu_score * 100, 4))
 
             if self.compute_wer_cer:
+                pred_norm = _normalize_text(pred)
+                label_norm = _normalize_text(label)
+
+                if is_jieba_available() and (_has_cjk(pred_norm) or _has_cjk(label_norm)):
+                    hypothesis_wer = [t for t in jieba.cut(pred_norm) if t.strip()]
+                    reference_wer = [t for t in jieba.cut(label_norm) if t.strip()]
+                else:
+                    hypothesis_wer = pred_norm.split()
+                    reference_wer = label_norm.split()
+
                 if is_jiwer_available():
-                    wer = jiwer.wer(" ".join(reference), " ".join(hypothesis))
-                    cer = jiwer.cer(" ".join(list(label)), " ".join(list(pred)))
+                    wer = jiwer.wer(" ".join(reference_wer), " ".join(hypothesis_wer))
+                    cer = jiwer.cer(" ".join(list(label_norm)), " ".join(list(pred_norm)))
                 else:
                     # Word Error Rate (WER) based on segmented tokens
-                    wer = _compute_error_rate(reference, hypothesis)
+                    wer = _compute_error_rate(reference_wer, hypothesis_wer)
                     # Character Error Rate (CER) based on raw characters
-                    cer = _compute_error_rate(list(label), list(pred))
+                    cer = _compute_error_rate(list(label_norm), list(pred_norm))
 
                 self.score_dict["wer"].append(round(wer * 100, 4))
                 self.score_dict["cer"].append(round(cer * 100, 4))
@@ -216,3 +228,12 @@ def _has_cjk(text: str) -> bool:
         if "\u4e00" <= char <= "\u9fff":
             return True
     return False
+
+
+def _normalize_text(text: str) -> str:
+    regex = r"(?<!\d)[.,;:'\"?!](?!\d)"
+    text = re.sub(regex, "", text)
+    text = text.lower()
+    # text = text.translate(str.maketrans("", "", string.punctuation))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
