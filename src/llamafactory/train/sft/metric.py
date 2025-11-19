@@ -116,6 +116,8 @@ class ComputeSimilarity:
         if getattr(self, "compute_wer_cer", False):
             self.score_dict["wer"] = []
             self.score_dict["cer"] = []
+
+        self._printed_examples = False
         return result
 
     def __post_init__(self):
