@@ -530,10 +530,6 @@ class FinetuningArguments(
         default=None,
         metadata={"help": "Maximum number of samples to use for evaluation."},
     )
-    eval_num_beams: Optional[int] = field(
-        default=None,
-        metadata={"help": "Number of beams to use for evaluation. This argument will be passed to `model.generate`"},
-    )
     eval_max_new_tokens: Optional[int] = field(
         default=None,
         metadata={"help": "Maximum number of new tokens to generate for evaluation."},
