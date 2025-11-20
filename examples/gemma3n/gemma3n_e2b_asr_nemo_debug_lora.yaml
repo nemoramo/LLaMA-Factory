@@ -10,7 +10,7 @@ do_sample: false
 temperature: 0.0
 top_p: 1.0
 num_beams: 1
-max_new_tokens: 256
+max_new_tokens: 64
 
 bf16: true
 flash_attn: auto
@@ -24,7 +24,7 @@ dataset: gemma3n_asr_nemo_train
 eval_dataset: gemma3n_asr_nemo_dev
 dataset_dir: /home/sagemaker-user/llama_data/
 val_size: 0.0
-cutoff_len: 1024
+cutoff_len: 512
 overwrite_cache: true
 preprocessing_num_workers: 8
 dataloader_num_workers: 4
@@ -43,8 +43,8 @@ lora_target:
   - v_proj
   - o_proj
   - gate_proj
-  - up_proj
-  - down_proj
+  # - up_proj
+  # - down_proj
 
 # 额外全参子模块：HF 结构中的 audio_tower + multi_modal_projector
 # 建议写成逗号分隔的字符串（与官方参数说明完全一致）
@@ -56,7 +56,7 @@ overwrite_output_dir: true
 
 num_train_epochs: 2.0
 
-per_device_train_batch_size: 1
+per_device_train_batch_size: 2
 per_device_eval_batch_size: 1
 gradient_accumulation_steps: 8
 
@@ -70,7 +70,7 @@ gradient_checkpointing: false
 
 logging_steps: 10
 eval_strategy: steps
-eval_steps: 100
+eval_steps: 10
 save_steps: 1000
 save_total_limit: 2
 load_best_model_at_end: false
@@ -81,3 +81,4 @@ ddp_find_unused_parameters: false
 seed: 42
 report_to: tensorboard
 audio_padding: longest
+eval_num_samples: 10
