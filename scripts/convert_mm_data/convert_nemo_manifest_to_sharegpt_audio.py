@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prompt",
         type=str,
-        default="请逐字转写下面这段语音，不要额外说明，只输出文本：<audio>",
+        default="Transcribe the audio verbatim. Do not add any commentary. Only output the text: <audio>",
         help="user 侧的指令模板，必须包含 <audio> 占位符",
     )
     p.add_argument(
