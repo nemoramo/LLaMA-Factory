@@ -16,8 +16,8 @@ bf16: true
 flash_attn: auto
 do_train: true
 
-freeze_vision_tower: false           # 允许 vision/audio 上挂 LoRA 或全参
-freeze_multi_modal_projector: false  # 同上
+freeze_vision_tower: true            # 防止 LoRA 命中 audio/vision 分支，保持它们全参
+freeze_multi_modal_projector: true  # projector 仍然全参
 
 ### data
 dataset: gemma3n_asr_nemo_train
@@ -80,3 +80,4 @@ ddp_find_unused_parameters: false
 
 seed: 42
 report_to: tensorboard
+audio_padding: longest

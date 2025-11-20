@@ -257,6 +257,10 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
         for key, value in features.items():  # cast data dtype for paligemma
             if torch.is_tensor(value) and torch.is_floating_point(value):
                 features[key] = value.to(self.compute_dtype)
+            elif isinstance(value, list):
+                features[key] = [
+                    v.to(self.compute_dtype) if torch.is_tensor(v) and torch.is_floating_point(v) else v for v in value
+                ]
 
         return features
 
