@@ -52,6 +52,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         finetuning_args: "FinetuningArguments",
         processor: Optional["ProcessorMixin"],
         model_args: Optional["ModelArguments"] = None,
+        eval_data_collator: Optional[Any] = None,
         gen_kwargs: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> None:
@@ -63,6 +64,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         else:
             self.processing_class: PreTrainedTokenizer = kwargs.get("tokenizer")
 
+        self.eval_data_collator = eval_data_collator
         super().__init__(**kwargs)
         if processor is not None:
             # avoid wrong loss under gradient accumulation
@@ -111,6 +113,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return torch.utils.data.SequentialSampler(self.train_dataset)
 
         return super()._get_train_sampler(*args, **kwargs)
+
+    @override
+    def get_eval_dataloader(self, eval_dataset: Optional["Dataset"] = None):
+        if self.eval_data_collator is None or self.eval_data_collator is self.data_collator:
+            return super().get_eval_dataloader(eval_dataset)
+
+        original_data_collator = self.data_collator
+        self.data_collator = self.eval_data_collator
+        try:
+            return super().get_eval_dataloader(eval_dataset)
+        finally:
+            self.data_collator = original_data_collator
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
@@ -186,11 +200,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         metric_key_prefix: str = "eval",
         **gen_kwargs,
     ) -> dict[str, float]:
-        r"""Overridden to set padding side to left during generation."""
-        if self.args.predict_with_generate:
-            original_padding_side = self.processing_class.padding_side
-            self.processing_class.padding_side = "left"
-
+        r"""Overridden to support eval sampling when predict_with_generate."""
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if (
             self.args.predict_with_generate
@@ -205,8 +215,4 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     rng.choice(len(eval_dataset), self.finetuning_args.eval_num_samples, replace=False)
                 )
 
-        try:
-            return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
-        finally:
-            if self.args.predict_with_generate:
-                self.processing_class.padding_side = original_padding_side
+        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)

@@ -54,16 +54,17 @@ def run_sft(
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)  # hack here: make model compatible with prediction
 
-    data_collator = SFTDataCollatorWith4DAttentionMask(
+    collator_kwargs = dict(
         template=template,
         model=model if not training_args.predict_with_generate else None,
-        pad_to_multiple_of=8 if training_args.do_train else None,  # for shift short attention
         label_pad_token_id=IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
         block_diag_attn=model_args.block_diag_attn,
         attn_implementation=getattr(model.config, "_attn_implementation", None),
         compute_dtype=model_args.compute_dtype,
         **tokenizer_module,
     )
+    train_data_collator = SFTDataCollatorWith4DAttentionMask(pad_to_multiple_of=8, **collator_kwargs)  # for shift short attention
+    eval_data_collator = SFTDataCollatorWith4DAttentionMask(pad_to_multiple_of=None, **collator_kwargs)
 
     # Metric utils
     metric_module = {}
@@ -98,7 +99,8 @@ def run_sft(
         model=model,
         args=training_args,
         finetuning_args=finetuning_args,
-        data_collator=data_collator,
+        data_collator=train_data_collator if training_args.do_train else eval_data_collator,
+        eval_data_collator=eval_data_collator,
         callbacks=callbacks,
         gen_kwargs=gen_kwargs,
         **dataset_module,
@@ -128,9 +130,6 @@ def run_sft(
                 keys += ["eval_loss", "eval_accuracy"]
 
             plot_loss(training_args.output_dir, keys=keys)
-
-    if training_args.predict_with_generate:
-        tokenizer.padding_side = "left"  # use left-padding in generation
 
     # Evaluation
     if training_args.do_eval:
