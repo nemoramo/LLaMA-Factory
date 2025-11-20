@@ -136,7 +136,7 @@ class ComputeSimilarity:
 
         # Log a few sample prediction/label pairs during evaluation for debugging.
         if self.compute_wer_cer and not getattr(self, "_printed_examples", False):
-            num_samples = min(3, len(decoded_preds))
+            num_samples = min(10, len(decoded_preds))
             if num_samples > 0:
                 sample_indices = np.random.choice(len(decoded_preds), size=num_samples, replace=False)
                 logger.info_rank0("Sample predictions for WER/CER evaluation:")

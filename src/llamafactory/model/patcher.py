@@ -34,7 +34,7 @@ from .model_utils.packing import configure_packing
 from .model_utils.quantization import configure_quantization
 from .model_utils.rope import configure_rope
 from .model_utils.valuehead import prepare_valuehead_model
-from .model_utils.visual import autocast_projector_dtype, configure_visual_model
+from .model_utils.visual import autocast_projector_dtype, cast_gemma3n_audio_outputs, configure_visual_model
 
 
 if TYPE_CHECKING:
@@ -202,6 +202,7 @@ def patch_model(
 
         prepare_model_for_training(model, model_args)
         autocast_projector_dtype(model, model_args)
+        cast_gemma3n_audio_outputs(model, model_args)
         add_z3_leaf_module(model)
 
     if not model_args.use_unsloth:

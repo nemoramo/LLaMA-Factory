@@ -145,6 +145,39 @@ def autocast_projector_dtype(model: "PreTrainedModel", model_args: "ModelArgumen
         mm_projector.register_forward_hook(_mm_projector_forward_post_hook)
 
 
+def cast_gemma3n_audio_outputs(model: "PreTrainedModel", model_args: "ModelArguments") -> None:
+    r"""
+    Casts audio tower outputs to model dtype for Gemma 3n.
+    """
+    if getattr(model.config, "model_type", None) != "gemma3n":
+        return
+
+    def _audio_tower_forward_post_hook(
+        module: "torch.nn.Module", args: tuple["torch.Tensor"], output: "torch.Tensor"
+    ) -> "torch.Tensor":
+        if isinstance(output, torch.Tensor):
+            return output.to(model_args.compute_dtype)
+        elif isinstance(output, tuple):
+            return tuple(
+                t.to(model_args.compute_dtype) if isinstance(t, torch.Tensor) and t.is_floating_point() else t
+                for t in output
+            )
+        return output
+
+    base_model = model.get_base_model() if hasattr(model, "get_base_model") else model
+
+    # Check for audio_tower in common locations
+    audio_tower = None
+    if hasattr(base_model, "audio_tower"):
+        audio_tower = base_model.audio_tower
+    elif hasattr(base_model, "model") and hasattr(base_model.model, "audio_tower"):
+        audio_tower = base_model.model.audio_tower
+
+    if audio_tower is not None:
+        logger.info_rank0(f"Casting audio tower outputs in {model_args.compute_dtype}.")
+        audio_tower.register_forward_hook(_audio_tower_forward_post_hook)
+
+
 def configure_visual_model(config: "PretrainedConfig") -> None:
     r"""Patch VLMs before loading them."""
     if getattr(config, "text_config", None) and not getattr(config, "hidden_size", None):

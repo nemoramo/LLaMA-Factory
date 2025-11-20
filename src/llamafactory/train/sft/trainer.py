@@ -200,7 +200,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         metric_key_prefix: str = "eval",
         **gen_kwargs,
     ) -> dict[str, float]:
-        r"""Overridden to support eval sampling when predict_with_generate."""
+        r"""Overridden to support eval sampling when predict_with_generate and restore left padding for eval."""
+        set_left_padding = self.args.predict_with_generate and hasattr(self, "processing_class")
+        if set_left_padding:
+            original_padding_side = self.processing_class.padding_side
+            self.processing_class.padding_side = "left"
+
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if (
             self.args.predict_with_generate
@@ -215,4 +220,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     rng.choice(len(eval_dataset), self.finetuning_args.eval_num_samples, replace=False)
                 )
 
-        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+        try:
+            return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+        finally:
+            if set_left_padding:
+                self.processing_class.padding_side = original_padding_side
