@@ -32,6 +32,7 @@ from .processor import (
     SupervisedDatasetProcessor,
     UnsupervisedDatasetProcessor,
 )
+from .processor.dynamic_prompt import DynamicPromptDataset
 
 
 if TYPE_CHECKING:
@@ -240,6 +241,17 @@ def _get_preprocessed_dataset(
     if dataset is None:
         return None
 
+    if (
+        data_args.dynamic_prompt_sampling
+        and stage == "sft"
+        and not data_args.packing
+        and not is_eval
+    ):
+        if data_args.streaming:
+            raise ValueError("Dynamic prompt sampling does not support streaming datasets.")
+        logger.info_rank0("Dynamic prompt sampling enabled: skip tokenization for training dataset.")
+        return dataset
+
     dataset_processor = _get_dataset_processor(
         data_args, stage, template, tokenizer, processor, do_generate=(training_args.predict_with_generate and is_eval)
     )
@@ -325,10 +337,61 @@ def get_dataset(
             )
 
         dataset_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
-        if data_args.tokenized_path is not None:  # save tokenized dataset to disk
+
+        # In dynamic prompt sampling mode, train_dataset stays aligned/raw.
+        # If validation split is derived from train_dataset (val_size),
+        # it must be tokenized explicitly for evaluation.
+        if (
+            data_args.dynamic_prompt_sampling
+            and stage == "sft"
+            and not data_args.packing
+            and not data_args.streaming
+        ):
+            # Be robust to different split names returned by split_dataset().
+            val_key = None
+            for k in ("validation", "eval", "dev", "test"):
+                if k in dataset_dict:
+                    val_key = k
+                    break
+            if val_key is None:
+                for k in dataset_dict.keys():
+                    if k.startswith("validation_"):
+                        val_key = k
+                        break
+
+            if val_key is not None:
+                val_ds = dataset_dict[val_key]
+                col_names = getattr(val_ds, "column_names", None)
+                if isinstance(col_names, (list, tuple)) and "input_ids" not in col_names:
+                    logger.info_rank0(f"Dynamic prompt sampling enabled: tokenizing {val_key} split.")
+                    dataset_dict[val_key] = _get_preprocessed_dataset(
+                        val_ds,
+                        data_args=data_args,
+                        training_args=training_args,
+                        stage=stage,
+                        template=template,
+                        tokenizer=tokenizer,
+                        processor=processor,
+                        is_eval=True,
+                    )
+        if data_args.tokenized_path is not None and not data_args.dynamic_prompt_sampling:  # save tokenized dataset to disk
             if training_args.should_save:
                 dataset_dict.save_to_disk(data_args.tokenized_path)
                 logger.info_rank0(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
                 logger.info_rank0(f"Please launch the training with `tokenized_path: {data_args.tokenized_path}`.")
 
-        return get_dataset_module(dataset_dict)
+        dataset_module = get_dataset_module(dataset_dict)
+        if (
+            data_args.dynamic_prompt_sampling
+            and stage == "sft"
+            and not data_args.packing
+            and not data_args.streaming
+        ):
+            train_ds = dataset_module.get("train_dataset")
+            if train_ds is not None:
+                dataset_module["train_dataset"] = DynamicPromptDataset(
+                    train_ds, template=template, tokenizer=tokenizer, processor=processor, data_args=data_args, seed=training_args.seed
+                )
+                logger.info_rank0("Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling.")
+
+        return dataset_module

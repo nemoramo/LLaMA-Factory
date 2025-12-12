@@ -137,6 +137,16 @@ class DataArguments:
         default=False,
         metadata={"help": "Whether or not to use a shared file system for the datasets."},
     )
+    dynamic_prompt_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable dynamic prompt sampling at training time (SFT only, no packing). "
+                "If a sample provides `prompt_pool`, one entry is chosen randomly per access and "
+                "appended to the last user prompt; otherwise falls back to the existing prompt."
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):
