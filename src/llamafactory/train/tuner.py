@@ -14,6 +14,8 @@
 
 import os
 import shutil
+import sys
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -49,10 +51,29 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _save_training_command(args: Any, training_args: "TrainingArguments") -> None:
+    """Save the current training command into output_dir for reproducibility."""
+    if not getattr(training_args, "should_save", False):
+        return
+
+    try:
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        cmd_path = os.path.join(training_args.output_dir, "training_command.txt")
+        command_line = " ".join(sys.argv)
+        with open(cmd_path, "w", encoding="utf-8") as f:
+            f.write(f"# Saved at {datetime.utcnow().isoformat()}Z\n")
+            f.write(command_line + "\n")
+        logger.info_rank0(f"Training command saved to {cmd_path}.")
+    except Exception as e:  # noqa: BLE001
+        logger.warning_rank0(f"Failed to save training command: {e}.")
+
+
 def _training_function(config: dict[str, Any]) -> None:
     args = config.get("args")
     callbacks: list[Any] = config.get("callbacks")
     model_args, data_args, training_args, finetuning_args, generating_args = get_train_args(args)
+
+    _save_training_command(args, training_args)
 
     callbacks.append(LogCallback())
     if finetuning_args.pissa_convert:
