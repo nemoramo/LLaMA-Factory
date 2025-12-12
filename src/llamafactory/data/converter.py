@@ -126,6 +126,8 @@ class AlpacaDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }
+        if "prompt_pool" in example and example["prompt_pool"]:
+            output["_prompt_pool"] = example["prompt_pool"]
         return output
 
 
@@ -222,6 +224,8 @@ class SharegptDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }
+        if "prompt_pool" in example and example["prompt_pool"]:
+            output["_prompt_pool"] = example["prompt_pool"]
         return output
 
 
@@ -362,6 +366,8 @@ class OpenAIDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }
+        if "prompt_pool" in example and example["prompt_pool"]:
+            output["_prompt_pool"] = example["prompt_pool"]
         return output
 
 

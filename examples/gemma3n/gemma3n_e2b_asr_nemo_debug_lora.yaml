@@ -30,6 +30,7 @@ preprocessing_num_workers: 8
 dataloader_num_workers: 4
 train_on_prompt: false
 packing: false
+dynamic_prompt_sampling: true
 
 ### lora
 lora_rank: 16
