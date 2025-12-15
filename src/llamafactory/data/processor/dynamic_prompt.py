@@ -4,7 +4,7 @@ import copy
 import hashlib
 import math
 import random
-from typing import Any, Optional, Sequence
+from typing import Any, Sequence
 
 import torch
 from torch.utils.data import Dataset, get_worker_info
@@ -44,14 +44,14 @@ class DynamicPromptDataset(Dataset):
         tokenizer,
         processor,
         data_args,
-        seed: Optional[int] = None,
+        seed: int | None = None,
     ) -> None:
         self.dataset = dataset
         self.data_args = data_args
 
         # RNG is created lazily and seeded per worker/rank to avoid identical sampling streams.
         self._base_seed = seed
-        self._rng: Optional[random.Random] = None
+        self._rng: random.Random | None = None
         self._rng_seeded: bool = False
 
         # Reuse the supervised processor for encoding logic.

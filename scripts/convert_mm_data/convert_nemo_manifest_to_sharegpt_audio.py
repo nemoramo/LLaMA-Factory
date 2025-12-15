@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-把 NeMo manifest (audio_filepath + text/original_text) 转成给 LLaMA-Factory 训练用的
-“OpenAI messages + audios” 格式，并可选生成 `prompt_pool` 以支持训练时动态采样：
+将 NeMo manifest (audio_filepath + text/original_text) 转为 LLaMA-Factory 训练用的 “OpenAI messages + audios” 格式.
+
+并可选生成 `prompt_pool` 以支持训练时动态采样：
 
 输入 (jsonl，每行 NeMo manifest)：
   {"audio_filepath": "...", "text": "...", "original_text": "...", "lang": "..."}

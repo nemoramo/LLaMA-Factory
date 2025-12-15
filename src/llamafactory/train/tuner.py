@@ -47,6 +47,8 @@ if is_ray_available():
 if TYPE_CHECKING:
     from transformers import TrainerCallback
 
+    from ..hparams import TrainingArguments
+
 
 logger = logging.get_logger(__name__)
 
