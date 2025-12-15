@@ -347,6 +347,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 sampled_dataset = eval_dataset.select(
                     rng.choice(len(eval_dataset), self.finetuning_args.eval_num_samples, replace=False)
                 )
+                logger.info_rank0(
+                    f"Evaluation: `{metric_key_prefix}_loss` computed on full dataset (n={len(eval_dataset)}); "
+                    f"generative metrics computed on subset (n={len(sampled_dataset)})."
+                )
                 gen_metrics = super().evaluate(sampled_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
 
                 # Merge: keep full loss, keep generative metrics from subset.
@@ -354,6 +358,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 loss_key = f"{metric_key_prefix}_loss"
                 if loss_key in loss_metrics:
                     merged[loss_key] = loss_metrics[loss_key]
+
+                # Expose full-eval runtime stats to avoid confusion (Phase 2 runs on subset).
+                for suffix in ("runtime", "samples_per_second", "steps_per_second"):
+                    k = f"{metric_key_prefix}_{suffix}"
+                    if k in loss_metrics:
+                        merged[f"{k}_full"] = loss_metrics[k]
                 return merged
 
             # Default behavior: either evaluate on full set, or sample everything together.

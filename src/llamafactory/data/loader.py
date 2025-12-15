@@ -49,6 +49,78 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+class _LazyAlignTransform:
+    """A picklable callable transform for HF `Dataset.with_transform(...)`.
+
+    Must correctly handle:
+      - single example access: dict of scalars/structures
+      - batched access: dict of lists/arrays (e.g. slicing)
+
+    Notes:
+      - `datasets.Dataset.with_transform` usually calls the transform with batched inputs (even for single index),
+        but we keep this robust to single-example dicts to avoid subtle format-dependent bugs.
+    """
+
+    def __init__(self, dataset_converter: Any, id_key: Optional[str]) -> None:
+        self.dataset_converter = dataset_converter
+        self.id_key = id_key
+
+    @staticmethod
+    def _is_batched_examples(examples: dict[str, Any]) -> tuple[bool, int]:
+        """Heuristically detect dict-of-lists/arrays batch input.
+
+        Consider it batched if all values are list/tuple/np.ndarray with the same length.
+        This avoids mis-detecting single examples that contain list fields (e.g. sharegpt conversations),
+        as long as there exists at least one non-list column (common case).
+        """
+        batch_size: Optional[int] = None
+        for v in examples.values():
+            if isinstance(v, np.ndarray):
+                if v.ndim == 0:
+                    return False, 1
+                n = len(v)
+            elif isinstance(v, (list, tuple)):
+                n = len(v)
+            else:
+                return False, 1
+
+            if batch_size is None:
+                batch_size = n
+            elif n != batch_size:
+                return False, 1
+
+        return True, int(batch_size or 0)
+
+    def __call__(self, examples: dict[str, Any]) -> dict[str, Any]:
+        if not examples:
+            return {}
+
+        is_batched, batch_size = self._is_batched_examples(examples)
+
+        # -------- single example --------
+        if not is_batched:
+            aligned = self.dataset_converter(examples)
+            if isinstance(self.id_key, str) and self.id_key and self.id_key in examples:
+                aligned[self.id_key] = examples[self.id_key]
+            return aligned
+
+        # -------- batched examples --------
+        outputs: dict[str, list[Any]] = {}
+
+        for i in range(batch_size):
+            row = {k: (v[i] if isinstance(v, (list, tuple, np.ndarray)) else v) for k, v in examples.items()}
+            aligned = self.dataset_converter(row)
+            for k, val in aligned.items():
+                outputs.setdefault(k, []).append(val)
+
+        # Preserve requested id_key if present in original examples.
+        if isinstance(self.id_key, str) and self.id_key and self.id_key in examples:
+            v = examples[self.id_key]
+            outputs[self.id_key] = list(v) if isinstance(v, (list, tuple, np.ndarray)) else [v] * batch_size
+
+        return outputs
+
+
 def _load_single_dataset(
     dataset_attr: "DatasetAttr",
     model_args: "ModelArguments",
@@ -167,27 +239,8 @@ def _load_single_dataset(
             raise ValueError(f"Lazy alignment does not support formatting: {dataset_attr.formatting}.")
 
         dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
-        id_key = data_args.dynamic_prompt_id_key
-
-        def _lazy_align_transform(examples: dict[str, list[Any]]) -> dict[str, list[Any]]:  # type: ignore
-            batch_size = 0
-            for v in examples.values():
-                batch_size = len(v)
-                break
-
-            outputs: dict[str, list[Any]] = {}
-            for i in range(batch_size):
-                row = {k: v[i] for k, v in examples.items()}
-                aligned = dataset_converter(row)
-                for k, val in aligned.items():
-                    outputs.setdefault(k, []).append(val)
-
-            if isinstance(id_key, str) and id_key and id_key in examples:
-                outputs[id_key] = examples[id_key]
-
-            return outputs
-
-        dataset = dataset.with_transform(_lazy_align_transform, output_all_columns=False)
+        transform = _LazyAlignTransform(dataset_converter=dataset_converter, id_key=data_args.dynamic_prompt_id_key)
+        dataset = dataset.with_transform(transform, output_all_columns=False)
         logger.info_rank0(f"Lazy-aligned dataset {dataset_attr}: conversion will run on-the-fly.")
         return dataset
 
@@ -350,6 +403,7 @@ def get_dataset(
     with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
         lazy_align_train = (
             data_args.dynamic_prompt_sampling
+            and getattr(data_args, "dynamic_prompt_lazy_align", True)
             and stage == "sft"
             and not data_args.packing
         )

@@ -148,6 +148,17 @@ class DataArguments:
         },
     )
 
+    dynamic_prompt_lazy_align: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When `dynamic_prompt_sampling` is enabled (SFT only, no packing), align/convert the training dataset "
+                "on-the-fly via `Dataset.with_transform` instead of running a full `map` conversion up-front. "
+                "Disabling this may increase startup time but can improve training throughput."
+            )
+        },
+    )
+
     dynamic_prompt_deterministic: bool = field(
         default=False,
         metadata={
