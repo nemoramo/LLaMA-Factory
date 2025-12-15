@@ -148,6 +148,26 @@ class DataArguments:
         },
     )
 
+    dynamic_prompt_deterministic: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use deterministic per-sample prompt sampling based on a stable hash. "
+                "Useful for reproducibility and more stable resume when using dynamic prompt sampling."
+            )
+        },
+    )
+
+    dynamic_prompt_id_key: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Field name to use as a stable per-sample id for deterministic dynamic prompt sampling. "
+                "If not set, will try to use the first audio path in `_audios`, then fallback to the last user message."
+            )
+        },
+    )
+
     def __post_init__(self):
         def split_arg(arg):
             if isinstance(arg, str):

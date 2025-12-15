@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 import numpy as np
 from datasets import Dataset, load_dataset, load_from_disk
@@ -21,7 +21,7 @@ from datasets import Dataset, load_dataset, load_from_disk
 from ..extras import logging
 from ..extras.constants import FILEEXT2TYPE
 from ..extras.misc import check_version, has_tokenized_data
-from .converter import align_dataset
+from .converter import align_dataset, get_dataset_converter
 from .data_utils import get_dataset_module, merge_dataset, read_cloud_json, split_dataset
 from .parser import get_dataset_list
 from .processor import (
@@ -54,6 +54,7 @@ def _load_single_dataset(
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
+    lazy_align: bool = False,
 ) -> Union["Dataset", "IterableDataset"]:
     r"""Load a single dataset and aligns it to the standard format."""
     logger.info_rank0(f"Loading dataset {dataset_attr}...")
@@ -159,6 +160,37 @@ def _load_single_dataset(
         max_samples = min(data_args.max_samples, len(dataset))
         dataset = dataset.select(range(max_samples))
 
+    if lazy_align:
+        if data_args.streaming:
+            raise ValueError("Lazy alignment is incompatible with `streaming`. Enable eager alignment instead.")
+        if dataset_attr.formatting not in ["alpaca", "sharegpt", "openai"]:
+            raise ValueError(f"Lazy alignment does not support formatting: {dataset_attr.formatting}.")
+
+        dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
+        id_key = data_args.dynamic_prompt_id_key
+
+        def _lazy_align_transform(examples: dict[str, list[Any]]) -> dict[str, list[Any]]:  # type: ignore
+            batch_size = 0
+            for v in examples.values():
+                batch_size = len(v)
+                break
+
+            outputs: dict[str, list[Any]] = {}
+            for i in range(batch_size):
+                row = {k: v[i] for k, v in examples.items()}
+                aligned = dataset_converter(row)
+                for k, val in aligned.items():
+                    outputs.setdefault(k, []).append(val)
+
+            if isinstance(id_key, str) and id_key and id_key in examples:
+                outputs[id_key] = examples[id_key]
+
+            return outputs
+
+        dataset = dataset.with_transform(_lazy_align_transform, output_all_columns=False)
+        logger.info_rank0(f"Lazy-aligned dataset {dataset_attr}: conversion will run on-the-fly.")
+        return dataset
+
     return align_dataset(dataset, dataset_attr, data_args, training_args)
 
 
@@ -168,18 +200,22 @@ def _get_merged_dataset(
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
     stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    lazy_align: bool = False,
     return_dict: bool = False,
 ) -> Optional[Union["Dataset", "IterableDataset", dict[str, "Dataset"]]]:
     r"""Return the merged datasets in the standard format."""
     if dataset_names is None:
         return None
 
+    if lazy_align and len(dataset_names) > 1:
+        raise ValueError("Lazy alignment currently supports a single dataset.")
+
     datasets = {}
     for dataset_name, dataset_attr in zip(dataset_names, get_dataset_list(dataset_names, data_args.dataset_dir)):
         if (stage == "rm" and dataset_attr.ranking is False) or (stage != "rm" and dataset_attr.ranking is True):
             raise ValueError("The dataset is not applicable in the current training stage.")
 
-        datasets[dataset_name] = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
+        datasets[dataset_name] = _load_single_dataset(dataset_attr, model_args, data_args, training_args, lazy_align=lazy_align)
 
     if return_dict:
         return datasets
@@ -312,13 +348,19 @@ def get_dataset(
 
     # Load and preprocess dataset
     with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
-        dataset = _get_merged_dataset(data_args.dataset, model_args, data_args, training_args, stage)
+        lazy_align_train = (
+            data_args.dynamic_prompt_sampling
+            and stage == "sft"
+            and not data_args.packing
+        )
+        dataset = _get_merged_dataset(data_args.dataset, model_args, data_args, training_args, stage, lazy_align=lazy_align_train)
         eval_dataset = _get_merged_dataset(
             data_args.eval_dataset,
             model_args,
             data_args,
             training_args,
             stage,
+            lazy_align=False,
             return_dict=data_args.eval_on_each_dataset,
         )
 
