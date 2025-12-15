@@ -360,7 +360,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     merged[loss_key] = loss_metrics[loss_key]
 
                 # Expose full-eval runtime stats to avoid confusion (Phase 2 runs on subset).
-                for suffix in ("runtime", "samples_per_second", "steps_per_second"):
+                for suffix in ("samples", "runtime", "samples_per_second", "steps_per_second"):
                     k = f"{metric_key_prefix}_{suffix}"
                     if k in loss_metrics:
                         merged[f"{k}_full"] = loss_metrics[k]

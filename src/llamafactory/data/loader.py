@@ -66,6 +66,11 @@ class _LazyAlignTransform:
         self.id_key = id_key
 
     @staticmethod
+    def _looks_like_message_dict(x: Any) -> bool:
+        # ShareGPT / OpenAI-like message dicts typically contain "role" and "content".
+        return isinstance(x, dict) and ("role" in x) and ("content" in x)
+
+    @staticmethod
     def _is_batched_examples(examples: dict[str, Any]) -> tuple[bool, int]:
         """Heuristically detect dict-of-lists/arrays batch input.
 
@@ -75,6 +80,11 @@ class _LazyAlignTransform:
         """
         batch_size: Optional[int] = None
         for v in examples.values():
+            # Guard: list[{"role","content"}] at the top-level is likely a single-example messages list.
+            # This protects edge cases like {"messages": [{"role":..., "content":...}, ...]} being misinterpreted as a batch.
+            if isinstance(v, (list, tuple)) and len(v) > 0 and _LazyAlignTransform._looks_like_message_dict(v[0]):
+                return False, 1
+
             if isinstance(v, np.ndarray):
                 if v.ndim == 0:
                     return False, 1

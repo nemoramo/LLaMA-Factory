@@ -164,7 +164,8 @@ class DataArguments:
         metadata={
             "help": (
                 "Use deterministic per-sample prompt sampling based on a stable hash. "
-                "Useful for reproducibility and more stable resume when using dynamic prompt sampling."
+                "Useful for reproducibility and more stable resume when using dynamic prompt sampling. "
+                "Note: deterministic mapping does not vary across epochs."
             )
         },
     )

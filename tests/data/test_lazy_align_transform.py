@@ -78,3 +78,15 @@ def test_lazy_align_transform_picklable():
     transform = _LazyAlignTransform(dataset_converter=_DummyConverter(), id_key="id")
     pickle.dumps(transform)
 
+
+@pytest.mark.runs_on(["cpu"])
+def test_lazy_align_transform_messages_only_single_example():
+    class _MsgOnlyConverter:
+        def __call__(self, example):
+            return {"_prompt": example["messages"], "_response": []}
+
+    transform = _LazyAlignTransform(dataset_converter=_MsgOnlyConverter(), id_key=None)
+    out = transform({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]})
+
+    assert out["_prompt"] == [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+    assert out["_response"] == []
