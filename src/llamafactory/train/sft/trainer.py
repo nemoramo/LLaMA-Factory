@@ -143,15 +143,121 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         Subclass and override to inject custom behavior.
         """
-        if self.args.predict_with_generate:  # do not pass labels to model when generate
-            labels = inputs.pop("labels", None)
-        else:
-            labels = inputs.get("labels")
+        # NOTE:
+        # - When `predict_with_generate=True`, we want to compute generative metrics (WER/CER),
+        #   but still keep `eval_loss` for best-checkpoint selection.
+        # - Passing `labels` into `model.generate()` is wasteful and can break some models.
+        #   Therefore we compute loss in a separate loss-only forward pass.
 
-        loss, generated_tokens, _ = super().prediction_step(
-            model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
-        )
+        labels = inputs.get("labels")
+
+        def _prepare_loss_inputs(
+            batch_inputs: dict[str, Union["torch.Tensor", Any]],
+        ) -> dict[str, Union["torch.Tensor", Any]]:
+            r"""Convert prompt-only + target-only batches to CLM-style batches for loss computation.
+
+            In generation-eval mode, LLaMA-Factory preprocesses eval data as:
+              - input_ids: prompt (plus modality tokens)
+              - labels: reference text only
+            For decoder-only models (e.g., Gemma3n), loss computation expects labels aligned with input_ids.
+            """
+            if getattr(getattr(model, "config", None), "is_encoder_decoder", False):
+                return batch_inputs  # keep seq2seq behavior
+
+            if "input_ids" not in batch_inputs or "labels" not in batch_inputs:
+                return batch_inputs
+
+            input_ids = batch_inputs.get("input_ids")
+            label_ids = batch_inputs.get("labels")
+            attention_mask = batch_inputs.get("attention_mask")
+            if not (
+                torch.is_tensor(input_ids)
+                and torch.is_tensor(label_ids)
+                and torch.is_tensor(attention_mask)
+                and input_ids.dim() == 2
+                and label_ids.dim() == 2
+                and attention_mask.dim() == 2
+            ):
+                return batch_inputs
+
+            if input_ids.size(1) == label_ids.size(1):
+                return batch_inputs
+
+            # Only handle the common prompt-only+target-only layout:
+            # attention_mask must match input_ids length.
+            if attention_mask.size(1) != input_ids.size(1):
+                return batch_inputs
+
+            pad_token_id = getattr(self.processing_class, "pad_token_id", None)
+            if pad_token_id is None:
+                return batch_inputs
+
+            # Treat both IGNORE_INDEX and pad_token_id as padding on the target side.
+            tgt_is_valid = label_ids.ne(IGNORE_INDEX) & label_ids.ne(pad_token_id)
+            tgt_input_ids = torch.where(tgt_is_valid, label_ids, label_ids.new_full(label_ids.shape, pad_token_id))
+            tgt_attention_mask = tgt_is_valid.to(dtype=attention_mask.dtype)
+
+            prompt_ignore = label_ids.new_full(input_ids.shape, IGNORE_INDEX)
+            merged = dict(batch_inputs)
+            merged["input_ids"] = torch.cat([input_ids, tgt_input_ids], dim=1)
+            merged["attention_mask"] = torch.cat([attention_mask, tgt_attention_mask], dim=1)
+            merged["labels"] = torch.cat([prompt_ignore, label_ids], dim=1)
+
+            # If a standard 2D position_ids is present, rebuild it for the merged sequence.
+            if "position_ids" in merged and torch.is_tensor(merged["position_ids"]) and merged["position_ids"].dim() == 2:
+                pos = torch.cumsum(merged["attention_mask"].long(), dim=1) - 1
+                merged["position_ids"] = pos.masked_fill(merged["attention_mask"] == 0, 0)
+
+            # Extend token_type_ids if present.
+            if (
+                "token_type_ids" in merged
+                and torch.is_tensor(merged["token_type_ids"])
+                and merged["token_type_ids"].dim() == 2
+                and merged["token_type_ids"].size(1) == input_ids.size(1)
+            ):
+                zeros = merged["token_type_ids"].new_zeros((merged["token_type_ids"].size(0), tgt_input_ids.size(1)))
+                merged["token_type_ids"] = torch.cat([merged["token_type_ids"], zeros], dim=1)
+
+            return merged
+
+        if self.args.predict_with_generate and not prediction_loss_only:
+            # 1) Loss-only pass (keeps labels) to preserve `{metric_key_prefix}_loss`.
+            loss_inputs = _prepare_loss_inputs(dict(inputs))
+            loss, _, _ = super().prediction_step(
+                model,
+                loss_inputs,
+                prediction_loss_only=True,
+                ignore_keys=ignore_keys,
+            )
+
+            # 2) Generation pass (remove labels to avoid loss computation during generation).
+            gen_inputs = dict(inputs)
+            gen_inputs.pop("labels", None)
+            _, generated_tokens, _ = super().prediction_step(
+                model,
+                gen_inputs,
+                prediction_loss_only=False,
+                ignore_keys=ignore_keys,
+                **gen_kwargs,
+            )
+        else:
+            # Default behavior (no generation, or loss-only evaluation).
+            # Keep labels when `prediction_loss_only=True` so eval_loss is available.
+            step_inputs = dict(inputs)
+            if prediction_loss_only:
+                step_inputs = _prepare_loss_inputs(step_inputs)
+            if self.args.predict_with_generate and not prediction_loss_only:
+                step_inputs.pop("labels", None)
+            loss, generated_tokens, _ = super().prediction_step(
+                model,
+                step_inputs,
+                prediction_loss_only=prediction_loss_only,
+                ignore_keys=ignore_keys,
+                **gen_kwargs,
+            )
+
         if generated_tokens is not None and self.args.predict_with_generate:
+            # Remove prompt part in the generated tokens.
             generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
             generated_tokens = generated_tokens.contiguous()
 
@@ -200,27 +306,68 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         metric_key_prefix: str = "eval",
         **gen_kwargs,
     ) -> dict[str, float]:
-        r"""Overridden to support eval sampling when predict_with_generate and restore left padding for eval."""
+        r"""Overridden to support eval sampling when predict_with_generate and restore left padding for eval.
+
+        When `predict_with_generate=True` and `eval_num_samples` is set, this method can optionally compute:
+        - `{metric_key_prefix}_loss` on the full eval dataset, and
+        - generative metrics (WER/CER/ROUGE/BLEU) on a sampled subset.
+        """
         set_left_padding = self.args.predict_with_generate and hasattr(self, "processing_class")
         if set_left_padding:
             original_padding_side = self.processing_class.padding_side
             self.processing_class.padding_side = "left"
 
-        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-        if (
-            self.args.predict_with_generate
-            and self.finetuning_args.eval_num_samples is not None
-            and eval_dataset is not None
-        ):
-            if self.finetuning_args.eval_num_samples < len(eval_dataset):
-                # Randomly sample a subset of the evaluation dataset
-                # Use a fixed generator to ensure the same subset is used for every evaluation
+        try:
+            eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+            if eval_dataset is None:
+                return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+
+            if (
+                self.args.predict_with_generate
+                and self.finetuning_args.eval_num_samples is not None
+                and getattr(self.finetuning_args, "eval_loss_on_full_dataset", True)
+                and self.finetuning_args.eval_num_samples < len(eval_dataset)
+            ):
+                # Phase 1: compute full-dataset eval loss only.
+                # Disable compute_metrics to avoid expensive/invalid metric computation without generation.
+                original_compute_metrics = self.compute_metrics
+                original_preprocess_logits_for_metrics = getattr(self, "preprocess_logits_for_metrics", None)
+                self.compute_metrics = None
+                if hasattr(self, "preprocess_logits_for_metrics"):
+                    self.preprocess_logits_for_metrics = None
+                try:
+                    loss_metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+                finally:
+                    self.compute_metrics = original_compute_metrics
+                    if hasattr(self, "preprocess_logits_for_metrics"):
+                        self.preprocess_logits_for_metrics = original_preprocess_logits_for_metrics
+
+                # Phase 2: compute generative metrics on a sampled subset (with generation).
+                rng = np.random.default_rng(self.args.seed)
+                sampled_dataset = eval_dataset.select(
+                    rng.choice(len(eval_dataset), self.finetuning_args.eval_num_samples, replace=False)
+                )
+                gen_metrics = super().evaluate(sampled_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+
+                # Merge: keep full loss, keep generative metrics from subset.
+                merged = dict(gen_metrics)
+                loss_key = f"{metric_key_prefix}_loss"
+                if loss_key in loss_metrics:
+                    merged[loss_key] = loss_metrics[loss_key]
+                return merged
+
+            # Default behavior: either evaluate on full set, or sample everything together.
+            if (
+                self.args.predict_with_generate
+                and self.finetuning_args.eval_num_samples is not None
+                and eval_dataset is not None
+                and self.finetuning_args.eval_num_samples < len(eval_dataset)
+            ):
                 rng = np.random.default_rng(self.args.seed)
                 eval_dataset = eval_dataset.select(
                     rng.choice(len(eval_dataset), self.finetuning_args.eval_num_samples, replace=False)
                 )
 
-        try:
             return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
         finally:
             if set_left_padding:

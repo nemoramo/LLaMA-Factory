@@ -12,6 +12,10 @@ top_p: 1.0
 num_beams: 1
 max_new_tokens: 64
 
+# 评估用：开启生成才能计算 WER/CER
+predict_with_generate: true
+
+
 bf16: true
 flash_attn: auto
 do_train: true
@@ -74,7 +78,9 @@ eval_strategy: steps
 eval_steps: 10
 save_steps: 1000
 save_total_limit: 2
-load_best_model_at_end: false
+load_best_model_at_end: true
+metric_for_best_model: loss
+greater_is_better: false
 
 ddp_timeout: 1800
 ddp_find_unused_parameters: false
@@ -83,3 +89,5 @@ seed: 42
 report_to: tensorboard
 audio_padding: longest
 eval_num_samples: 10
+eval_loss_on_full_dataset: true  # loss 用全量 eval；WER/CER 等生成指标用 eval_num_samples 子集
+compute_wer_cer: true

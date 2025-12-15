@@ -530,6 +530,16 @@ class FinetuningArguments(
         default=None,
         metadata={"help": "Maximum number of samples to use for evaluation."},
     )
+    eval_loss_on_full_dataset: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When `predict_with_generate` is enabled and `eval_num_samples` is set, "
+                "compute eval loss on the full evaluation dataset while computing generative metrics "
+                "(WER/CER/ROUGE/BLEU) on the sampled subset."
+            )
+        },
+    )
     eval_max_new_tokens: Optional[int] = field(
         default=None,
         metadata={"help": "Maximum number of new tokens to generate for evaluation."},
