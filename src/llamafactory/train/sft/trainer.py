@@ -329,15 +329,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 and self.finetuning_args.eval_num_samples < len(eval_dataset)
             ):
                 # Phase 1: compute full-dataset eval loss only.
-                # Disable compute_metrics to avoid expensive/invalid metric computation without generation.
+                # Disable generation + compute_metrics to avoid duplicating the expensive generation pass.
                 original_compute_metrics = self.compute_metrics
                 original_preprocess_logits_for_metrics = getattr(self, "preprocess_logits_for_metrics", None)
+                original_predict_with_generate = self.args.predict_with_generate
                 self.compute_metrics = None
                 if hasattr(self, "preprocess_logits_for_metrics"):
                     self.preprocess_logits_for_metrics = None
                 try:
-                    loss_metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+                    self.args.predict_with_generate = False
+                    loss_metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
                 finally:
+                    self.args.predict_with_generate = original_predict_with_generate
                     self.compute_metrics = original_compute_metrics
                     if hasattr(self, "preprocess_logits_for_metrics"):
                         self.preprocess_logits_for_metrics = original_preprocess_logits_for_metrics
@@ -360,7 +363,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     merged[loss_key] = loss_metrics[loss_key]
 
                 # Expose full-eval runtime stats to avoid confusion (Phase 2 runs on subset).
-                for suffix in ("samples", "runtime", "samples_per_second", "steps_per_second"):
+                for suffix in ("samples", "steps", "runtime", "samples_per_second", "steps_per_second"):
                     k = f"{metric_key_prefix}_{suffix}"
                     if k in loss_metrics:
                         merged[f"{k}_full"] = loss_metrics[k]

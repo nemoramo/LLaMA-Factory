@@ -17,7 +17,10 @@ import pickle
 import pytest
 from datasets import Dataset
 
+from llamafactory.data.converter import get_dataset_converter
 from llamafactory.data.loader import _LazyAlignTransform
+from llamafactory.data.parser import DatasetAttr
+from llamafactory.hparams import DataArguments
 
 
 class _DummyConverter:
@@ -90,3 +93,25 @@ def test_lazy_align_transform_messages_only_single_example():
 
     assert out["_prompt"] == [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
     assert out["_response"] == []
+
+
+@pytest.mark.runs_on(["cpu"])
+def test_lazy_align_transform_messages_only_single_example_sharegpt_variant():
+    class _ShareGPTMsgOnlyConverter:
+        def __call__(self, example):
+            return {"_prompt": example["conversations"], "_response": []}
+
+    transform = _LazyAlignTransform(dataset_converter=_ShareGPTMsgOnlyConverter(), id_key=None)
+    out = transform({"conversations": [{"from": "human", "value": "hi"}, {"from": "gpt", "value": "ok"}]})
+
+    assert out["_prompt"] == [{"from": "human", "value": "hi"}, {"from": "gpt", "value": "ok"}]
+    assert out["_response"] == []
+
+
+@pytest.mark.runs_on(["cpu"])
+def test_builtin_dataset_converters_picklable():
+    data_args = DataArguments()
+    for formatting in ("alpaca", "sharegpt", "openai"):
+        dataset_attr = DatasetAttr(load_from="file", dataset_name="dummy", formatting=formatting)
+        converter = get_dataset_converter(formatting, dataset_attr, data_args)
+        pickle.dumps(converter)

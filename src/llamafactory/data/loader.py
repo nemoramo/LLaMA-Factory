@@ -66,9 +66,28 @@ class _LazyAlignTransform:
         self.id_key = id_key
 
     @staticmethod
-    def _looks_like_message_dict(x: Any) -> bool:
-        # ShareGPT / OpenAI-like message dicts typically contain "role" and "content".
-        return isinstance(x, dict) and ("role" in x) and ("content" in x)
+    def _looks_like_chat_message_dict(x: Any) -> bool:
+        """Detect common chat message dict variants to avoid mis-classifying messages as a batch."""
+        if not isinstance(x, dict):
+            return False
+
+        # OpenAI style: {"role": "...", "content": "..."}
+        if "role" in x and "content" in x:
+            return True
+
+        # ShareGPT style: {"from": "...", "value": "..."}
+        if "from" in x and "value" in x:
+            return True
+
+        # Other common variants (best-effort): {"speaker": "...", "text"/"content": "..."}
+        if "speaker" in x and ("text" in x or "content" in x):
+            return True
+
+        # e.g. {"type": "...", "text": "..."}
+        if "type" in x and "text" in x:
+            return True
+
+        return False
 
     @staticmethod
     def _is_batched_examples(examples: dict[str, Any]) -> tuple[bool, int]:
@@ -82,7 +101,7 @@ class _LazyAlignTransform:
         for v in examples.values():
             # Guard: list[{"role","content"}] at the top-level is likely a single-example messages list.
             # This protects edge cases like {"messages": [{"role":..., "content":...}, ...]} being misinterpreted as a batch.
-            if isinstance(v, (list, tuple)) and len(v) > 0 and _LazyAlignTransform._looks_like_message_dict(v[0]):
+            if isinstance(v, (list, tuple)) and len(v) > 0 and _LazyAlignTransform._looks_like_chat_message_dict(v[0]):
                 return False, 1
 
             if isinstance(v, np.ndarray):
