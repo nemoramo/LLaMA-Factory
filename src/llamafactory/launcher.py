@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import signal
 import subprocess
 import sys
 from copy import deepcopy
@@ -57,6 +58,81 @@ def launch():
     if is_env_enabled("USE_MCA"):  # force use torchrun
         os.environ["FORCE_TORCHRUN"] = "1"
 
+    def _kill_process_tree(process: subprocess.Popen, *, timeout: float = 30.0) -> None:
+        """Best-effort terminate a process *and* its children (torchrun/DDP workers)."""
+        if process.poll() is not None:
+            return
+
+        def _wait_or_none(seconds: float) -> bool:
+            try:
+                process.wait(timeout=seconds)
+                return True
+            except subprocess.TimeoutExpired:
+                return False
+
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+            except Exception:
+                try:
+                    process.send_signal(signal.SIGINT)
+                except Exception:
+                    pass
+            if _wait_or_none(min(10.0, timeout)):
+                return
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except Exception:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            if _wait_or_none(min(10.0, timeout)):
+                return
+            try:
+                os.killpg(process.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            _wait_or_none(min(10.0, timeout))
+        else:
+            # Windows: best-effort terminate/kill.
+            try:
+                process.send_signal(signal.SIGINT)
+            except Exception:
+                pass
+            if _wait_or_none(min(10.0, timeout)):
+                return
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            if _wait_or_none(min(10.0, timeout)):
+                return
+            try:
+                process.kill()
+            except Exception:
+                pass
+            _wait_or_none(min(10.0, timeout))
+
+    def _run_subprocess(cmd: list[str], *, env: dict[str, str]) -> int:
+        popen_kwargs: dict[str, object] = {"env": env}
+        # Make the subprocess a process group leader so Ctrl+C can be forwarded reliably.
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        else:  # pragma: no cover
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        process = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603
+        try:
+            return process.wait()
+        except KeyboardInterrupt:
+            logger.warning_rank0("KeyboardInterrupt received, terminating distributed workers...")
+            _kill_process_tree(process)
+            return 130
+
     if command == "train" and (
         is_env_enabled("FORCE_TORCHRUN") or (get_device_count() > 1 and not use_ray() and not use_kt())
     ):
@@ -90,48 +166,37 @@ def launch():
             if min_nnodes is not None and max_nnodes is not None:
                 rdzv_nnodes = f"{min_nnodes}:{max_nnodes}"
 
-            process = subprocess.run(
-                (
-                    "torchrun --nnodes {rdzv_nnodes} --nproc-per-node {nproc_per_node} "
-                    "--rdzv-id {rdzv_id} --rdzv-backend c10d --rdzv-endpoint {master_addr}:{master_port} "
-                    "--max-restarts {max_restarts} {file_name} {args}"
-                )
-                .format(
-                    rdzv_nnodes=rdzv_nnodes,
-                    nproc_per_node=nproc_per_node,
-                    rdzv_id=rdzv_id,
-                    master_addr=master_addr,
-                    master_port=master_port,
-                    max_restarts=max_restarts,
-                    file_name=__file__,
-                    args=" ".join(sys.argv[1:]),
-                )
-                .split(),
-                env=env,
-                check=True,
+            cmd = (
+                "torchrun --nnodes {rdzv_nnodes} --nproc-per-node {nproc_per_node} "
+                "--rdzv-id {rdzv_id} --rdzv-backend c10d --rdzv-endpoint {master_addr}:{master_port} "
+                "--max-restarts {max_restarts} {file_name} {args}"
+            ).format(
+                rdzv_nnodes=rdzv_nnodes,
+                nproc_per_node=nproc_per_node,
+                rdzv_id=rdzv_id,
+                master_addr=master_addr,
+                master_port=master_port,
+                max_restarts=max_restarts,
+                file_name=__file__,
+                args=" ".join(sys.argv[1:]),
             )
         else:
             # NOTE: DO NOT USE shell=True to avoid security risk
-            process = subprocess.run(
-                (
-                    "torchrun --nnodes {nnodes} --node_rank {node_rank} --nproc_per_node {nproc_per_node} "
-                    "--master_addr {master_addr} --master_port {master_port} {file_name} {args}"
-                )
-                .format(
-                    nnodes=nnodes,
-                    node_rank=node_rank,
-                    nproc_per_node=nproc_per_node,
-                    master_addr=master_addr,
-                    master_port=master_port,
-                    file_name=__file__,
-                    args=" ".join(sys.argv[1:]),
-                )
-                .split(),
-                env=env,
-                check=True,
+            cmd = (
+                "torchrun --nnodes {nnodes} --node_rank {node_rank} --nproc_per_node {nproc_per_node} "
+                "--master_addr {master_addr} --master_port {master_port} {file_name} {args}"
+            ).format(
+                nnodes=nnodes,
+                node_rank=node_rank,
+                nproc_per_node=nproc_per_node,
+                master_addr=master_addr,
+                master_port=master_port,
+                file_name=__file__,
+                args=" ".join(sys.argv[1:]),
             )
 
-        sys.exit(process.returncode)
+        # torchrun prints its own errors; propagate return code cleanly.
+        sys.exit(_run_subprocess(cmd.split(), env=env))
 
     elif command == "api":
         from .api.app import run_api

@@ -106,8 +106,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--normalized-suffix",
         type=str,
-        default="Please provide a clean, normalized transcription.",
-        help="Suffix for normalized(text) targets; supports {lang}/{has_digits} placeholders.",
+        default="Please provide a clean, normalized transcription (lowercase, no punctuation).",
+        help=(
+            "Suffix for normalized(text) targets (typically no capitalization/punctuation); "
+            "supports {lang}/{has_digits} placeholders."
+        ),
     )
     p.add_argument(
         "--original-suffix",
@@ -204,7 +207,7 @@ def convert_manifest(
     disable_prompt_pool: bool = False,
     original_prob: float = 0.2,
     lang_hint_prob: float = 0.1,
-    normalized_suffix: str = "Please provide a clean, normalized transcription.",
+    normalized_suffix: str = "Please provide a clean, normalized transcription (lowercase, no punctuation).",
     original_suffix: str = "Please transcribe verbatim, preserving casing and punctuation.",
     lang_hint_template: str = "The language is {lang}.",
     digits_hint_template: str = "",

@@ -196,12 +196,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             tgt_is_valid = label_ids.ne(IGNORE_INDEX) & label_ids.ne(pad_token_id)
             tgt_input_ids = torch.where(tgt_is_valid, label_ids, label_ids.new_full(label_ids.shape, pad_token_id))
             tgt_attention_mask = tgt_is_valid.to(dtype=attention_mask.dtype)
+            tgt_labels = torch.where(tgt_is_valid, label_ids, label_ids.new_full(label_ids.shape, IGNORE_INDEX))
 
             prompt_ignore = label_ids.new_full(input_ids.shape, IGNORE_INDEX)
             merged = dict(batch_inputs)
             merged["input_ids"] = torch.cat([input_ids, tgt_input_ids], dim=1)
             merged["attention_mask"] = torch.cat([attention_mask, tgt_attention_mask], dim=1)
-            merged["labels"] = torch.cat([prompt_ignore, label_ids], dim=1)
+            merged["labels"] = torch.cat([prompt_ignore, tgt_labels], dim=1)
 
             # If a standard 2D position_ids is present, rebuild it for the merged sequence.
             if "position_ids" in merged and torch.is_tensor(merged["position_ids"]) and merged["position_ids"].dim() == 2:
@@ -221,25 +222,38 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return merged
 
         if self.args.predict_with_generate and not prediction_loss_only:
-            # 1) Loss-only pass (keeps labels) to preserve `{metric_key_prefix}_loss`.
-            loss_inputs = _prepare_loss_inputs(dict(inputs))
-            loss, _, _ = super().prediction_step(
-                model,
-                loss_inputs,
-                prediction_loss_only=True,
-                ignore_keys=ignore_keys,
-            )
+            if getattr(self, "_skip_generate_loss", False):
+                # Generation-only pass (skip loss) for two-stage eval (Phase 2).
+                gen_inputs = dict(inputs)
+                gen_inputs.pop("labels", None)
+                loss = None
+                _, generated_tokens, _ = super().prediction_step(
+                    model,
+                    gen_inputs,
+                    prediction_loss_only=False,
+                    ignore_keys=ignore_keys,
+                    **gen_kwargs,
+                )
+            else:
+                # 1) Loss-only pass (keeps labels) to preserve `{metric_key_prefix}_loss`.
+                loss_inputs = _prepare_loss_inputs(dict(inputs))
+                loss, _, _ = super().prediction_step(
+                    model,
+                    loss_inputs,
+                    prediction_loss_only=True,
+                    ignore_keys=ignore_keys,
+                )
 
-            # 2) Generation pass (remove labels to avoid loss computation during generation).
-            gen_inputs = dict(inputs)
-            gen_inputs.pop("labels", None)
-            _, generated_tokens, _ = super().prediction_step(
-                model,
-                gen_inputs,
-                prediction_loss_only=False,
-                ignore_keys=ignore_keys,
-                **gen_kwargs,
-            )
+                # 2) Generation pass (remove labels to avoid loss computation during generation).
+                gen_inputs = dict(inputs)
+                gen_inputs.pop("labels", None)
+                _, generated_tokens, _ = super().prediction_step(
+                    model,
+                    gen_inputs,
+                    prediction_loss_only=False,
+                    ignore_keys=ignore_keys,
+                    **gen_kwargs,
+                )
         else:
             # Default behavior (no generation, or loss-only evaluation).
             # Keep labels when `prediction_loss_only=True` so eval_loss is available.
@@ -360,11 +374,18 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     f"Evaluation: `{metric_key_prefix}_loss` computed on full dataset (n={len(eval_dataset)}); "
                     f"generative metrics computed on subset (n={len(sampled_dataset)})."
                 )
+                had_skip_generate_loss = hasattr(self, "_skip_generate_loss")
+                original_skip_generate_loss = getattr(self, "_skip_generate_loss", False)
+                self._skip_generate_loss = True
                 _set_left_padding()
                 try:
                     gen_metrics = super().evaluate(sampled_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
                 finally:
                     _restore_padding()
+                    if had_skip_generate_loss:
+                        self._skip_generate_loss = original_skip_generate_loss
+                    else:
+                        delattr(self, "_skip_generate_loss")
 
                 # Merge: keep full loss, keep generative metrics from subset.
                 merged = dict(gen_metrics)
