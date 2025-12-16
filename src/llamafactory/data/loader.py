@@ -32,7 +32,10 @@ from .processor import (
     SupervisedDatasetProcessor,
     UnsupervisedDatasetProcessor,
 )
-from .processor.dynamic_prompt import DynamicPromptDataset, DynamicPromptPackedDataset
+from .processor.dynamic_prompt import (
+    DynamicPromptDataset,
+    build_dynamic_prompt_packed_iterable_dataset,
+)
 
 
 if TYPE_CHECKING:
@@ -511,16 +514,81 @@ def get_dataset(
             train_ds = dataset_module.get("train_dataset")
             if train_ds is not None:
                 if data_args.packing:
-                    dataset_module["train_dataset"] = DynamicPromptPackedDataset(
+                    max_samples_per_pack = int(getattr(data_args, "dynamic_prompt_packing_max_samples_per_pack", 8) or 8)
+                    max_steps = int(getattr(training_args, "max_steps", 0) or 0)
+                    if max_steps <= 0:
+                        raise ValueError(
+                            "Dynamic prompt packing uses an IterableDataset without `__len__`; please set `max_steps` > 0 "
+                            "(and optionally `num_train_epochs=1`)."
+                        )
+
+                    # Prefer per-rank dataloading for dynamic prompt packing. Without this, Accelerate may default to
+                    # `dispatch_batches=True` for iterable datasets, which iterates only on rank0 and broadcasts.
+                    world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+                    if (
+                        world_size > 1
+                        and hasattr(training_args, "accelerator_config")
+                        and getattr(training_args.accelerator_config, "dispatch_batches", None) is None
+                    ):
+                        training_args.accelerator_config.dispatch_batches = False
+                        logger.info_rank0(
+                            "Dynamic prompt packing: set `dispatch_batches: false` to enable per-rank sharded dataloading."
+                        )
+
+                    buffer_size = int(getattr(data_args, "dynamic_prompt_packing_buffer_size", 20000) or 20000)
+                    shuffle_packs = bool(getattr(data_args, "dynamic_prompt_packing_shuffle", True))
+
+                    num_shards = int(getattr(data_args, "dynamic_prompt_packing_num_shards", 0) or 0)
+                    if num_shards <= 0:
+                        # Ensure `num_shards` is large enough for Accelerate to shard by data sources
+                        # when `dispatch_batches=False` (avoids cross-rank duplication).
+                        num_workers = int(getattr(training_args, "dataloader_num_workers", 0) or 0)
+                        base = max(1, world_size * max(1, num_workers))
+                        num_shards = base * 128
+                        if world_size > 1:
+                            num_shards = ((num_shards + world_size - 1) // world_size) * world_size
+
+                    global_shuffle = bool(getattr(data_args, "dynamic_prompt_packing_global_shuffle", True))
+                    dataset_converter = None
+                    id_key = None
+                    col_names = getattr(train_ds, "column_names", None)
+                    is_aligned = isinstance(col_names, (list, tuple)) and "_prompt" in col_names and "_response" in col_names
+                    if not is_aligned:
+                        dataset_names = data_args.dataset or []
+                        if len(dataset_names) != 1:
+                            raise ValueError(
+                                "Dynamic prompt packing with lazy alignment currently supports a single dataset."
+                            )
+                        dataset_attr = next(iter(get_dataset_list(dataset_names, data_args.dataset_dir)))
+                        dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
+                        id_key = data_args.dynamic_prompt_id_key
+                        logger.info_rank0(
+                            "Dynamic prompt packing: dataset is not aligned; will convert to `_prompt/_response/...` on-the-fly."
+                        )
+
+                    dataset_module["train_dataset"] = build_dynamic_prompt_packed_iterable_dataset(
                         train_ds,
                         template=template,
                         tokenizer=tokenizer,
                         processor=processor,
                         data_args=data_args,
+                        dataset_converter=dataset_converter,
+                        id_key=id_key,
                         seed=training_args.seed,
+                        buffer_size=buffer_size,
+                        max_samples_per_pack=max_samples_per_pack,
+                        shuffle_packs=shuffle_packs,
+                        num_shards=num_shards,
+                        global_shuffle=global_shuffle,
                     )
                     logger.info_rank0(
-                        "Wrapped train dataset with DynamicPromptPackedDataset for on-the-fly prompt sampling + packing."
+                        "Wrapped train dataset with buffered knapsack packing "
+                        "(dynamic prompt sampling + packing, on-the-fly encode + on-the-fly pack)."
+                    )
+
+                    logger.info_rank0(
+                        "Note: on-the-fly packing changes epoch semantics (raw samples/tokens per step vary); "
+                        "prefer controlling training budget via `max_steps`."
                     )
                 else:
                     dataset_module["train_dataset"] = DynamicPromptDataset(

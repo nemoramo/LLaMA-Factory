@@ -19,6 +19,7 @@ import copy
 import hashlib
 import math
 import random
+from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any
 
@@ -28,7 +29,7 @@ from torch.utils.data import Dataset, get_worker_info
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ..data_utils import Role
-from .processor_utils import DatasetProcessor
+from .processor_utils import DatasetProcessor, greedy_knapsack
 from .supervised import SupervisedDatasetProcessor
 
 
@@ -330,58 +331,222 @@ class DynamicPromptDataset(Dataset):
         return item
 
 
-class DynamicPromptPackedDataset(DynamicPromptDataset):
-    """A DynamicPromptDataset variant that packs multiple samples into one sequence.
+class DynamicPromptPackedBatchProcessor:
+    """Batch processor that does on-the-fly dynamic prompt sampling + buffered knapsack packing.
 
-    This is intended for SFT when you want:
-    - `dynamic_prompt_sampling: true` (sample from `_prompt_pool` at access time), and
-    - `packing: true` (optionally `neat_packing: true` for strict isolation).
-
-    Implementation notes:
-    - Packing is done on-the-fly in `__getitem__`, so it is CPU-heavy.
-    - Each packed item always includes the requested index, and then tries to add extra random indices
-      until reaching `cutoff_len` capacity. As a result, raw samples may appear multiple times per epoch.
+    Intended usage: `datasets.IterableDataset.map(batched=True, batch_size=buffer_size)`.
+    Buffering is only for speed (batching Python/tokenizer work); it doesn't require full-dataset tokenization.
     """
 
     def __init__(
         self,
-        dataset,
         template,
         tokenizer,
         processor,
         data_args,
+        *,
+        dataset_converter: Any | None = None,
+        id_key: str | None = None,
         seed: int | None = None,
         max_samples_per_pack: int = 8,
-        max_trials_per_extra: int = 8,
+        shuffle_packs: bool = True,
     ) -> None:
-        super().__init__(
-            dataset=dataset,
-            template=template,
-            tokenizer=tokenizer,
-            processor=processor,
-            data_args=data_args,
-            seed=seed,
-        )
+        self.data_args = data_args
         self.tokenizer = tokenizer
         self.max_samples_per_pack = max(1, int(max_samples_per_pack))
-        self.max_trials_per_extra = max(1, int(max_trials_per_extra))
+        self.shuffle_packs = bool(shuffle_packs)
+        self.dataset_converter = dataset_converter
+        self.id_key = id_key
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
+        self._base_seed = seed
+        self._rng: random.Random | None = None
+        self._rng_seeded: bool = False
+
+        self.encoder = SupervisedDatasetProcessor(
+            template=template, tokenizer=tokenizer, processor=processor, data_args=data_args
+        )
+
+    def _get_rng(self) -> random.Random:
+        if self._rng is None:
+            self._rng = random.Random()
+
+        if not self._rng_seeded:
+            worker_info = get_worker_info()
+            worker_id = worker_info.id if worker_info else 0
+
+            rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                try:
+                    rank = int(torch.distributed.get_rank())
+                except Exception:
+                    rank = 0
+
+            worker_seed = int(torch.initial_seed())
+            base_seed = int(self._base_seed) if self._base_seed is not None else 0
+            mixed = (worker_seed + base_seed + rank * 1000 + worker_id) % (2**32)
+
+            self._rng.seed(mixed)
+            self._rng_seeded = True
+
+        return self._rng
+
+    @staticmethod
+    def _stable_hash64(text: str) -> int:
+        digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="little", signed=False)
+
+    @staticmethod
+    def _sanitize_weight(w: Any) -> float:
+        try:
+            fw = float(w)
+        except Exception:
+            fw = 1.0
+        if not math.isfinite(fw) or fw < 0:
+            return 0.0
+        return fw
+
+    def _choose_from_pool(self, pool: Sequence[Any]) -> Any:
         rng = self._get_rng()
+        if len(pool) == 0:
+            raise ValueError("prompt_pool is empty.")
 
-        cutoff_len = int(self.data_args.cutoff_len)
-        if cutoff_len <= 0:
-            raise ValueError(f"Invalid cutoff_len for packing: {self.data_args.cutoff_len}")
-        # Match PackedSupervisedDatasetProcessor behavior: always reserve 1 token for padding.
-        target_len = cutoff_len + 1
-        capacity = target_len - 1
+        values: list[Any] = []
+        weights: list[float] = []
+        for item in pool:
+            w = 1.0
+            if isinstance(item, dict) and "weight" in item:
+                w = self._sanitize_weight(item.get("weight"))
+            values.append(item)
+            weights.append(w)
 
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = self.tokenizer.eos_token_id
-        if pad_token_id is None:
-            raise ValueError("tokenizer.pad_token_id and tokenizer.eos_token_id are both None.")
+        if any(w > 0 for w in weights):
+            return rng.choices(values, weights=weights, k=1)[0]
+        return rng.choice(values)
 
+    def _get_sample_id(self, example: dict[str, Any]) -> str:
+        id_key = getattr(self.data_args, "dynamic_prompt_id_key", None)
+        if isinstance(id_key, str) and id_key and id_key in example and example[id_key] is not None:
+            return str(example[id_key])
+
+        audios = example.get("_audios")
+        if isinstance(audios, list) and len(audios) > 0 and audios[0] is not None:
+            return str(audios[0])
+
+        prompt_messages = example.get("_prompt")
+        if isinstance(prompt_messages, list):
+            for m in reversed(prompt_messages):
+                if isinstance(m, dict) and m.get("role") == Role.USER.value:
+                    return str(m.get("content", ""))
+
+        return str(prompt_messages) if prompt_messages is not None else ""
+
+    def _choose_from_pool_deterministic(self, pool: Sequence[Any], example: dict[str, Any]) -> Any:
+        if len(pool) == 0:
+            raise ValueError("prompt_pool is empty.")
+
+        base_seed = int(self._base_seed) if self._base_seed is not None else 0
+        sample_id = self._get_sample_id(example)
+        h = self._stable_hash64(f"{base_seed}|{sample_id}")
+
+        values: list[Any] = []
+        weights: list[float] = []
+        for item in pool:
+            w = 1.0
+            if isinstance(item, dict) and "weight" in item:
+                w = self._sanitize_weight(item.get("weight"))
+            values.append(item)
+            weights.append(w)
+
+        total = sum(weights)
+        if total > 0:
+            r = (h / float(2**64)) * total
+            acc = 0.0
+            for v, w in zip(values, weights):
+                if w <= 0:
+                    continue
+                acc += w
+                if r < acc:
+                    return v
+            return values[-1]
+
+        return values[int(h % len(values))]
+
+    def _sample_pool_choice(self, example: dict[str, Any]) -> Any | None:
+        pool = example.get("_prompt_pool")
+        if not (isinstance(pool, list) and len(pool) > 0):
+            return None
+        if getattr(self.data_args, "dynamic_prompt_deterministic", False):
+            return self._choose_from_pool_deterministic(pool, example)
+        return self._choose_from_pool(pool)
+
+    @staticmethod
+    def _build_prompt_messages(example: dict[str, Any], chosen: Any | None) -> list[dict[str, Any]]:
+        prompt_messages = example.get("_prompt") or []
+        if not isinstance(prompt_messages, list):
+            prompt_messages = []
+        prompt_messages = copy.deepcopy(prompt_messages)
+
+        if chosen is None:
+            return prompt_messages
+
+        if isinstance(chosen, list) and all(isinstance(m, dict) for m in chosen):
+            return copy.deepcopy(chosen)
+
+        if isinstance(chosen, dict) and ("content" in chosen or "role" in chosen):
+            msg = copy.deepcopy(chosen)
+            if "role" not in msg:
+                msg["role"] = Role.USER.value
+            msg.setdefault("content", "")
+            prompt_messages.append(msg)
+            return prompt_messages
+
+        if isinstance(chosen, dict):
+            suffix = str(chosen.get("text") or chosen.get("suffix") or "")
+        else:
+            suffix = "" if chosen is None else str(chosen)
+
+        if not suffix:
+            return prompt_messages
+
+        for m in reversed(prompt_messages):
+            if m.get("role") == Role.USER.value:
+                base = m.get("content", "")
+                sep = ""
+                if base and not base.endswith(("\n", " ")) and not suffix.startswith(("\n", " ")):
+                    sep = "\n"
+                m["content"] = f"{base}{sep}{suffix}" if base else suffix
+                break
+        else:
+            prompt_messages.append({"role": Role.USER.value, "content": suffix})
+
+        return prompt_messages
+
+    @staticmethod
+    def _build_response_messages(example: dict[str, Any], chosen: Any | None) -> list[dict[str, Any]]:
+        response_messages = example.get("_response") or []
+        if not isinstance(response_messages, list):
+            response_messages = []
+        response_messages = copy.deepcopy(response_messages)
+
+        if isinstance(chosen, dict):
+            completion = chosen.get("completion") or chosen.get("response") or chosen.get("output")
+            if completion is not None:
+                completion_str = str(completion)
+                if len(response_messages) > 0:
+                    response_messages[-1]["content"] = completion_str
+                else:
+                    response_messages.append({"role": Role.ASSISTANT.value, "content": completion_str})
+
+        return response_messages
+
+    def _pack_segments(
+        self,
+        segments: list[dict[str, Any]],
+        *,
+        pad_token_id: int,
+        target_len: int,
+        capacity: int,
+    ) -> dict[str, Any]:
         packed_input_ids: list[int] = []
         packed_labels: list[int] = []
         packed_position_ids: list[int] = []
@@ -394,16 +559,15 @@ class DynamicPromptPackedDataset(DynamicPromptDataset):
         has_videos = False
         has_audios = False
 
-        used: set[int] = {int(idx)}
-
-        def add_segment(item: dict[str, Any], seg_id: int) -> None:
-            nonlocal has_images, has_videos, has_audios
-            seg_input_ids = item["input_ids"]
-            seg_labels = item["labels"]
+        seg_id = 1
+        for seg in segments:
+            seg_input_ids = seg.get("input_ids") or []
+            seg_labels = seg.get("labels") or []
             start = len(packed_input_ids)
 
-            # Safety: never exceed packing capacity.
-            # Extra segments are already checked before adding; this primarily protects the first segment.
+            if start >= capacity:
+                break
+
             if start + len(seg_input_ids) > capacity:
                 keep = max(0, capacity - start)
                 seg_input_ids = seg_input_ids[:keep]
@@ -411,65 +575,31 @@ class DynamicPromptPackedDataset(DynamicPromptDataset):
 
             seg_len = len(seg_input_ids)
             if seg_len == 0:
-                return
+                continue
 
             packed_input_ids.extend(seg_input_ids)
             packed_labels.extend(seg_labels)
             if self.data_args.neat_packing:
-                # Per-segment position reset for strict isolation.
                 packed_position_ids.extend(list(range(seg_len)))
                 packed_attention_mask.extend([seg_id] * seg_len)
+                packed_labels[start] = IGNORE_INDEX
             else:
-                # Continuous positions for normal packing.
                 packed_position_ids.extend(list(range(start, start + seg_len)))
                 packed_attention_mask.extend([1] * seg_len)
 
-            # Neat packing: mask boundary labels to avoid cross-segment loss contributions.
-            if self.data_args.neat_packing:
-                if start == 0:
-                    packed_labels[0] = IGNORE_INDEX
-                else:
-                    packed_labels[start] = IGNORE_INDEX
-
-            if "images" in item:
+            if "images" in seg:
                 has_images = True
-                packed_images.extend(item.get("images") or [])
-            if "videos" in item:
+                packed_images.extend(seg.get("images") or [])
+            if "videos" in seg:
                 has_videos = True
-                packed_videos.extend(item.get("videos") or [])
-            if "audios" in item:
+                packed_videos.extend(seg.get("videos") or [])
+            if "audios" in seg:
                 has_audios = True
-                packed_audios.extend(item.get("audios") or [])
+                packed_audios.extend(seg.get("audios") or [])
 
-        # First segment: always include `idx`.
-        add_segment(super().__getitem__(idx), seg_id=1)
-
-        seg_id = 2
-        while seg_id <= self.max_samples_per_pack and len(packed_input_ids) < capacity:
-            remaining = capacity - len(packed_input_ids)
-            if remaining <= 0:
-                break
-
-            chosen: dict[str, Any] | None = None
-            for _ in range(self.max_trials_per_extra):
-                cand = int(rng.randrange(len(self.dataset)))
-                if cand in used and len(used) < len(self.dataset):
-                    continue
-                cand_item = super().__getitem__(cand)
-                if len(cand_item["input_ids"]) <= remaining:
-                    chosen = cand_item
-                    used.add(cand)
-                    break
-
-            if chosen is None:
-                break
-
-            add_segment(chosen, seg_id=seg_id)
             seg_id += 1
 
-        # Ensure final length is exactly `cutoff_len + 1` and contains at least one pad token.
         if len(packed_input_ids) >= target_len:
-            # Reserve the last token for padding.
             packed_input_ids = packed_input_ids[: target_len - 1]
             packed_labels = packed_labels[: target_len - 1]
             packed_position_ids = packed_position_ids[: target_len - 1]
@@ -477,7 +607,7 @@ class DynamicPromptPackedDataset(DynamicPromptDataset):
 
         pad_length = target_len - len(packed_input_ids)
         if pad_length < 1:
-            pad_length = 1  # defensive; should not happen due to the truncation above.
+            pad_length = 1
 
         packed_input_ids.extend([int(pad_token_id)] * pad_length)
         packed_position_ids.extend([0] * pad_length)
@@ -513,8 +643,194 @@ class DynamicPromptPackedDataset(DynamicPromptDataset):
             item["videos"] = packed_videos
         if has_audios:
             item["audios"] = packed_audios
-
         return item
+
+    def __call__(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        if not examples:
+            return {}
+
+        prompt_col = examples.get("_prompt")
+        if isinstance(prompt_col, list):
+            batch_size = len(prompt_col)
+        else:
+            first_col = next(iter(examples.values()), None)
+            batch_size = len(first_col) if isinstance(first_col, list) else 0
+        if batch_size == 0:
+            return {}
+
+        rng = self._get_rng()
+
+        cutoff_len = int(self.data_args.cutoff_len)
+        if cutoff_len <= 0:
+            raise ValueError(f"Invalid cutoff_len for packing: {self.data_args.cutoff_len}")
+
+        target_len = cutoff_len + 1
+        capacity = target_len - 1
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("tokenizer.pad_token_id and tokenizer.eos_token_id are both None.")
+
+        items: list[dict[str, Any]] = []
+        lengths: list[int] = []
+        length2indexes: dict[int, list[int]] = defaultdict(list)
+
+        for i in range(batch_size):
+            row = {k: v[i] for k, v in examples.items()}
+            if self.dataset_converter is not None:
+                aligned = self.dataset_converter(row)
+                if not isinstance(aligned, dict):
+                    continue
+                if isinstance(self.id_key, str) and self.id_key and self.id_key in row and row[self.id_key] is not None:
+                    aligned[self.id_key] = row[self.id_key]
+                example = aligned
+            else:
+                example = row
+
+            prompt = example.get("_prompt") or []
+            response = example.get("_response") or []
+            if not (isinstance(prompt, list) and isinstance(response, list)):
+                continue
+            if len(prompt) % 2 != 1 or len(response) != 1:
+                logger.warning_rank0("Dropped invalid example: {}".format(prompt + response))
+                continue
+
+            chosen = self._sample_pool_choice(example)
+            prompt_messages = self._build_prompt_messages(example, chosen)
+            response_messages = self._build_response_messages(example, chosen)
+
+            input_ids, labels = self.encoder._encode_data_example(
+                prompt=prompt_messages,
+                response=response_messages,
+                system=example.get("_system"),
+                tools=example.get("_tools"),
+                images=example.get("_images") or [],
+                videos=example.get("_videos") or [],
+                audios=example.get("_audios") or [],
+            )
+
+            l = len(input_ids)
+            if l == 0:
+                continue
+            if l > capacity:
+                logger.warning_rank0(f"Dropped lengthy example with length {l} > {capacity}.")
+                continue
+
+            item: dict[str, Any] = {"input_ids": input_ids, "labels": labels}
+            if example.get("_images") is not None:
+                item["images"] = example.get("_images") or []
+            if example.get("_videos") is not None:
+                item["videos"] = example.get("_videos") or []
+            if example.get("_audios") is not None:
+                item["audios"] = example.get("_audios") or []
+
+            index = len(items)
+            items.append(item)
+            length2indexes[l].append(index)
+            lengths.append(l)
+
+        if not items:
+            return {}
+
+        knapsacks = greedy_knapsack(lengths.copy(), capacity)
+        if self.shuffle_packs:
+            rng.shuffle(knapsacks)
+
+        model_inputs: dict[str, list[Any]] = defaultdict(list)
+        for knapsack in knapsacks:
+            if not knapsack:
+                continue
+
+            picked: list[int] = []
+            for l in knapsack:
+                if length2indexes[l]:
+                    picked.append(length2indexes[l].pop())
+
+            if not picked:
+                continue
+
+            for start in range(0, len(picked), self.max_samples_per_pack):
+                segments = [items[i] for i in picked[start : start + self.max_samples_per_pack]]
+                packed = self._pack_segments(
+                    segments,
+                    pad_token_id=int(pad_token_id),
+                    target_len=target_len,
+                    capacity=capacity,
+                )
+                for k, v in packed.items():
+                    model_inputs[k].append(v)
+
+        return dict(model_inputs)
+
+
+def build_dynamic_prompt_packed_iterable_dataset(
+    dataset,
+    *,
+    template,
+    tokenizer,
+    processor,
+    data_args,
+    dataset_converter: Any | None = None,
+    id_key: str | None = None,
+    seed: int | None = None,
+    buffer_size: int = 20000,
+    max_samples_per_pack: int = 8,
+    shuffle_packs: bool = True,
+    num_shards: int = 0,
+    global_shuffle: bool = True,
+):
+    """Build a sharded HF IterableDataset for buffered dynamic prompt packing."""
+    try:
+        from datasets import Dataset
+    except Exception as err:  # pragma: no cover
+        raise ImportError("Dynamic prompt packing requires the `datasets` package.") from err
+
+    if not isinstance(buffer_size, int) or buffer_size <= 0:
+        raise ValueError(f"Invalid buffer_size for dynamic prompt packing: {buffer_size}")
+
+    if num_shards <= 0:
+        # Power-of-two default tends to play well with common world sizes and dataloader workers.
+        num_shards = 1024
+
+    if global_shuffle:
+        try:
+            dataset = dataset.shuffle(seed=int(seed or 0))
+        except Exception as err:
+            logger.warning_rank0(f"Failed to shuffle dataset for dynamic prompt packing: {err}")
+
+    if not isinstance(dataset, Dataset):
+        raise ValueError("Dynamic prompt packing requires a HF `Dataset` (map-style) as input.")
+
+    try:
+        iterable_ds = dataset.to_iterable_dataset(num_shards=int(num_shards))
+    except Exception as err:
+        raise ValueError("Dynamic prompt packing requires `dataset.to_iterable_dataset(num_shards=...)`.") from err
+
+    raw_columns = getattr(dataset, "column_names", None)
+    remove_columns = list(raw_columns) if isinstance(raw_columns, (list, tuple)) else None
+
+    packer = DynamicPromptPackedBatchProcessor(
+        template=template,
+        tokenizer=tokenizer,
+        processor=processor,
+        data_args=data_args,
+        dataset_converter=dataset_converter,
+        id_key=id_key,
+        seed=seed,
+        max_samples_per_pack=max_samples_per_pack,
+        shuffle_packs=shuffle_packs,
+    )
+    packed = iterable_ds.map(
+        packer,
+        batched=True,
+        batch_size=int(buffer_size),
+        remove_columns=remove_columns,
+    )
+    # Repeat indefinitely to avoid DDP hangs when `max_steps` exceeds one full pass. Training length should be
+    # controlled via `max_steps`. Each "cycle" still uses every raw sample at most once (per rank shard).
+    return packed.repeat(None)
 
 
 class DynamicPromptProcessor(DatasetProcessor):
