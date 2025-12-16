@@ -13,8 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-将 NeMo manifest (audio_filepath + text/original_text) 转为 LLaMA-Factory 训练用的 “OpenAI messages + audios” 格式.
+"""将 NeMo manifest (audio_filepath + text/original_text) 转为 LLaMA-Factory 训练用的 “OpenAI messages + audios” 格式.
 
 并可选生成 `prompt_pool` 以支持训练时动态采样：
 
@@ -223,7 +222,7 @@ def convert_manifest(
 
     prefix = "" if s3_prefix is None else str(s3_prefix)
 
-    with open(input_path, "r", encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
+    with open(input_path, encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
         for line in fin:
             line = line.strip()
             if not line:

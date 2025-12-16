@@ -19,7 +19,8 @@ import copy
 import hashlib
 import math
 import random
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch.utils.data import Dataset, get_worker_info

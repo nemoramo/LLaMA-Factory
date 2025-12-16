@@ -16,10 +16,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
-import re
-import string
 
 import numpy as np
 import torch

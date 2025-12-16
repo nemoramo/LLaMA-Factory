@@ -15,12 +15,14 @@
 import sys
 
 import pytest
+from transformers.utils import is_torch_cuda_available, is_torch_hpu_available, is_torch_xpu_available
 
 from llamafactory.chat import ChatModel
 from llamafactory.extras.packages import is_sglang_available
 
 
 MODEL_NAME = "Qwen/Qwen2.5-0.5B"
+HAS_ACCELERATOR = is_torch_cuda_available() or is_torch_xpu_available() or is_torch_hpu_available()
 
 
 INFER_ARGS = {
@@ -39,8 +41,9 @@ MESSAGES = [
 ]
 
 
-@pytest.mark.runs_on(["cpu"])
+@pytest.mark.runs_on(["cuda", "xpu", "hpu"])
 @pytest.mark.skipif(not is_sglang_available(), reason="SGLang is not installed")
+@pytest.mark.skipif(not HAS_ACCELERATOR, reason="SGLang requires an accelerator (CUDA, XPU, HPU)")
 def test_chat():
     r"""Test the SGLang engine's basic chat functionality."""
     chat_model = ChatModel(INFER_ARGS)
@@ -49,8 +52,9 @@ def test_chat():
     print(response.response_text)
 
 
-@pytest.mark.runs_on(["cpu"])
+@pytest.mark.runs_on(["cuda", "xpu", "hpu"])
 @pytest.mark.skipif(not is_sglang_available(), reason="SGLang is not installed")
+@pytest.mark.skipif(not HAS_ACCELERATOR, reason="SGLang requires an accelerator (CUDA, XPU, HPU)")
 def test_stream_chat():
     r"""Test the SGLang engine's streaming chat functionality."""
     chat_model = ChatModel(INFER_ARGS)

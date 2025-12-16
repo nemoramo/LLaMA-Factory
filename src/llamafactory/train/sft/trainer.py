@@ -312,10 +312,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         - `{metric_key_prefix}_loss` on the full eval dataset, and
         - generative metrics (WER/CER/ROUGE/BLEU) on a sampled subset.
         """
-        set_left_padding = self.args.predict_with_generate and hasattr(self, "processing_class")
-        if set_left_padding:
-            original_padding_side = self.processing_class.padding_side
-            self.processing_class.padding_side = "left"
+        has_processing_class = hasattr(self, "processing_class")
+        original_padding_side = self.processing_class.padding_side if has_processing_class else None
+
+        def _set_left_padding() -> None:
+            if has_processing_class:
+                self.processing_class.padding_side = "left"
+
+        def _restore_padding() -> None:
+            if has_processing_class and original_padding_side is not None:
+                self.processing_class.padding_side = original_padding_side
 
         try:
             eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -354,7 +360,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     f"Evaluation: `{metric_key_prefix}_loss` computed on full dataset (n={len(eval_dataset)}); "
                     f"generative metrics computed on subset (n={len(sampled_dataset)})."
                 )
-                gen_metrics = super().evaluate(sampled_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+                _set_left_padding()
+                try:
+                    gen_metrics = super().evaluate(sampled_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+                finally:
+                    _restore_padding()
 
                 # Merge: keep full loss, keep generative metrics from subset.
                 merged = dict(gen_metrics)
@@ -381,7 +391,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     rng.choice(len(eval_dataset), self.finetuning_args.eval_num_samples, replace=False)
                 )
 
+            if self.args.predict_with_generate:
+                _set_left_padding()
+                try:
+                    return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
+                finally:
+                    _restore_padding()
+
             return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix, **gen_kwargs)
         finally:
-            if set_left_padding:
-                self.processing_class.padding_side = original_padding_side
+            _restore_padding()
