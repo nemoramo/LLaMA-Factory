@@ -369,9 +369,12 @@ class DynamicPromptPackedDataset(DynamicPromptDataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         rng = self._get_rng()
 
-        capacity = int(self.data_args.cutoff_len)
-        if capacity <= 0:
+        cutoff_len = int(self.data_args.cutoff_len)
+        if cutoff_len <= 0:
             raise ValueError(f"Invalid cutoff_len for packing: {self.data_args.cutoff_len}")
+        # Match PackedSupervisedDatasetProcessor behavior: always reserve 1 token for padding.
+        target_len = cutoff_len + 1
+        capacity = target_len - 1
 
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
@@ -399,13 +402,27 @@ class DynamicPromptPackedDataset(DynamicPromptDataset):
             seg_labels = item["labels"]
             start = len(packed_input_ids)
 
+            # Safety: never exceed packing capacity.
+            # Extra segments are already checked before adding; this primarily protects the first segment.
+            if start + len(seg_input_ids) > capacity:
+                keep = max(0, capacity - start)
+                seg_input_ids = seg_input_ids[:keep]
+                seg_labels = seg_labels[:keep]
+
+            seg_len = len(seg_input_ids)
+            if seg_len == 0:
+                return
+
             packed_input_ids.extend(seg_input_ids)
             packed_labels.extend(seg_labels)
-            packed_position_ids.extend(list(range(len(seg_input_ids))))
             if self.data_args.neat_packing:
-                packed_attention_mask.extend([seg_id] * len(seg_input_ids))
+                # Per-segment position reset for strict isolation.
+                packed_position_ids.extend(list(range(seg_len)))
+                packed_attention_mask.extend([seg_id] * seg_len)
             else:
-                packed_attention_mask.extend([1] * len(seg_input_ids))
+                # Continuous positions for normal packing.
+                packed_position_ids.extend(list(range(start, start + seg_len)))
+                packed_attention_mask.extend([1] * seg_len)
 
             # Neat packing: mask boundary labels to avoid cross-segment loss contributions.
             if self.data_args.neat_packing:
@@ -450,10 +467,17 @@ class DynamicPromptPackedDataset(DynamicPromptDataset):
             add_segment(chosen, seg_id=seg_id)
             seg_id += 1
 
-        # Pad to `cutoff_len + 1` to match PackedSupervisedDatasetProcessor behavior.
-        pad_length = capacity - len(packed_input_ids) + 1
+        # Ensure final length is exactly `cutoff_len + 1` and contains at least one pad token.
+        if len(packed_input_ids) >= target_len:
+            # Reserve the last token for padding.
+            packed_input_ids = packed_input_ids[: target_len - 1]
+            packed_labels = packed_labels[: target_len - 1]
+            packed_position_ids = packed_position_ids[: target_len - 1]
+            packed_attention_mask = packed_attention_mask[: target_len - 1]
+
+        pad_length = target_len - len(packed_input_ids)
         if pad_length < 1:
-            pad_length = 1
+            pad_length = 1  # defensive; should not happen due to the truncation above.
 
         packed_input_ids.extend([int(pad_token_id)] * pad_length)
         packed_position_ids.extend([0] * pad_length)
@@ -462,6 +486,20 @@ class DynamicPromptPackedDataset(DynamicPromptDataset):
             packed_attention_mask.extend([0] * pad_length)
         else:
             packed_attention_mask.extend([1] * pad_length)
+
+        if not (
+            len(packed_input_ids)
+            == len(packed_labels)
+            == len(packed_position_ids)
+            == len(packed_attention_mask)
+            == target_len
+        ):
+            raise ValueError(
+                "Packed sample has inconsistent lengths: "
+                f"input_ids={len(packed_input_ids)}, labels={len(packed_labels)}, "
+                f"position_ids={len(packed_position_ids)}, attention_mask={len(packed_attention_mask)}, "
+                f"expected={target_len}"
+            )
 
         item: dict[str, Any] = {
             "input_ids": packed_input_ids,
