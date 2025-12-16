@@ -1,4 +1,5 @@
 # Copyright 2025 the LlamaFactory team.
+# Additional author: ramos.ma (GitHub: nemoramo).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,10 +18,17 @@
 Contains shared fixtures, pytest configuration, and custom markers.
 """
 
+import sys
+from pathlib import Path
+
 import pytest
 
 from llamafactory.extras.misc import get_current_device, is_env_enabled
 from llamafactory.train.test_utils import patch_valuehead_model
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 try:
