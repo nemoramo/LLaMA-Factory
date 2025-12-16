@@ -1,9 +1,26 @@
+# Copyright 2025 the LlamaFactory team.
+# Additional author: ramos.ma (GitHub: nemoramo).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import random
-from typing import Any, Optional, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch.utils.data import Dataset, get_worker_info
@@ -43,14 +60,14 @@ class DynamicPromptDataset(Dataset):
         tokenizer,
         processor,
         data_args,
-        seed: Optional[int] = None,
+        seed: int | None = None,
     ) -> None:
         self.dataset = dataset
         self.data_args = data_args
 
         # RNG is created lazily and seeded per worker/rank to avoid identical sampling streams.
         self._base_seed = seed
-        self._rng: Optional[random.Random] = None
+        self._rng: random.Random | None = None
         self._rng_seeded: bool = False
 
         # Reuse the supervised processor for encoding logic.
@@ -62,14 +79,35 @@ class DynamicPromptDataset(Dataset):
         column_names = getattr(dataset, "column_names", None)
         if isinstance(column_names, (list, tuple, set)):
             required = {"_prompt", "_response"}
-            missing = required - set(column_names)
+            colset = set(column_names)
+            if "input_ids" in colset and not required.issubset(colset):
+                raise ValueError(
+                    "DynamicPromptDataset expects an aligned dataset with columns "
+                    f"{sorted(required)}. Got tokenized columns {sorted(colset)}. "
+                    "This often happens when loading a tokenized dataset (`tokenized_path`)."
+                )
+
+            missing = required - colset
+            if missing:
+                # Support lazily aligned datasets (e.g., HF dataset.with_transform()).
+                try:
+                    sample = dataset[0]
+                    if isinstance(sample, dict) and required.issubset(sample.keys()):
+                        missing = set()
+                except Exception:
+                    pass
+
             if missing:
                 raise ValueError(
                     "DynamicPromptDataset expects an aligned dataset with columns "
                     f"{sorted(required)}, but missing: {sorted(missing)}. "
-                    "This often happens when loading a tokenized dataset (`tokenized_path`) "
-                    "or when alignment/conversion did not run."
+                    "This often happens when alignment/conversion did not run."
                 )
+
+    @staticmethod
+    def _stable_hash64(text: str) -> int:
+        digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="little", signed=False)
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -134,10 +172,62 @@ class DynamicPromptDataset(Dataset):
             return rng.choices(values, weights=weights, k=1)[0]
         return rng.choice(values)
 
+    def _get_sample_id(self, example: dict[str, Any]) -> str:
+        """Best-effort stable id used for deterministic per-sample prompt selection."""
+        id_key = getattr(self.data_args, "dynamic_prompt_id_key", None)
+        if isinstance(id_key, str) and id_key and id_key in example and example[id_key] is not None:
+            return str(example[id_key])
+
+        audios = example.get("_audios")
+        if isinstance(audios, list) and len(audios) > 0 and audios[0] is not None:
+            return str(audios[0])
+
+        prompt_messages = example.get("_prompt")
+        if isinstance(prompt_messages, list):
+            for m in reversed(prompt_messages):
+                if isinstance(m, dict) and m.get("role") == Role.USER.value:
+                    return str(m.get("content", ""))
+
+        return str(prompt_messages) if prompt_messages is not None else ""
+
+    def _choose_from_pool_deterministic(self, pool: Sequence[Any], example: dict[str, Any]) -> Any:
+        if len(pool) == 0:
+            raise ValueError("prompt_pool is empty.")
+
+        base_seed = int(self._base_seed) if self._base_seed is not None else 0
+        sample_id = self._get_sample_id(example)
+        h = self._stable_hash64(f"{base_seed}|{sample_id}")
+
+        values: list[Any] = []
+        weights: list[float] = []
+        for item in pool:
+            w = 1.0
+            if isinstance(item, dict) and "weight" in item:
+                w = self._sanitize_weight(item.get("weight"))
+            values.append(item)
+            weights.append(w)
+
+        total = sum(weights)
+        if total > 0:
+            # Map hash to [0, total) deterministically.
+            r = (h / float(2**64)) * total
+            acc = 0.0
+            for v, w in zip(values, weights):
+                if w <= 0:
+                    continue
+                acc += w
+                if r < acc:
+                    return v
+            return values[-1]
+
+        return values[int(h % len(values))]
+
     def _sample_pool_choice(self, example: dict[str, Any]) -> Any | None:
         pool = example.get("_prompt_pool")
         if not (isinstance(pool, list) and len(pool) > 0):
             return None
+        if getattr(self.data_args, "dynamic_prompt_deterministic", False):
+            return self._choose_from_pool_deterministic(pool, example)
         return self._choose_from_pool(pool)
 
     def _build_prompt_messages(self, example: dict[str, Any], chosen: Any | None) -> list[dict[str, Any]]:

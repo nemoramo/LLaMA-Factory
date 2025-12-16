@@ -93,3 +93,6 @@ conflicts = [
         { extra = "sglang" },
     ],
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]

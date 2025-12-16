@@ -146,9 +146,7 @@ def autocast_projector_dtype(model: "PreTrainedModel", model_args: "ModelArgumen
 
 
 def cast_gemma3n_audio_outputs(model: "PreTrainedModel", model_args: "ModelArguments") -> None:
-    r"""
-    Casts audio tower outputs to model dtype for Gemma 3n.
-    """
+    r"""Casts audio tower outputs to model dtype for Gemma 3n."""
     if getattr(model.config, "model_type", None) != "gemma3n":
         return
 

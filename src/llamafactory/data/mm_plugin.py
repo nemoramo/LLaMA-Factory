@@ -461,7 +461,7 @@ class MMPluginMixin:
 
         Including reading and resampling.
         """
-        results: list["NDArray"] = []
+        results: list[NDArray] = []
         sampling_rates: list[float] = []
 
         for audio in audios:

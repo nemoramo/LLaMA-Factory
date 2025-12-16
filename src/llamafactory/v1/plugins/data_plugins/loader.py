@@ -1,4 +1,5 @@
 # Copyright 2025 the LlamaFactory team.
+# Additional author: ramos.ma (GitHub: nemoramo).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -48,8 +49,21 @@ class DataLoaderPlugin:
         if "file_name" in dataset_info:
             filepath = os.path.join(dataset_dir, dataset_info["file_name"])
             return self.load_data_from_file(filepath, split, streaming)
-        else:
-            raise NotImplementedError()
+        if "path" in dataset_info:
+            path = dataset_info["path"]
+            if isinstance(path, str) and not os.path.isabs(path):
+                candidate = os.path.join(dataset_dir, path)
+                if os.path.exists(candidate):
+                    path = candidate
+
+            load_kwargs: dict[str, Any] = {}
+            for k in ("name", "data_dir", "data_files", "cache_dir", "revision", "token"):
+                if k in dataset_info and dataset_info[k] is not None:
+                    load_kwargs[k] = dataset_info[k]
+
+            return load_dataset(path, split=split, streaming=streaming, **load_kwargs)
+
+        raise NotImplementedError("Dataset info must contain either `file_name` or `path`.")
 
     def load_data_from_file(self, filepath: str, split: str, streaming: bool) -> HFDataset:
         if os.path.isdir(filepath):

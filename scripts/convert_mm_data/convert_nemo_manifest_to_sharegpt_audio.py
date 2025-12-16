@@ -1,9 +1,21 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# Copyright 2025 the LlamaFactory team.
+# Additional author: ramos.ma (GitHub: nemoramo).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-"""
-把 NeMo manifest (audio_filepath + text/original_text) 转成给 LLaMA-Factory 训练用的
-“OpenAI messages + audios” 格式，并可选生成 `prompt_pool` 以支持训练时动态采样：
+"""将 NeMo manifest (audio_filepath + text/original_text) 转为 LLaMA-Factory 训练用的 “OpenAI messages + audios” 格式.
+
+并可选生成 `prompt_pool` 以支持训练时动态采样：
 
 输入 (jsonl，每行 NeMo manifest)：
   {"audio_filepath": "...", "text": "...", "original_text": "...", "lang": "..."}
@@ -210,7 +222,7 @@ def convert_manifest(
 
     prefix = "" if s3_prefix is None else str(s3_prefix)
 
-    with open(input_path, "r", encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
+    with open(input_path, encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
         for line in fin:
             line = line.strip()
             if not line:

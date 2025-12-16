@@ -148,6 +148,38 @@ class DataArguments:
         },
     )
 
+    dynamic_prompt_lazy_align: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When `dynamic_prompt_sampling` is enabled (SFT only, no packing), align/convert the training dataset "
+                "on-the-fly via `Dataset.with_transform` instead of running a full `map` conversion up-front. "
+                "Disabling this may increase startup time but can improve training throughput."
+            )
+        },
+    )
+
+    dynamic_prompt_deterministic: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use deterministic per-sample prompt sampling based on a stable hash. "
+                "Useful for reproducibility and more stable resume when using dynamic prompt sampling. "
+                "Note: deterministic mapping does not vary across epochs."
+            )
+        },
+    )
+
+    dynamic_prompt_id_key: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Field name to use as a stable per-sample id for deterministic dynamic prompt sampling. "
+                "If not set, will try to use the first audio path in `_audios`, then fallback to the last user message."
+            )
+        },
+    )
+
     def __post_init__(self):
         def split_arg(arg):
             if isinstance(arg, str):
