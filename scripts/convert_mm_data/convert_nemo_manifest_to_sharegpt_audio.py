@@ -36,6 +36,10 @@
 `prompt_pool.text` 会在训练时被追加到最后一个 user 消息后；如果 entry 带有
 `completion`，则会覆盖 assistant 的目标文本，从而实现 original/text 的动态切换。
 
+注意：ASR 场景里 `text` 通常是规范化转写（例如 lowercase、no punctuation）。如果某些样本的
+`original_text` 本身也没有大小写/标点导致与 `text` 完全一致，则会自动忽略该样本的 original 分支
+（避免生成无意义的 per-sample 概率）。
+
 然后在 dataset_info.json 里注册：
   formatting: "sharegpt"
   columns: {"messages": "messages", "audios": "audios"}
@@ -108,7 +112,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="Please provide a clean, normalized transcription (lowercase, no punctuation).",
         help=(
-            "Suffix for normalized(text) targets (typically no capitalization/punctuation); "
+            "Suffix for normalized(text) targets (typically lowercase, no punctuation); "
             "supports {lang}/{has_digits} placeholders."
         ),
     )
