@@ -330,6 +330,155 @@ class DynamicPromptDataset(Dataset):
         return item
 
 
+class DynamicPromptPackedDataset(DynamicPromptDataset):
+    """A DynamicPromptDataset variant that packs multiple samples into one sequence.
+
+    This is intended for SFT when you want:
+    - `dynamic_prompt_sampling: true` (sample from `_prompt_pool` at access time), and
+    - `packing: true` (optionally `neat_packing: true` for strict isolation).
+
+    Implementation notes:
+    - Packing is done on-the-fly in `__getitem__`, so it is CPU-heavy.
+    - Each packed item always includes the requested index, and then tries to add extra random indices
+      until reaching `cutoff_len` capacity. As a result, raw samples may appear multiple times per epoch.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        template,
+        tokenizer,
+        processor,
+        data_args,
+        seed: int | None = None,
+        max_samples_per_pack: int = 8,
+        max_trials_per_extra: int = 8,
+    ) -> None:
+        super().__init__(
+            dataset=dataset,
+            template=template,
+            tokenizer=tokenizer,
+            processor=processor,
+            data_args=data_args,
+            seed=seed,
+        )
+        self.tokenizer = tokenizer
+        self.max_samples_per_pack = max(1, int(max_samples_per_pack))
+        self.max_trials_per_extra = max(1, int(max_trials_per_extra))
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        rng = self._get_rng()
+
+        capacity = int(self.data_args.cutoff_len)
+        if capacity <= 0:
+            raise ValueError(f"Invalid cutoff_len for packing: {self.data_args.cutoff_len}")
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("tokenizer.pad_token_id and tokenizer.eos_token_id are both None.")
+
+        packed_input_ids: list[int] = []
+        packed_labels: list[int] = []
+        packed_position_ids: list[int] = []
+        packed_attention_mask: list[int] = []
+
+        packed_images: list[Any] = []
+        packed_videos: list[Any] = []
+        packed_audios: list[Any] = []
+        has_images = False
+        has_videos = False
+        has_audios = False
+
+        used: set[int] = {int(idx)}
+
+        def add_segment(item: dict[str, Any], seg_id: int) -> None:
+            nonlocal has_images, has_videos, has_audios
+            seg_input_ids = item["input_ids"]
+            seg_labels = item["labels"]
+            start = len(packed_input_ids)
+
+            packed_input_ids.extend(seg_input_ids)
+            packed_labels.extend(seg_labels)
+            packed_position_ids.extend(list(range(len(seg_input_ids))))
+            if self.data_args.neat_packing:
+                packed_attention_mask.extend([seg_id] * len(seg_input_ids))
+            else:
+                packed_attention_mask.extend([1] * len(seg_input_ids))
+
+            # Neat packing: mask boundary labels to avoid cross-segment loss contributions.
+            if self.data_args.neat_packing:
+                if start == 0:
+                    packed_labels[0] = IGNORE_INDEX
+                else:
+                    packed_labels[start] = IGNORE_INDEX
+
+            if "images" in item:
+                has_images = True
+                packed_images.extend(item.get("images") or [])
+            if "videos" in item:
+                has_videos = True
+                packed_videos.extend(item.get("videos") or [])
+            if "audios" in item:
+                has_audios = True
+                packed_audios.extend(item.get("audios") or [])
+
+        # First segment: always include `idx`.
+        add_segment(super().__getitem__(idx), seg_id=1)
+
+        seg_id = 2
+        while seg_id <= self.max_samples_per_pack and len(packed_input_ids) < capacity:
+            remaining = capacity - len(packed_input_ids)
+            if remaining <= 0:
+                break
+
+            chosen: dict[str, Any] | None = None
+            for _ in range(self.max_trials_per_extra):
+                cand = int(rng.randrange(len(self.dataset)))
+                if cand in used and len(used) < len(self.dataset):
+                    continue
+                cand_item = super().__getitem__(cand)
+                if len(cand_item["input_ids"]) <= remaining:
+                    chosen = cand_item
+                    used.add(cand)
+                    break
+
+            if chosen is None:
+                break
+
+            add_segment(chosen, seg_id=seg_id)
+            seg_id += 1
+
+        # Pad to `cutoff_len + 1` to match PackedSupervisedDatasetProcessor behavior.
+        pad_length = capacity - len(packed_input_ids) + 1
+        if pad_length < 1:
+            pad_length = 1
+
+        packed_input_ids.extend([int(pad_token_id)] * pad_length)
+        packed_position_ids.extend([0] * pad_length)
+        packed_labels.extend([IGNORE_INDEX] * pad_length)
+        if self.data_args.neat_packing:
+            packed_attention_mask.extend([0] * pad_length)
+        else:
+            packed_attention_mask.extend([1] * pad_length)
+
+        item: dict[str, Any] = {
+            "input_ids": packed_input_ids,
+            "attention_mask": packed_attention_mask,
+            "position_ids": packed_position_ids,
+            "labels": packed_labels,
+        }
+        if has_images:
+            item["images"] = packed_images
+        if has_videos:
+            item["videos"] = packed_videos
+        if has_audios:
+            item["audios"] = packed_audios
+
+        return item
+
+
 class DynamicPromptProcessor(DatasetProcessor):
     """Placeholder for interface consistency; not used for HF map preprocessing."""
 

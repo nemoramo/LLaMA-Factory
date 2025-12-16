@@ -192,6 +192,15 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
             if len(packed_input_ids) != self.data_args.cutoff_len + 1:
                 raise ValueError("The length of packed example should be identical to the cutoff length.")
 
+            # Neat packing: mask boundary labels to avoid cross-segment loss contributions.
+            # Even with block-diagonal attention, CLM loss shifting is sequential; the first token of a segment
+            # would otherwise be predicted from the previous segment's last token.
+            if self.data_args.neat_packing and packed_labels:
+                packed_labels[0] = IGNORE_INDEX
+                for j in range(1, len(packed_labels)):
+                    if packed_attention_masks[j] != packed_attention_masks[j - 1] and packed_attention_masks[j] != 0:
+                        packed_labels[j] = IGNORE_INDEX
+
             model_inputs["input_ids"].append(packed_input_ids)
             model_inputs["attention_mask"].append(packed_attention_masks)
             model_inputs["position_ids"].append(packed_position_ids)

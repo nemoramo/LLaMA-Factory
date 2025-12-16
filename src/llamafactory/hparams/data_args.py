@@ -141,7 +141,7 @@ class DataArguments:
         default=False,
         metadata={
             "help": (
-                "Enable dynamic prompt sampling at training time (SFT only, no packing). "
+                "Enable dynamic prompt sampling at training time (SFT only). "
                 "If a sample provides `prompt_pool`, one entry is chosen randomly per access and "
                 "appended to the last user prompt; otherwise falls back to the existing prompt."
             )
@@ -152,7 +152,7 @@ class DataArguments:
         default=True,
         metadata={
             "help": (
-                "When `dynamic_prompt_sampling` is enabled (SFT only, no packing), align/convert the training dataset "
+                "When `dynamic_prompt_sampling` is enabled (SFT only), align/convert the training dataset "
                 "on-the-fly via `Dataset.with_transform` instead of running a full `map` conversion up-front. "
                 "Disabling this may increase startup time but can improve training throughput."
             )

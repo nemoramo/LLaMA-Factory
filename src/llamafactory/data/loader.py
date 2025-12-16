@@ -32,7 +32,7 @@ from .processor import (
     SupervisedDatasetProcessor,
     UnsupervisedDatasetProcessor,
 )
-from .processor.dynamic_prompt import DynamicPromptDataset
+from .processor.dynamic_prompt import DynamicPromptDataset, DynamicPromptPackedDataset
 
 
 if TYPE_CHECKING:
@@ -362,7 +362,6 @@ def _get_preprocessed_dataset(
     if (
         data_args.dynamic_prompt_sampling
         and stage == "sft"
-        and not data_args.packing
         and not is_eval
     ):
         if data_args.streaming:
@@ -434,7 +433,6 @@ def get_dataset(
             data_args.dynamic_prompt_sampling
             and getattr(data_args, "dynamic_prompt_lazy_align", True)
             and stage == "sft"
-            and not data_args.packing
         )
         dataset = _get_merged_dataset(data_args.dataset, model_args, data_args, training_args, stage, lazy_align=lazy_align_train)
         eval_dataset = _get_merged_dataset(
@@ -469,7 +467,6 @@ def get_dataset(
         if (
             data_args.dynamic_prompt_sampling
             and stage == "sft"
-            and not data_args.packing
             and not data_args.streaming
         ):
             # Be robust to different split names returned by split_dataset().
@@ -509,14 +506,31 @@ def get_dataset(
         if (
             data_args.dynamic_prompt_sampling
             and stage == "sft"
-            and not data_args.packing
             and not data_args.streaming
         ):
             train_ds = dataset_module.get("train_dataset")
             if train_ds is not None:
-                dataset_module["train_dataset"] = DynamicPromptDataset(
-                    train_ds, template=template, tokenizer=tokenizer, processor=processor, data_args=data_args, seed=training_args.seed
-                )
-                logger.info_rank0("Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling.")
+                if data_args.packing:
+                    dataset_module["train_dataset"] = DynamicPromptPackedDataset(
+                        train_ds,
+                        template=template,
+                        tokenizer=tokenizer,
+                        processor=processor,
+                        data_args=data_args,
+                        seed=training_args.seed,
+                    )
+                    logger.info_rank0(
+                        "Wrapped train dataset with DynamicPromptPackedDataset for on-the-fly prompt sampling + packing."
+                    )
+                else:
+                    dataset_module["train_dataset"] = DynamicPromptDataset(
+                        train_ds,
+                        template=template,
+                        tokenizer=tokenizer,
+                        processor=processor,
+                        data_args=data_args,
+                        seed=training_args.seed,
+                    )
+                    logger.info_rank0("Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling.")
 
         return dataset_module
