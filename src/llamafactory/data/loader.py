@@ -527,17 +527,36 @@ def get_dataset(
                     world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
                     if world_size > 1 and hasattr(training_args, "accelerator_config"):
                         cfg = training_args.accelerator_config
-                        if getattr(cfg, "dispatch_batches", None) is None:
-                            cfg.dispatch_batches = False
-                            logger.info_rank0(
-                                "Dynamic prompt packing: set `dispatch_batches: false` to enable per-rank sharded dataloading."
-                            )
-                        elif getattr(cfg, "dispatch_batches", False):
+                        if cfg is None:
                             logger.warning_rank0(
-                                "Dynamic prompt packing: detected `dispatch_batches: true`. This may cause rank0-only "
-                                "iteration + broadcast, leading to cross-rank duplication. Consider setting "
-                                "`dispatch_batches: false`."
+                                "Dynamic prompt packing: `training_args.accelerator_config` is None; cannot auto-set "
+                                "`dispatch_batches`. If you observe cross-rank duplication, consider setting "
+                                "`dispatch_batches: false` in your Accelerate config."
                             )
+                        elif isinstance(cfg, dict):
+                            if cfg.get("dispatch_batches", None) is None:
+                                cfg["dispatch_batches"] = False
+                                logger.info_rank0(
+                                    "Dynamic prompt packing: set `dispatch_batches: false` to enable per-rank sharded dataloading."
+                                )
+                            elif cfg.get("dispatch_batches", False):
+                                logger.warning_rank0(
+                                    "Dynamic prompt packing: detected `dispatch_batches: true`. This may cause rank0-only "
+                                    "iteration + broadcast, leading to cross-rank duplication. Consider setting "
+                                    "`dispatch_batches: false`."
+                                )
+                        else:
+                            if getattr(cfg, "dispatch_batches", None) is None:
+                                cfg.dispatch_batches = False
+                                logger.info_rank0(
+                                    "Dynamic prompt packing: set `dispatch_batches: false` to enable per-rank sharded dataloading."
+                                )
+                            elif getattr(cfg, "dispatch_batches", False):
+                                logger.warning_rank0(
+                                    "Dynamic prompt packing: detected `dispatch_batches: true`. This may cause rank0-only "
+                                    "iteration + broadcast, leading to cross-rank duplication. Consider setting "
+                                    "`dispatch_batches: false`."
+                                )
 
                     buffer_size = int(getattr(data_args, "dynamic_prompt_packing_buffer_size", 20000) or 20000)
                     shuffle_packs = bool(getattr(data_args, "dynamic_prompt_packing_shuffle", True))
