@@ -653,10 +653,17 @@ class DynamicPromptPackedBatchProcessor:
         if isinstance(prompt_col, list):
             batch_size = len(prompt_col)
         else:
-            first_col = next(iter(examples.values()), None)
+            first_col = next((v for v in examples.values() if isinstance(v, list)), None)
             batch_size = len(first_col) if isinstance(first_col, list) else 0
         if batch_size == 0:
             return {}
+
+        for k, v in examples.items():
+            if isinstance(v, list) and len(v) != batch_size:
+                raise ValueError(
+                    "Dynamic prompt packing received inconsistent batch column lengths: "
+                    f"len({k})={len(v)} vs batch_size={batch_size}"
+                )
 
         rng = self._get_rng()
 
@@ -677,11 +684,19 @@ class DynamicPromptPackedBatchProcessor:
         lengths: list[int] = []
         length2indexes: dict[int, list[int]] = defaultdict(list)
 
+        dropped_invalid = 0
+        dropped_long = 0
+        dropped_encode = 0
+
+        warn_limit = int(getattr(self, "_warn_limit", 5) or 5)
+        warned = int(getattr(self, "_warned", 0) or 0)
+
         for i in range(batch_size):
             row = {k: v[i] for k, v in examples.items()}
             if self.dataset_converter is not None:
                 aligned = self.dataset_converter(row)
                 if not isinstance(aligned, dict):
+                    dropped_invalid += 1
                     continue
                 if isinstance(self.id_key, str) and self.id_key and self.id_key in row and row[self.id_key] is not None:
                     aligned[self.id_key] = row[self.id_key]
@@ -692,30 +707,45 @@ class DynamicPromptPackedBatchProcessor:
             prompt = example.get("_prompt") or []
             response = example.get("_response") or []
             if not (isinstance(prompt, list) and isinstance(response, list)):
+                dropped_invalid += 1
                 continue
             if len(prompt) % 2 != 1 or len(response) != 1:
-                logger.warning_rank0("Dropped invalid example: {}".format(prompt + response))
+                dropped_invalid += 1
+                if warned < warn_limit:
+                    logger.warning_rank0("Dropped invalid example: {}".format(prompt + response))
+                    warned += 1
                 continue
 
             chosen = self._sample_pool_choice(example)
             prompt_messages = self._build_prompt_messages(example, chosen)
             response_messages = self._build_response_messages(example, chosen)
 
-            input_ids, labels = self.encoder._encode_data_example(
-                prompt=prompt_messages,
-                response=response_messages,
-                system=example.get("_system"),
-                tools=example.get("_tools"),
-                images=example.get("_images") or [],
-                videos=example.get("_videos") or [],
-                audios=example.get("_audios") or [],
-            )
+            try:
+                input_ids, labels = self.encoder._encode_data_example(
+                    prompt=prompt_messages,
+                    response=response_messages,
+                    system=example.get("_system"),
+                    tools=example.get("_tools"),
+                    images=example.get("_images") or [],
+                    videos=example.get("_videos") or [],
+                    audios=example.get("_audios") or [],
+                )
+            except Exception as err:
+                dropped_encode += 1
+                if warned < warn_limit:
+                    logger.warning_rank0(f"Dropped example due to encode error: {err}")
+                    warned += 1
+                continue
 
             l = len(input_ids)
             if l == 0:
+                dropped_invalid += 1
                 continue
             if l > capacity:
-                logger.warning_rank0(f"Dropped lengthy example with length {l} > {capacity}.")
+                dropped_long += 1
+                if warned < warn_limit:
+                    logger.warning_rank0(f"Dropped lengthy example with length {l} > {capacity}.")
+                    warned += 1
                 continue
 
             item: dict[str, Any] = {"input_ids": input_ids, "labels": labels}
@@ -730,6 +760,68 @@ class DynamicPromptPackedBatchProcessor:
             items.append(item)
             length2indexes[l].append(index)
             lengths.append(l)
+
+        self._warned = warned
+        self._warn_limit = warn_limit
+
+        # Cumulative stats (per worker process).
+        seen_total = int(getattr(self, "_seen_total", 0) or 0) + batch_size
+        kept_total = int(getattr(self, "_kept_total", 0) or 0) + len(items)
+        dropped_invalid_total = int(getattr(self, "_dropped_invalid_total", 0) or 0) + dropped_invalid
+        dropped_long_total = int(getattr(self, "_dropped_long_total", 0) or 0) + dropped_long
+        dropped_encode_total = int(getattr(self, "_dropped_encode_total", 0) or 0) + dropped_encode
+
+        self._seen_total = seen_total
+        self._kept_total = kept_total
+        self._dropped_invalid_total = dropped_invalid_total
+        self._dropped_long_total = dropped_long_total
+        self._dropped_encode_total = dropped_encode_total
+
+        log_every_seen = int(getattr(self, "_log_every_seen", 200000) or 200000)
+        last_log_seen_total = int(getattr(self, "_last_log_seen_total", 0) or 0)
+        if log_every_seen > 0 and (seen_total - last_log_seen_total) >= log_every_seen:
+            last_log_kept_total = int(getattr(self, "_last_log_kept_total", 0) or 0)
+            last_log_dropped_invalid_total = int(getattr(self, "_last_log_dropped_invalid_total", 0) or 0)
+            last_log_dropped_long_total = int(getattr(self, "_last_log_dropped_long_total", 0) or 0)
+            last_log_dropped_encode_total = int(getattr(self, "_last_log_dropped_encode_total", 0) or 0)
+
+            window_seen = seen_total - last_log_seen_total
+            window_kept = kept_total - last_log_kept_total
+            window_drop_invalid = dropped_invalid_total - last_log_dropped_invalid_total
+            window_drop_long = dropped_long_total - last_log_dropped_long_total
+            window_drop_encode = dropped_encode_total - last_log_dropped_encode_total
+
+            total_keep_ratio = kept_total / max(1, seen_total)
+            window_keep_ratio = window_kept / max(1, window_seen)
+
+            worker_info = get_worker_info()
+            worker_id = worker_info.id if worker_info else 0
+
+            logger.info_rank0(
+                "Dynamic prompt packing stats (worker={}): total kept={}/{} ({:.2%}), "
+                "dropped_invalid={}, dropped_long={}, dropped_encode={}; window kept={}/{} ({:.2%}), "
+                "dropped_invalid={}, dropped_long={}, dropped_encode={}.".format(
+                    worker_id,
+                    kept_total,
+                    seen_total,
+                    total_keep_ratio,
+                    dropped_invalid_total,
+                    dropped_long_total,
+                    dropped_encode_total,
+                    window_kept,
+                    window_seen,
+                    window_keep_ratio,
+                    window_drop_invalid,
+                    window_drop_long,
+                    window_drop_encode,
+                )
+            )
+
+            self._last_log_seen_total = seen_total
+            self._last_log_kept_total = kept_total
+            self._last_log_dropped_invalid_total = dropped_invalid_total
+            self._last_log_dropped_long_total = dropped_long_total
+            self._last_log_dropped_encode_total = dropped_encode_total
 
         if not items:
             return {}
@@ -787,21 +879,41 @@ def build_dynamic_prompt_packed_iterable_dataset(
     except Exception as err:  # pragma: no cover
         raise ImportError("Dynamic prompt packing requires the `datasets` package.") from err
 
+    if not isinstance(dataset, Dataset):
+        raise ValueError("Dynamic prompt packing requires a HF map-style `Dataset` as input (not streaming).")
+
     if not isinstance(buffer_size, int) or buffer_size <= 0:
         raise ValueError(f"Invalid buffer_size for dynamic prompt packing: {buffer_size}")
+
+    # Best-effort resource hint: buffering scales CPU/RAM roughly linearly with buffer_size and cutoff_len.
+    try:
+        cutoff_len = int(getattr(data_args, "cutoff_len", 0) or 0)
+        if cutoff_len > 0:
+            approx_tokens = buffer_size * cutoff_len
+            if approx_tokens >= 5_000_000:
+                logger.warning_rank0(
+                    f"Dynamic prompt packing: buffer_size({buffer_size}) * cutoff_len({cutoff_len}) "
+                    f"≈ {approx_tokens:,} tokens buffered per map call. This can be CPU/RAM heavy. "
+                    "Consider reducing `dynamic_prompt_packing_buffer_size` if you hit OOM/slowdowns."
+                )
+    except Exception:
+        pass
 
     if num_shards <= 0:
         # Power-of-two default tends to play well with common world sizes and dataloader workers.
         num_shards = 1024
+        try:
+            n = len(dataset)
+            if isinstance(n, int) and n > 0:
+                num_shards = min(num_shards, n)
+        except Exception:
+            pass
 
     if global_shuffle:
         try:
             dataset = dataset.shuffle(seed=int(seed or 0))
         except Exception as err:
             logger.warning_rank0(f"Failed to shuffle dataset for dynamic prompt packing: {err}")
-
-    if not isinstance(dataset, Dataset):
-        raise ValueError("Dynamic prompt packing requires a HF `Dataset` (map-style) as input.")
 
     try:
         iterable_ds = dataset.to_iterable_dataset(num_shards=int(num_shards))

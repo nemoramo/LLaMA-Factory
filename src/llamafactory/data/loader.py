@@ -525,15 +525,19 @@ def get_dataset(
                     # Prefer per-rank dataloading for dynamic prompt packing. Without this, Accelerate may default to
                     # `dispatch_batches=True` for iterable datasets, which iterates only on rank0 and broadcasts.
                     world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
-                    if (
-                        world_size > 1
-                        and hasattr(training_args, "accelerator_config")
-                        and getattr(training_args.accelerator_config, "dispatch_batches", None) is None
-                    ):
-                        training_args.accelerator_config.dispatch_batches = False
-                        logger.info_rank0(
-                            "Dynamic prompt packing: set `dispatch_batches: false` to enable per-rank sharded dataloading."
-                        )
+                    if world_size > 1 and hasattr(training_args, "accelerator_config"):
+                        cfg = training_args.accelerator_config
+                        if getattr(cfg, "dispatch_batches", None) is None:
+                            cfg.dispatch_batches = False
+                            logger.info_rank0(
+                                "Dynamic prompt packing: set `dispatch_batches: false` to enable per-rank sharded dataloading."
+                            )
+                        elif getattr(cfg, "dispatch_batches", False):
+                            logger.warning_rank0(
+                                "Dynamic prompt packing: detected `dispatch_batches: true`. This may cause rank0-only "
+                                "iteration + broadcast, leading to cross-rank duplication. Consider setting "
+                                "`dispatch_batches: false`."
+                            )
 
                     buffer_size = int(getattr(data_args, "dynamic_prompt_packing_buffer_size", 20000) or 20000)
                     shuffle_packs = bool(getattr(data_args, "dynamic_prompt_packing_shuffle", True))
@@ -547,6 +551,15 @@ def get_dataset(
                         num_shards = base * 128
                         if world_size > 1:
                             num_shards = ((num_shards + world_size - 1) // world_size) * world_size
+                        # Cap num_shards by dataset size when possible to avoid excessive empty shards on small datasets.
+                        try:
+                            n = len(train_ds)
+                            if isinstance(n, int) and n > 0:
+                                num_shards = min(num_shards, n)
+                                if world_size > 1 and n >= world_size:
+                                    num_shards = max(world_size, (num_shards // world_size) * world_size)
+                        except Exception:
+                            pass
 
                     global_shuffle = bool(getattr(data_args, "dynamic_prompt_packing_global_shuffle", True))
                     dataset_converter = None
