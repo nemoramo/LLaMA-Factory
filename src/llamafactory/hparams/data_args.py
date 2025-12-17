@@ -141,7 +141,7 @@ class DataArguments:
         default=False,
         metadata={
             "help": (
-                "Enable dynamic prompt sampling at training time (SFT only, no packing). "
+                "Enable dynamic prompt sampling at training time (SFT only). "
                 "If a sample provides `prompt_pool`, one entry is chosen randomly per access and "
                 "appended to the last user prompt; otherwise falls back to the existing prompt."
             )
@@ -152,7 +152,7 @@ class DataArguments:
         default=True,
         metadata={
             "help": (
-                "When `dynamic_prompt_sampling` is enabled (SFT only, no packing), align/convert the training dataset "
+                "When `dynamic_prompt_sampling` is enabled (SFT only), align/convert the training dataset "
                 "on-the-fly via `Dataset.with_transform` instead of running a full `map` conversion up-front. "
                 "Disabling this may increase startup time but can improve training throughput."
             )
@@ -170,7 +170,7 @@ class DataArguments:
         },
     )
 
-    dynamic_prompt_id_key: Optional[str] = field(
+    dynamic_prompt_id_key: str | None = field(
         default=None,
         metadata={
             "help": (
@@ -178,6 +178,52 @@ class DataArguments:
                 "If not set, will try to use the first audio path in `_audios`, then fallback to the last user message."
             )
         },
+    )
+
+    dynamic_prompt_packing_global_shuffle: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When using dynamic prompt packing (`dynamic_prompt_sampling` + `packing`), shuffle the map-style "
+                "dataset once (with `seed`) before converting it to an iterable dataset for buffered encode+pack."
+            )
+        },
+    )
+
+    dynamic_prompt_packing_num_shards: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of shards used by `Dataset.to_iterable_dataset(num_shards=...)` for dynamic prompt packing. "
+                "A larger value enables efficient per-rank/per-worker sharding. Use 0 for auto."
+            )
+        },
+    )
+
+    dynamic_prompt_packing_buffer_size: int = field(
+        default=20000,
+        metadata={
+            "help": (
+                "Buffer size for dynamic prompt packing (`dynamic_prompt_sampling` + `packing`). "
+                "The dataset encodes/tokenizes in buffered batches and packs each buffer with greedy knapsack. "
+                "Larger values improve packing efficiency but increase CPU/memory usage."
+            )
+        },
+    )
+
+    dynamic_prompt_packing_max_samples_per_pack: int = field(
+        default=8,
+        metadata={
+            "help": (
+                "Upper bound on how many raw samples are concatenated into a single packed sequence when using "
+                "dynamic prompt packing."
+            )
+        },
+    )
+
+    dynamic_prompt_packing_shuffle: bool = field(
+        default=True,
+        metadata={"help": "Shuffle packed sequences inside each buffer for dynamic prompt packing."},
     )
 
     def __post_init__(self):
