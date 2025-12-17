@@ -12,16 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..config.model_args import ModelArguments
-from ..extras.types import Model, Processor
+import os
+import socket
 
 
-class ModelEngine:
-    def __init__(self, model_args: ModelArguments) -> None:
-        self.args = model_args
+def find_available_port() -> int:
+    r"""Find an available port on the local machine."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
-    def get_model(self) -> Model:
-        pass
 
-    def get_processor(self) -> Processor:
-        pass
+def is_env_enabled(env_var: str, default: str = "0") -> bool:
+    r"""Check if the environment variable is enabled."""
+    return os.getenv(env_var, default).lower() in ["true", "y", "1"]
+
+
+if __name__ == "__main__":
+    print(find_available_port())

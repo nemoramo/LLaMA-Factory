@@ -49,6 +49,7 @@ class Template:
     default_system: str
     stop_words: list[str]
     thought_words: tuple[str, str]
+    tool_call_words: tuple[str, str]
     efficient_eos: bool
     replace_eos: bool
     replace_jinja_template: bool
@@ -156,7 +157,9 @@ class Template:
             elif message["role"] == Role.OBSERVATION:
                 elements += self.format_observation.apply(content=message["content"])
             elif message["role"] == Role.FUNCTION:
-                elements += self.format_function.apply(content=message["content"], thought_words=self.thought_words)
+                elements += self.format_function.apply(
+                    content=message["content"], thought_words=self.thought_words, tool_call_words=self.tool_call_words
+                )
             else:
                 raise NotImplementedError("Unexpected role: {}".format(message["role"]))
 
@@ -199,9 +202,12 @@ class Template:
             logger.info_rank0(f"Add pad token: {tokenizer.pad_token}")
 
         if stop_words:
-            num_added_tokens = tokenizer.add_special_tokens(
-                dict(additional_special_tokens=stop_words), replace_additional_special_tokens=False
-            )
+            try:
+                num_added_tokens = tokenizer.add_special_tokens(
+                    dict(additional_special_tokens=stop_words), replace_additional_special_tokens=False
+                )
+            except TypeError:
+                num_added_tokens = tokenizer.add_special_tokens(dict(additional_special_tokens=stop_words))
             logger.info_rank0("Add {} to stop words.".format(",".join(stop_words)))
             if num_added_tokens > 0:
                 logger.warning_rank0("New tokens have been added, make sure `resize_vocab` is True.")
@@ -468,6 +474,7 @@ def register_template(
     default_system: str = "",
     stop_words: Optional[list[str]] = None,
     thought_words: Optional[tuple[str, str]] = None,
+    tool_call_words: Optional[tuple[str, str]] = None,
     efficient_eos: bool = False,
     replace_eos: bool = False,
     replace_jinja_template: bool = False,
@@ -519,6 +526,7 @@ def register_template(
         default_system=default_system,
         stop_words=stop_words or [],
         thought_words=thought_words or ("<think>\n", "\n</think>\n\n"),
+        tool_call_words=tool_call_words or ("<tool_call>", "</tool_call>"),
         efficient_eos=efficient_eos,
         replace_eos=replace_eos,
         replace_jinja_template=replace_jinja_template,
@@ -580,6 +588,7 @@ def parse_template(tokenizer: "PreTrainedTokenizer") -> "Template":
         default_system=default_system,
         stop_words=[],
         thought_words=("<think>\n", "\n</think>\n\n"),
+        tool_call_words=("<tool_call>", "</tool_call>"),
         efficient_eos=False,
         replace_eos=False,
         replace_jinja_template=False,
@@ -1125,7 +1134,7 @@ register_template(
 
 # copied from glm4 template
 register_template(
-    name="glm4v_moe",
+    name="glm4_5v",
     format_user=StringFormatter(slots=["<|user|>\n{{content}}<|assistant|>"]),
     format_assistant=StringFormatter(slots=["\n{{content}}"]),
     format_system=StringFormatter(slots=["<|system|>\n{{content}}"]),
@@ -1680,6 +1689,19 @@ register_template(
     format_observation=StringFormatter(slots=["""[TOOL_RESULTS]{"content": {{content}}}[/TOOL_RESULTS]"""]),
     format_tools=ToolFormatter(tool_format="mistral"),
     format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
+    mm_plugin=get_mm_plugin(name="pixtral", image_token="[IMG]"),
+)
+
+
+register_template(
+    name="ministral3",
+    format_user=StringFormatter(slots=["[INST]{{content}}[/INST]"]),
+    format_system=StringFormatter(slots=["{{content}}\n\n"]),
+    format_function=FunctionFormatter(slots=["[TOOL_CALLS]{{content}}", {"eos_token"}], tool_format="mistral"),
+    format_observation=StringFormatter(slots=["""[TOOL_RESULTS]{"content": {{content}}}[/TOOL_RESULTS]"""]),
+    format_tools=ToolFormatter(tool_format="mistral"),
+    format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
+    template_class=Llama2Template,
     mm_plugin=get_mm_plugin(name="pixtral", image_token="[IMG]"),
 )
 

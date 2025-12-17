@@ -21,6 +21,7 @@ from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_templat
 from ...extras.constants import IGNORE_INDEX
 from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
+from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
@@ -79,15 +80,34 @@ def run_sft(
     # Keyword arguments for `model.generate`
     gen_kwargs = generating_args.to_dict(obey_generation_config=True)
     eos_token_ids: list[int] = []
-    if tokenizer.eos_token_id is not None:
-        if isinstance(tokenizer.eos_token_id, (list, tuple)):
-            eos_token_ids.extend(int(stop_id) for stop_id in tokenizer.eos_token_id)
+    eos_attr = getattr(tokenizer, "eos_token_id", None)
+    if eos_attr is not None:
+        if isinstance(eos_attr, (list, tuple)):
+            eos_token_ids.extend(int(stop_id) for stop_id in eos_attr if stop_id is not None)
         else:
-            eos_token_ids.append(int(tokenizer.eos_token_id))
+            eos_token_ids.append(int(eos_attr))
 
+    # Compatible with Transformers v4 and Transformers v5: include additional special tokens as EOS stops.
+    extra_ids: list[int] = []
+    if is_transformers_version_greater_than("4.58.0"):
+        raw_extra_ids = getattr(tokenizer, "additional_special_tokens_ids", None)
+        if isinstance(raw_extra_ids, (list, tuple)):
+            extra_ids = [int(i) for i in raw_extra_ids if i is not None]
+        else:
+            extra_special_tokens = getattr(tokenizer, "_extra_special_tokens", [])
+            string_tokens = [str(t) for t in extra_special_tokens]
+            converted = tokenizer.convert_tokens_to_ids(string_tokens)
+            if isinstance(converted, (list, tuple)):
+                extra_ids = [int(i) for i in converted if i is not None]
+    else:
+        raw_extra_ids = getattr(tokenizer, "additional_special_tokens_ids", [])
+        if isinstance(raw_extra_ids, (list, tuple)):
+            extra_ids = [int(i) for i in raw_extra_ids if i is not None]
+
+    eos_token_ids.extend(i for i in extra_ids if i != -1)
+    eos_token_ids = list(dict.fromkeys(eos_token_ids))
     if not eos_token_ids:
         raise ValueError("Cannot determine `eos_token_id` from tokenizer.")
-
     gen_kwargs["eos_token_id"] = eos_token_ids
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
     gen_kwargs.setdefault("min_new_tokens", 1)
