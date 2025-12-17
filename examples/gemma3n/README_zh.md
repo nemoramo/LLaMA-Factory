@@ -183,6 +183,18 @@ NPROC_PER_NODE=8 WANDB_DISABLED=true \
 llamafactory-cli train examples/gemma3n/gemma3n_e2b_asr_nemo_debug_lora.yaml
 ```
 
+### 5.3 Unsloth（单机版 dynamic prompt）
+
+如果你希望用 Unsloth 加速（并保留 `dynamic_prompt_sampling: true` 的在线 prompt_pool 采样），使用：
+
+- 配置：`examples/gemma3n/gemma3n_e2b_asr_nemo_debug_lora_unsloth.yaml`
+- 关键：需要先安装 `unsloth`，并在 YAML 里设置 `use_unsloth: true`
+
+```bash
+CUDA_VISIBLE_DEVICES=0 WANDB_DISABLED=true \
+llamafactory-cli train examples/gemma3n/gemma3n_e2b_asr_nemo_debug_lora_unsloth.yaml
+```
+
 说明：
 
 - LLaMA-Factory 会在多 GPU 时自动走 `torchrun`（或你也可以 `FORCE_TORCHRUN=1` 强制）。
