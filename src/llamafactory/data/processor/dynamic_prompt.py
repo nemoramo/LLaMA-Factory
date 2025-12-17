@@ -599,15 +599,18 @@ class DynamicPromptPackedBatchProcessor:
 
             seg_id += 1
 
-        if len(packed_input_ids) >= target_len:
-            packed_input_ids = packed_input_ids[: target_len - 1]
-            packed_labels = packed_labels[: target_len - 1]
-            packed_position_ids = packed_position_ids[: target_len - 1]
-            packed_attention_mask = packed_attention_mask[: target_len - 1]
+        # Ensure there is always at least one padding token (see `target_len = cutoff_len + 1`).
+        if len(packed_input_ids) > capacity:
+            packed_input_ids = packed_input_ids[:capacity]
+            packed_labels = packed_labels[:capacity]
+            packed_position_ids = packed_position_ids[:capacity]
+            packed_attention_mask = packed_attention_mask[:capacity]
 
         pad_length = target_len - len(packed_input_ids)
-        if pad_length < 1:
-            pad_length = 1
+        if pad_length <= 0:
+            raise ValueError(
+                "Internal error: packed sequence length must be < target_len to keep at least one padding token."
+            )
 
         packed_input_ids.extend([int(pad_token_id)] * pad_length)
         packed_position_ids.extend([0] * pad_length)
