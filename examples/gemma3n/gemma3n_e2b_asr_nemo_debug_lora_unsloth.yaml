@@ -1,0 +1,97 @@
+### model
+# 说明：需要先安装 unsloth（否则 parser 会报缺依赖）
+model_name_or_path: google/gemma-3n-E4B-it
+template: gemma3n
+stage: sft
+finetuning_type: lora
+trust_remote_code: true
+
+# Unsloth 加速（单机/单卡/多卡均可；不兼容 ZeRO-3）
+use_unsloth: true
+
+# 生成相关（评估用）
+do_sample: false
+temperature: 0.0
+top_p: 1.0
+num_beams: 1
+max_new_tokens: 256
+
+# 评估用：开启生成才能计算 WER/CER
+predict_with_generate: false
+
+
+bf16: true
+flash_attn: auto
+do_train: true
+
+freeze_vision_tower: true            # 防止 LoRA 命中 audio/vision 分支，保持它们全参
+freeze_multi_modal_projector: true  # projector 仍然全参
+
+### data
+dataset: gemma3n_asr_v9_train
+eval_dataset: gemma3n_asr_hausa_youtube_test_norm_text
+dataset_dir: /data2/mayufeng/manifests/llama_data/
+val_size: 0.0
+cutoff_len: 2048
+overwrite_cache: true
+preprocessing_num_workers: 12
+dataloader_num_workers: 8
+train_on_prompt: false
+packing: false
+dynamic_prompt_sampling: true
+
+### lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# LLM 部分：对齐 Unsloth 的 target_modules
+lora_target:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  # - up_proj
+  # - down_proj
+
+# 额外全参子模块：HF 结构中的 audio_tower + multi_modal_projector
+# 建议写成逗号分隔的字符串（与官方参数说明完全一致）
+additional_target: audio_tower,multi_modal_projector
+
+### training
+output_dir: /data2/mayufeng/llamafactory_saves/gemma3n-e2b-asr-nemo/e4b-hausa-test-v1-unsloth
+overwrite_output_dir: true
+
+num_train_epochs: 5.0
+
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 8
+
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+adam_beta2: 0.95
+max_grad_norm: 1.0
+gradient_checkpointing: false
+
+logging_steps: 10
+eval_strategy: steps
+eval_steps: 500
+save_steps: 2000
+save_total_limit: 5
+load_best_model_at_end: true
+metric_for_best_model: loss
+greater_is_better: false
+
+ddp_timeout: 1800
+ddp_find_unused_parameters: false
+
+seed: 42
+report_to: tensorboard
+audio_padding: longest
+eval_num_samples: 16
+eval_loss_on_full_dataset: true  # loss 用全量 eval；WER/CER 等生成指标用 eval_num_samples 子集
+compute_wer_cer: true
