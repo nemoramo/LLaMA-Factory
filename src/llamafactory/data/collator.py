@@ -120,9 +120,18 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_audlens.append(len(audios))
             batch_input_ids.append(feature["input_ids"])
 
+        # NOTE:
+        # Some workflows (e.g. prompt packing) pre-compute `position_ids` and produce fixed-length sequences.
+        # In such cases, appending dummy multimodal tokens would (1) exceed the model's max length and
+        # (2) create ragged `position_ids`, which breaks `tokenizer.pad`.
+        allow_fake_mm = not any("position_ids" in f for f in features)
+
         fake_input_ids = []
         if (
-            self.template.mm_plugin.image_token is not None and sum(batch_imglens) == 0 and sum(batch_vidlens) == 0
+            allow_fake_mm
+            and self.template.mm_plugin.image_token is not None
+            and sum(batch_imglens) == 0
+            and sum(batch_vidlens) == 0
         ):  # avoid process hanging in zero3/fsdp case
             fake_messages = [{"role": "user", "content": IMAGE_PLACEHOLDER}]
             fake_images = [Image.new("RGB", (64, 64), (255, 255, 255))]
@@ -138,7 +147,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_imglens[0] = 1
 
         if (
-            self.template.mm_plugin.audio_token is not None and sum(batch_audlens) == 0
+            allow_fake_mm and self.template.mm_plugin.audio_token is not None and sum(batch_audlens) == 0
         ):  # avoid process hanging in zero3/fsdp case
             fake_messages = [{"role": "user", "content": AUDIO_PLACEHOLDER}]
             fake_audios = [np.zeros(1600)]
@@ -162,6 +171,22 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 features[0]["input_ids"] = fake_input_ids + features[0]["input_ids"]
                 features[0]["attention_mask"] = [0] * len(fake_input_ids) + features[0]["attention_mask"]
                 features[0]["labels"] = [IGNORE_INDEX] * len(fake_input_ids) + features[0]["labels"]
+
+            if "position_ids" in features[0]:
+                pos = features[0]["position_ids"]
+                pad = [0] * len(fake_input_ids)
+                if torch.is_tensor(pos):
+                    pad_tensor = torch.zeros(len(fake_input_ids), dtype=pos.dtype, device=pos.device)
+                    if self.tokenizer.padding_side == "right":
+                        pos = torch.cat([pos, pad_tensor], dim=-1)
+                    else:
+                        pos = torch.cat([pad_tensor, pos], dim=-1)
+                elif isinstance(pos, list):
+                    if self.tokenizer.padding_side == "right":
+                        pos = pos + pad
+                    else:
+                        pos = pad + pos
+                features[0]["position_ids"] = pos
 
             batch_input_ids[0] = features[0]["input_ids"]
 

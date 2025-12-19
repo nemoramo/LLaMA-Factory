@@ -13,7 +13,7 @@ num_beams: 1
 max_new_tokens: 256
 
 # 评估用：开启生成才能计算 WER/CER
-predict_with_generate: false
+predict_with_generate: true
 
 
 bf16: true

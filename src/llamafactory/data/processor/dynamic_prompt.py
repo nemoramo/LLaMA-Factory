@@ -357,6 +357,9 @@ class DynamicPromptPackedBatchProcessor:
         self.shuffle_packs = bool(shuffle_packs)
         self.dataset_converter = dataset_converter
         self.id_key = id_key
+        self._buffer_idx = 0
+        self._seen_samples = 0
+        self._log_every = int(getattr(data_args, "dynamic_prompt_packing_log_interval", 0) or 0)
 
         self._base_seed = seed
         self._rng: random.Random | None = None
@@ -668,6 +671,14 @@ class DynamicPromptPackedBatchProcessor:
                     f"len({k})={len(v)} vs batch_size={batch_size}"
                 )
 
+        self._buffer_idx += 1
+        self._seen_samples += batch_size
+        if self._log_every > 0 and self._buffer_idx % self._log_every == 0:
+            logger.info_rank0(
+                f"Dynamic prompt packing: processed {self._buffer_idx} buffers, "
+                f"{self._seen_samples} raw samples (latest buffer_size={batch_size})."
+            )
+
         rng = self._get_rng()
 
         cutoff_len = int(self.data_args.cutoff_len)
@@ -921,7 +932,26 @@ def build_dynamic_prompt_packed_iterable_dataset(
     try:
         iterable_ds = dataset.to_iterable_dataset(num_shards=int(num_shards))
     except Exception as err:
-        raise ValueError("Dynamic prompt packing requires `dataset.to_iterable_dataset(num_shards=...)`.") from err
+        # HF `datasets` does not always support converting a formatted map-style dataset (e.g. `with_transform`,
+        # `with_format`, or selected columns/format kwargs) into an iterable dataset. Clear formatting/transform
+        # and retry.
+        try:
+            unformatted = dataset
+            if hasattr(unformatted, "reset_format"):
+                try:
+                    unformatted.reset_format()
+                except Exception:
+                    pass
+            if hasattr(unformatted, "with_format"):
+                try:
+                    unformatted = unformatted.with_format(None)
+                except Exception:
+                    pass
+
+            iterable_ds = unformatted.to_iterable_dataset(num_shards=int(num_shards))
+            dataset = unformatted
+        except Exception:
+            raise ValueError("Dynamic prompt packing requires `dataset.to_iterable_dataset(num_shards=...)`.") from err
 
     raw_columns = getattr(dataset, "column_names", None)
     remove_columns = list(raw_columns) if isinstance(raw_columns, (list, tuple)) else None
