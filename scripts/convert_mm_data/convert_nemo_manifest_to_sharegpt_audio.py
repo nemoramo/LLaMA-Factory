@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--original-prob",
         type=float,
-        default=0.2,
+        default=0.3,
         help="抽到 original_text 作为目标 completion 的概率（0-1），无 original_text 时自动忽略",
     )
     p.add_argument(
@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--normalized-suffix",
         type=str,
-        default="Please provide a clean, normalized transcription (lowercase, no punctuation).",
+        default="Just provide a lowercased, normalized transcription without additional commentary.",
         help=(
             "Suffix for normalized(text) targets (typically lowercase, no punctuation); "
             "supports {lang}/{has_digits} placeholders."
@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--original-suffix",
         type=str,
-        default="Please transcribe verbatim, preserving casing and punctuation.",
+        default="Just transcribe the audio verbatim, preserving casing and punctuation without additional commentary.",
         help="Suffix for original_text targets; supports {lang}/{has_digits} placeholders.",
     )
     p.add_argument(
@@ -209,10 +209,10 @@ def convert_manifest(
     original_text_key: str = "original_text",
     lang_key: str = "lang",
     disable_prompt_pool: bool = False,
-    original_prob: float = 0.2,
+    original_prob: float = 0.3,
     lang_hint_prob: float = 0.1,
-    normalized_suffix: str = "Please provide a clean, normalized transcription (lowercase, no punctuation).",
-    original_suffix: str = "Please transcribe verbatim, preserving casing and punctuation.",
+    normalized_suffix: str = "Just provide a lowercased, normalized transcription without additional commentary.",
+    original_suffix: str = "Just transcribe the audio verbatim, preserving casing and punctuation without additional commentary.",
     lang_hint_template: str = "The language is {lang}.",
     digits_hint_template: str = "",
     digits_original_hint_template: str = "",
