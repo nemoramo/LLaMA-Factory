@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Standalone Unsloth Gemma-3n Audio SFT with dynamic prompt_pool sampling.
+"""Standalone Unsloth Gemma-3n Audio SFT with dynamic prompt_pool sampling.
 
 This script is intentionally *not* wired into LLaMA-Factory's Trainer / dataset pipeline.
 It consumes the ShareGPT-Audio jsonl produced by LLaMA-Factory converters:
@@ -10,8 +9,11 @@ It consumes the ShareGPT-Audio jsonl produced by LLaMA-Factory converters:
 
 Dynamic prompt behavior:
   - one prompt_pool entry is sampled per example at collate time
-  - entry.text is appended to the last user message
+  - entry.text is appended to the system prompt
   - entry.completion overwrites the assistant target text
+
+Eval behavior:
+  - prompt_pool uses the max-weight (Top1) entry (no sampling)
 
 Limitations:
   - only 1 audio per example is supported (len(audios) == 1).
@@ -21,12 +23,72 @@ from __future__ import annotations
 
 import argparse
 import copy
+import glob
 import hashlib
 import math
 import os
 import random
+import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
+
+try:
+    import numpy as np  # type: ignore
+except Exception:
+    np = None  # type: ignore
+
+try:
+    import torch  # type: ignore
+except Exception:
+    torch = None  # type: ignore
+
+try:
+    from datasets import load_dataset  # type: ignore
+except Exception:
+    load_dataset = None  # type: ignore
+
+try:
+    from torch.utils.data import get_worker_info  # type: ignore
+except Exception:
+    get_worker_info = None  # type: ignore
+
+try:
+    from unsloth import FastModel  # type: ignore
+except Exception:
+    FastModel = None  # type: ignore
+
+try:
+    from transformers import TrainerCallback  # type: ignore
+except Exception:
+    TrainerCallback = object  # type: ignore
+
+try:
+    from trl import SFTConfig, SFTTrainer  # type: ignore
+except Exception:
+    SFTConfig = None  # type: ignore
+    SFTTrainer = None  # type: ignore
+
+
+try:
+    import soundfile as sf  # type: ignore
+except Exception:
+    sf = None
+
+try:
+    import librosa  # type: ignore
+except Exception:
+    librosa = None
+
+try:
+    import torchaudio  # type: ignore
+    import torchaudio.functional as AF  # type: ignore
+except Exception:
+    torchaudio = None
+    AF = None
+
+
+DEFAULT_SYSTEM_PROMPT = "You are an assistant that transcribes speech accurately."
 
 
 def _sanitize_weight(w: Any) -> float:
@@ -37,6 +99,18 @@ def _sanitize_weight(w: Any) -> float:
     if not math.isfinite(fw) or fw < 0:
         return 0.0
     return fw
+
+
+def _top1_from_pool(pool: Sequence[Any]) -> Any:
+    if len(pool) == 0:
+        raise ValueError("prompt_pool is empty.")
+
+    def _key(item: Any) -> float:
+        if isinstance(item, dict) and "weight" in item:
+            return _sanitize_weight(item.get("weight"))
+        return 1.0
+
+    return max(pool, key=_key)
 
 
 def _stable_hash64(text: str) -> int:
@@ -76,7 +150,9 @@ def _get_sample_id(example: dict[str, Any], id_key: Optional[str]) -> str:
     return str(messages) if messages is not None else ""
 
 
-def _choose_from_pool_deterministic(pool: Sequence[Any], example: dict[str, Any], seed: int, id_key: Optional[str]) -> Any:
+def _choose_from_pool_deterministic(
+    pool: Sequence[Any], example: dict[str, Any], seed: int, id_key: Optional[str]
+) -> Any:
     if len(pool) == 0:
         raise ValueError("prompt_pool is empty.")
 
@@ -107,20 +183,51 @@ def _choose_from_pool_deterministic(pool: Sequence[Any], example: dict[str, Any]
     return values[int(h % len(values))]
 
 
-def _append_suffix_to_last_user(messages: list[dict[str, Any]], suffix: str) -> None:
+def _ensure_system_message(messages: list[dict[str, Any]], default_system_prompt: str) -> dict[str, Any]:
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "system":
+            return m
+    sys_msg = {"role": "system", "content": str(default_system_prompt or "")}
+    messages.insert(0, sys_msg)
+    return sys_msg
+
+
+def _append_suffix_to_system(messages: list[dict[str, Any]], suffix: str) -> None:
     if not suffix:
         return
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            base = m.get("content", "")
-            if not isinstance(base, str):
-                base = str(base)
-            sep = ""
-            if base and not base.endswith(("\n", " ")) and not suffix.startswith(("\n", " ")):
-                sep = "\n"
-            m["content"] = f"{base}{sep}{suffix}" if base else suffix
-            return
-    messages.append({"role": "user", "content": suffix})
+
+    sys_msg: Optional[dict[str, Any]] = None
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "system":
+            sys_msg = m
+            break
+    if sys_msg is None:
+        sys_msg = {"role": "system", "content": ""}
+        messages.insert(0, sys_msg)
+
+    content = sys_msg.get("content", "")
+    if isinstance(content, str):
+        base = content
+        sep = " " if base and not base.endswith((" ", "\n")) and not suffix.startswith((" ", "\n")) else ""
+        sys_msg["content"] = f"{base}{sep}{suffix}" if base else suffix
+        return
+
+    if isinstance(content, list):
+        # Best-effort support for multimodal-style content lists.
+        for item in reversed(content):
+            if isinstance(item, dict) and "text" in item:
+                base = "" if item.get("text") is None else str(item.get("text"))
+                sep = " " if base and not base.endswith((" ", "\n")) and not suffix.startswith((" ", "\n")) else ""
+                item["text"] = f"{base}{sep}{suffix}" if base else suffix
+                sys_msg["content"] = content
+                return
+        content.append({"type": "text", "text": suffix})
+        sys_msg["content"] = content
+        return
+
+    base = "" if content is None else str(content)
+    sep = " " if base and not base.endswith((" ", "\n")) and not suffix.startswith((" ", "\n")) else ""
+    sys_msg["content"] = f"{base}{sep}{suffix}" if base else suffix
 
 
 def _override_last_assistant(messages: list[dict[str, Any]], completion: Optional[str]) -> None:
@@ -136,8 +243,6 @@ def _override_last_assistant(messages: list[dict[str, Any]], completion: Optiona
 
 def _load_audio_array(path: str, target_sr: int) -> "list[float]":
     """Load mono audio and resample to target_sr if needed. Returns float32 list."""
-    import numpy as np
-
     if not path:
         raise ValueError("Empty audio path.")
     if not os.path.exists(path):
@@ -147,19 +252,18 @@ def _load_audio_array(path: str, target_sr: int) -> "list[float]":
     sr: Optional[int] = None
 
     # Try soundfile first (fast, common).
-    try:
-        import soundfile as sf  # type: ignore
-
-        audio, sr = sf.read(path, always_2d=False)
-    except Exception:
-        audio = None
-        sr = None
+    if sf is not None:
+        try:
+            audio, sr = sf.read(path, always_2d=False)
+        except Exception:
+            audio = None
+            sr = None
 
     # Fallback: librosa (handles many formats + resampling).
     if audio is None or sr is None:
+        if librosa is None:
+            raise RuntimeError(f"Failed to load audio: {path}. Install `soundfile` or `librosa`.")
         try:
-            import librosa  # type: ignore
-
             audio, sr = librosa.load(path, sr=None, mono=True)
         except Exception as e:
             raise RuntimeError(
@@ -181,17 +285,22 @@ def _load_audio_array(path: str, target_sr: int) -> "list[float]":
         raise RuntimeError(f"Audio sample rate unknown: {path}")
 
     if int(sr) != int(target_sr):
-        # Prefer librosa.resample if available, otherwise try torchaudio.
-        try:
-            import librosa  # type: ignore
+        resampled = False
 
-            audio = librosa.resample(audio, orig_sr=int(sr), target_sr=int(target_sr)).astype(np.float32)
-            sr = int(target_sr)
-        except Exception:
+        # Prefer librosa.resample if available.
+        if librosa is not None:
             try:
-                import torch
-                import torchaudio
+                audio = librosa.resample(audio, orig_sr=int(sr), target_sr=int(target_sr)).astype(np.float32)
+                sr = int(target_sr)
+                resampled = True
+            except Exception:
+                resampled = False
 
+        # Fallback: torchaudio resample.
+        if not resampled:
+            if torchaudio is None:
+                raise RuntimeError(f"Need `librosa` or `torchaudio` to resample {path} from {sr} -> {target_sr}.")
+            try:
                 wav = torch.from_numpy(audio).float().unsqueeze(0)
                 wav = torchaudio.functional.resample(wav, int(sr), int(target_sr))
                 audio = wav.squeeze(0).cpu().numpy().astype(np.float32)
@@ -205,6 +314,62 @@ def _load_audio_array(path: str, target_sr: int) -> "list[float]":
         raise RuntimeError(f"Empty audio after decoding: {path}")
 
     return audio.tolist()
+
+
+class SpecAugment:
+    """Waveform-level time masking (SpecAugment-style) using torchaudio.functional.mask_along_axis."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        mask_param: float = 0.1,
+        num_masks: int = 2,
+        fill_value: float = 0.0,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.mask_param = float(mask_param)
+        self.num_masks = int(num_masks)
+        self.fill_value = float(fill_value)
+
+    def __call__(self, audio: "list[float]", *, rng: random.Random) -> "list[float]":
+        if (not self.enabled) or self.mask_param <= 0 or self.num_masks <= 0:
+            return audio
+
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.ndim != 1:
+            arr = arr.reshape(-1)
+
+        length = int(arr.shape[0])
+        if length <= 1:
+            return arr.astype(np.float32, copy=False).tolist()
+
+        out = arr.astype(np.float32, copy=True)
+        max_len = int(length * float(self.mask_param))
+        if max_len <= 0:
+            return out.tolist()
+
+        if AF is None:
+            for _ in range(self.num_masks):
+                mask_len = rng.randint(0, max_len)
+                if mask_len <= 0:
+                    continue
+                start = rng.randrange(0, max(1, length - mask_len + 1))
+                out[start : start + mask_len] = float(self.fill_value)
+            return out.tolist()
+
+        x = torch.from_numpy(out).unsqueeze(0)  # [1, T]
+        for _ in range(self.num_masks):
+            seed = rng.randrange(0, 2**31 - 1)
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed)
+                x = AF.mask_along_axis(
+                    x,
+                    mask_param=max_len,
+                    mask_value=float(self.fill_value),
+                    axis=1,
+                )
+        return x.squeeze(0).cpu().numpy().astype(np.float32).tolist()
 
 
 def _extract_prompt_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -232,10 +397,6 @@ def _build_generation_prompt_text(
     *,
     dataset_audio_placeholder: str,
     dynamic_prompt: bool,
-    dynamic_prompt_deterministic: bool,
-    dynamic_prompt_id_key: Optional[str],
-    seed: int,
-    rng: random.Random,
 ) -> str:
     messages = example.get("messages")
     if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
@@ -244,18 +405,17 @@ def _build_generation_prompt_text(
 
     prompt_messages = _extract_prompt_messages(messages)
 
+    _ensure_system_message(prompt_messages, default_system_prompt=DEFAULT_SYSTEM_PROMPT)
+
     if dynamic_prompt:
         pool = example.get("prompt_pool")
         if isinstance(pool, list) and len(pool) > 0:
-            if dynamic_prompt_deterministic:
-                chosen = _choose_from_pool_deterministic(pool, example, seed=seed, id_key=dynamic_prompt_id_key)
-            else:
-                chosen = _choose_from_pool(pool, rng)
+            chosen = _top1_from_pool(pool)
             if isinstance(chosen, dict):
                 suffix = str(chosen.get("text") or chosen.get("suffix") or "")
             else:
                 suffix = "" if chosen is None else str(chosen)
-            _append_suffix_to_last_user(prompt_messages, suffix=suffix)
+            _append_suffix_to_system(prompt_messages, suffix=suffix)
 
     prompt_text = processor.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True).strip()
 
@@ -266,13 +426,36 @@ def _build_generation_prompt_text(
     return prompt_text.replace(dataset_audio_placeholder, audio_token)
 
 
-def _generate_and_dump_samples(
+def _get_dist_rank_world_size() -> tuple[int, int]:
+    rank = 0
+    world_size = 1
+    if torch is None:
+        return rank, world_size
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world_size = int(torch.distributed.get_world_size())
+            rank = int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return rank, world_size
+
+
+def _select_eval_generation_indices(*, dataset_len: int, num_samples: int, seed: int) -> list[int]:
+    n = int(dataset_len)
+    if n <= 0 or int(num_samples) <= 0:
+        return []
+    k = min(int(num_samples), n)
+    rng = random.Random(int(seed))
+    indices = list(range(n))
+    return rng.sample(indices, k) if n > k else indices
+
+
+def _generate_samples_for_indices(
     *,
     model: Any,
     processor: Any,
     dataset: Any,
-    output_path: str,
-    num_samples: int,
+    indices: Sequence[int],
     max_new_tokens: int,
     do_sample: bool,
     temperature: float,
@@ -281,16 +464,9 @@ def _generate_and_dump_samples(
     seed: int,
     dataset_audio_placeholder: str,
     dynamic_prompt: bool,
-    dynamic_prompt_deterministic: bool,
-    dynamic_prompt_id_key: Optional[str],
-    print_first: int = 3,
-) -> None:
-    if dataset is None or num_samples <= 0:
-        return
-
-    import json
-
-    import torch
+) -> list[dict[str, Any]]:
+    if dataset is None or not indices:
+        return []
 
     # Best-effort device resolution.
     try:
@@ -305,13 +481,6 @@ def _generate_and_dump_samples(
     )
     target_sr = int(target_sr)
 
-    n = len(dataset)
-    k = min(int(num_samples), int(n))
-    rng = random.Random(int(seed))
-    indices = list(range(n))
-    indices = rng.sample(indices, k) if n > k else indices
-
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     model_was_training = getattr(model, "training", False)
     model.eval()
 
@@ -321,8 +490,14 @@ def _generate_and_dump_samples(
         s = str(x).replace("\n", "\\n")
         return s if len(s) <= limit else s[: limit - 3] + "..."
 
-    printed = 0
-    with open(output_path, "w", encoding="utf-8") as f, torch.no_grad():
+    results: list[dict[str, Any]] = []
+    rank, _ = _get_dist_rank_world_size()
+    try:
+        torch.manual_seed(int(seed) + int(rank))
+    except Exception:
+        pass
+
+    with torch.no_grad():
         for idx in indices:
             ex = dataset[int(idx)]
 
@@ -331,10 +506,6 @@ def _generate_and_dump_samples(
                 ex,
                 dataset_audio_placeholder=dataset_audio_placeholder,
                 dynamic_prompt=dynamic_prompt,
-                dynamic_prompt_deterministic=dynamic_prompt_deterministic,
-                dynamic_prompt_id_key=dynamic_prompt_id_key,
-                seed=seed,
-                rng=rng,
             )
 
             audio_paths = ex.get("audios")
@@ -359,21 +530,101 @@ def _generate_and_dump_samples(
             completion_ids = gen_ids[0, prompt_len:]
             pred = processor.tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
 
-            ref = _extract_reference_text(ex.get("messages") or [])
-            row = {
-                "idx": int(idx),
-                "audio": audio_paths[0],
-                "prompt": prompt_text,
-                "reference": ref,
-                "prediction": pred,
-            }
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            if printed < int(print_first):
-                print(f"[gen] idx={int(idx)} pred={_short(pred)} | ref={_short(ref)}")
-                printed += 1
+            ref: Optional[str] = None
+            if dynamic_prompt:
+                pool = ex.get("prompt_pool")
+                if isinstance(pool, list) and len(pool) > 0:
+                    chosen = _top1_from_pool(pool)
+                    if isinstance(chosen, dict) and chosen.get("completion") is not None:
+                        ref = str(chosen.get("completion"))
+            if ref is None:
+                ref = _extract_reference_text(ex.get("messages") or [])
+
+            results.append(
+                {
+                    "idx": int(idx),
+                    "rank": int(rank),
+                    "pred": _short(pred),
+                    "ref": _short(ref),
+                }
+            )
 
     if model_was_training:
         model.train()
+    return results
+
+
+def _distributed_generate_and_print_samples(
+    *,
+    model: Any,
+    processor: Any,
+    dataset: Any,
+    num_samples: int,
+    max_new_tokens: int,
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    seed: int,
+    step_label: str,
+    dataset_audio_placeholder: str,
+    dynamic_prompt: bool,
+) -> None:
+    if dataset is None or int(num_samples) <= 0:
+        return
+
+    rank, world_size = _get_dist_rank_world_size()
+
+    indices = _select_eval_generation_indices(dataset_len=len(dataset), num_samples=int(num_samples), seed=int(seed))
+    if not indices:
+        return
+
+    local_indices = indices if world_size <= 1 else indices[int(rank) :: int(world_size)]
+    local_results = _generate_samples_for_indices(
+        model=model,
+        processor=processor,
+        dataset=dataset,
+        indices=local_indices,
+        max_new_tokens=int(max_new_tokens),
+        do_sample=bool(do_sample),
+        temperature=float(temperature),
+        top_p=float(top_p),
+        top_k=int(top_k),
+        seed=int(seed),
+        dataset_audio_placeholder=dataset_audio_placeholder,
+        dynamic_prompt=dynamic_prompt,
+    )
+
+    is_dist = False
+    try:
+        is_dist = bool(
+            torch is not None and torch.distributed.is_available() and torch.distributed.is_initialized() and world_size > 1
+        )
+    except Exception:
+        is_dist = False
+
+    if is_dist:
+        gathered: list[list[dict[str, Any]]] = [[] for _ in range(int(world_size))]
+        torch.distributed.all_gather_object(gathered, local_results)
+        if int(rank) != 0:
+            return
+        merged = [x for sub in gathered for x in sub]
+    else:
+        if int(rank) != 0:
+            return
+        merged = list(local_results)
+
+    position = {int(idx): pos for pos, idx in enumerate(indices)}
+    merged.sort(key=lambda r: position.get(int(r.get("idx", -1)), 1_000_000_000))
+
+    print(f"[eval-gen] step={step_label} samples={min(int(num_samples), len(dataset))} world_size={int(world_size)}")
+    for r in merged:
+        idx = int(r.get("idx", -1))
+        r_rank = int(r.get("rank", 0))
+        pred = str(r.get("pred", ""))
+        ref = str(r.get("ref", ""))
+        rank_suffix = f" rank={r_rank}" if int(world_size) > 1 else ""
+        print(f"[eval-gen] idx={idx}{rank_suffix} pred={pred} | ref={ref}")
 
 
 @dataclass
@@ -384,6 +635,12 @@ class DynamicPromptAudioCollator:
     dynamic_prompt_deterministic: bool = False
     dynamic_prompt_id_key: Optional[str] = None
     dataset_audio_placeholder: str = "<audio>"
+
+    specaug_enabled: bool = True
+    specaug_mask_param: float = 0.1
+    specaug_num_masks: int = 2
+    specaug_fill_value: float = 0.0
+    specaug_train_only: bool = True
 
     _rng: Optional[random.Random] = None
     _rng_seeded: bool = False
@@ -397,9 +654,6 @@ class DynamicPromptAudioCollator:
             rank = 0
             worker_seed = 0
             try:
-                import torch
-                from torch.utils.data import get_worker_info
-
                 wi = get_worker_info()
                 worker_id = wi.id if wi else 0
                 worker_seed = int(torch.initial_seed())
@@ -417,14 +671,14 @@ class DynamicPromptAudioCollator:
         return self._rng
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
-        import torch
-
         texts: list[str] = []
         prompt_texts: list[str] = []
         audios: list[list[float]] = []
 
         audio_placeholder = self.dataset_audio_placeholder
-        audio_token = getattr(self.processor, "audio_token", None) or getattr(self.processor.tokenizer, "audio_token", None)
+        audio_token = getattr(self.processor, "audio_token", None) or getattr(
+            self.processor.tokenizer, "audio_token", None
+        )
         if not isinstance(audio_token, str) or not audio_token:
             raise ValueError("Cannot determine Gemma3n audio_token from processor/tokenizer.")
 
@@ -440,6 +694,14 @@ class DynamicPromptAudioCollator:
         target_sr = int(target_sr)
 
         rng = self._get_rng()
+        is_eval_batch = any(bool(ex.get("__is_eval__", False)) for ex in examples)
+        apply_specaug = bool(self.specaug_enabled) and (not bool(self.specaug_train_only) or not is_eval_batch)
+        specaug = SpecAugment(
+            enabled=bool(self.specaug_enabled),
+            mask_param=float(self.specaug_mask_param),
+            num_masks=int(self.specaug_num_masks),
+            fill_value=float(self.specaug_fill_value),
+        )
 
         for ex in examples:
             messages = ex.get("messages")
@@ -447,10 +709,14 @@ class DynamicPromptAudioCollator:
                 raise ValueError("Each example must have `messages` as list[dict].")
             messages = copy.deepcopy(messages)
 
+            _ensure_system_message(messages, default_system_prompt=DEFAULT_SYSTEM_PROMPT)
+
             if self.dynamic_prompt:
                 pool = ex.get("prompt_pool")
                 if isinstance(pool, list) and len(pool) > 0:
-                    if self.dynamic_prompt_deterministic:
+                    if bool(ex.get("__is_eval__", False)):
+                        chosen = _top1_from_pool(pool)
+                    elif self.dynamic_prompt_deterministic:
                         chosen = _choose_from_pool_deterministic(pool, ex, seed=self.seed, id_key=self.dynamic_prompt_id_key)
                     else:
                         chosen = _choose_from_pool(pool, rng)
@@ -460,7 +726,7 @@ class DynamicPromptAudioCollator:
                     else:
                         suffix = str(chosen) if chosen is not None else ""
                         completion = None
-                    _append_suffix_to_last_user(messages, suffix=suffix)
+                    _append_suffix_to_system(messages, suffix=suffix)
                     _override_last_assistant(messages, completion=completion)
 
             # Build full text.
@@ -485,7 +751,10 @@ class DynamicPromptAudioCollator:
             audio_paths = ex.get("audios")
             if not (isinstance(audio_paths, list) and len(audio_paths) == 1 and isinstance(audio_paths[0], str)):
                 raise ValueError("This script currently supports exactly 1 audio per example (audios=[path]).")
-            audios.append(_load_audio_array(audio_paths[0], target_sr=target_sr))
+            audio_arr = _load_audio_array(audio_paths[0], target_sr=target_sr)
+            if apply_specaug:
+                audio_arr = specaug(audio_arr, rng=rng)
+            audios.append(audio_arr)
 
         # Tokenize full inputs (includes audio feature extraction + token_type_ids).
         batch = self.processor(text=texts, audio=audios, return_tensors="pt", padding=True)
@@ -508,7 +777,14 @@ class DynamicPromptAudioCollator:
         pad_id = getattr(tok, "pad_token_id", None)
         if pad_id is not None:
             labels[labels == int(pad_id)] = -100
-        for attr in ("image_token_id", "audio_token_id", "boi_token_id", "eoi_token_id", "boa_token_id", "eoa_token_id"):
+        for attr in (
+            "image_token_id",
+            "audio_token_id",
+            "boi_token_id",
+            "eoi_token_id",
+            "boa_token_id",
+            "eoa_token_id",
+        ):
             if hasattr(tok, attr):
                 labels[labels == int(getattr(tok, attr))] = -100
 
@@ -524,8 +800,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir", type=str, required=True)
 
     p.add_argument("--model_name", type=str, default="unsloth/gemma-3n-E4B-it")
-    p.add_argument("--max_seq_length", type=int, default=2048)
-    p.add_argument("--load_in_4bit", action="store_true")
+    p.add_argument("--max_seq_length", type=int, default=1024)
+    p.add_argument("--load_in_4bit", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--hf_token", type=str, default=None)
 
     # LoRA
@@ -538,18 +814,26 @@ def parse_args() -> argparse.Namespace:
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,post,linear_start,linear_end,embedding_projection",
         help="Comma-separated target module names for Unsloth LoRA injection.",
     )
-    p.add_argument("--finetune_vision_layers", action="store_true", help="Enable vision/audio branch finetuning in Unsloth.")
+    p.add_argument(
+        "--finetune_vision_layers", action="store_true", help="Enable vision/audio branch finetuning in Unsloth."
+    )
 
     # Training
-    p.add_argument("--per_device_train_batch_size", type=int, default=2)
+    p.add_argument("--per_device_train_batch_size", type=int, default=16)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    p.add_argument("--num_train_epochs", type=float, default=1.0)
+    p.add_argument("--num_train_epochs", type=float, default=2.0)
     p.add_argument("--learning_rate", type=float, default=5e-5)
     p.add_argument("--warmup_ratio", type=float, default=0.1)
     p.add_argument("--weight_decay", type=float, default=0.001)
     p.add_argument("--lr_scheduler_type", type=str, default="cosine")
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=200)
+    p.add_argument(
+        "--save_top_k",
+        type=int,
+        default=0,
+        help="Keep top-K checkpoints by lowest eval_loss (0 disables). Requires eval + save aligned (eval_steps == save_steps).",
+    )
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--report_to", type=str, default="none")
     p.add_argument("--optim", type=str, default="adamw_8bit")
@@ -570,18 +854,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dynamic_prompt_id_key", type=str, default=None)
     p.add_argument("--dataset_audio_placeholder", type=str, default="<audio>")
 
-    # Generative samples during eval / after training
-    p.add_argument("--eval_generate_samples", type=int, default=0, help="Dump N generations from eval set (0 disables).")
+    # SpecAugment
+    p.add_argument("--specaug", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--specaug_mask_param", type=float, default=0.1)
+    p.add_argument("--specaug_num_masks", type=int, default=2)
+    p.add_argument("--specaug_fill_value", type=float, default=0.0)
+    p.add_argument("--specaug_train_only", action=argparse.BooleanOptionalAction, default=True)
+
+    # Print generations during eval / after training
+    p.add_argument("--eval_generate_samples", type=int, default=0, help="Print N generations from eval set (0 disables).")
     p.add_argument("--eval_generate_max_new_tokens", type=int, default=128)
     p.add_argument("--eval_generate_do_sample", action="store_true")
     p.add_argument("--eval_generate_temperature", type=float, default=1.0)
     p.add_argument("--eval_generate_top_p", type=float, default=0.95)
     p.add_argument("--eval_generate_top_k", type=int, default=64)
-    p.add_argument(
-        "--eval_generate_dynamic_prompt",
-        action="store_true",
-        help="Sample prompt_pool for generation prompts (default: off).",
-    )
 
     return p.parse_args()
 
@@ -591,23 +877,62 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Import heavy deps lazily (keeps this file importable without torch).
-    import numpy as np
-    import torch
-    from datasets import load_dataset
-    from trl import SFTConfig, SFTTrainer
-    from unsloth import FastModel
-    from transformers import TrainerCallback
+    missing: list[str] = []
+    if np is None:
+        missing.append("numpy")
+    if torch is None:
+        missing.append("torch")
+    if load_dataset is None:
+        missing.append("datasets")
+    if TrainerCallback is object:
+        missing.append("transformers")
+    if FastModel is None:
+        missing.append("unsloth")
+    if SFTTrainer is None or SFTConfig is None:
+        missing.append("trl")
+    if missing:
+        raise RuntimeError(f"Missing required packages: {', '.join(sorted(set(missing)))}")
+
+    # TRL's SFTTrainer computes extra metrics (e.g. entropy) from `outputs.logits`.
+    # Unsloth may omit logits by default; force-enable logits for compatibility.
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
+
+    # Quantized (4-bit/8-bit) models cannot be moved across devices by Accelerate.
+    # Under torchrun/DDP, each rank must load the model directly onto its local GPU.
+    if bool(args.load_in_4bit) and torch.cuda.is_available():
+        try:
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        except Exception:
+            local_rank = 0
+        try:
+            torch.cuda.set_device(local_rank)
+        except Exception:
+            pass
+
+    def _is_world_process_zero_from_args(args_tr: Any) -> bool:
+        try:
+            should_save = getattr(args_tr, "should_save", None)
+            if should_save is not None:
+                return bool(should_save)
+        except Exception:
+            pass
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                return int(torch.distributed.get_rank()) == 0
+        except Exception:
+            pass
+        return True
 
     model, processor = FastModel.from_pretrained(
         model_name=args.model_name,
         dtype=None,  # auto
         max_seq_length=int(args.max_seq_length),
         load_in_4bit=bool(args.load_in_4bit),
+        device_map={"": torch.cuda.current_device()} if bool(args.load_in_4bit) and torch.cuda.is_available() else None,
         full_finetuning=False,
         token=args.hf_token,
     )
@@ -629,11 +954,27 @@ def main() -> None:
         target_modules=target_modules,
     )
 
+    trainable_params = sum(int(p.numel()) for p in model.parameters() if getattr(p, "requires_grad", False))
+    if trainable_params <= 0:
+        raise RuntimeError(
+            "No trainable parameters found after LoRA injection. "
+            "Check `--target_modules` and that Unsloth PEFT injection succeeded."
+        )
+
     train_dataset = load_dataset("json", data_files=args.train_jsonl, split="train")
     eval_dataset = load_dataset("json", data_files=args.eval_jsonl, split="train") if args.eval_jsonl else None
 
     if str(args.eval_strategy) != "no" and eval_dataset is None:
         raise ValueError("`--eval_strategy` requires `--eval_jsonl`.")
+
+    if eval_dataset is not None:
+        eval_dataset = eval_dataset.add_column("__is_eval__", np.ones(len(eval_dataset), dtype=np.bool_))
+
+    if int(args.save_top_k) > 0:
+        if eval_dataset is None or str(args.eval_strategy) == "no":
+            raise ValueError("`--save_top_k` requires `--eval_jsonl` and `--eval_strategy`.")
+        if str(args.eval_strategy) == "steps" and int(args.eval_steps) != int(args.save_steps):
+            raise ValueError("`--save_top_k` requires `--eval_steps == --save_steps` so each checkpoint has eval_loss.")
 
     collator = DynamicPromptAudioCollator(
         processor=processor,
@@ -642,20 +983,21 @@ def main() -> None:
         dynamic_prompt_deterministic=bool(args.dynamic_prompt_deterministic),
         dynamic_prompt_id_key=args.dynamic_prompt_id_key,
         dataset_audio_placeholder=args.dataset_audio_placeholder,
+        specaug_enabled=bool(args.specaug),
+        specaug_mask_param=float(args.specaug_mask_param),
+        specaug_num_masks=int(args.specaug_num_masks),
+        specaug_fill_value=float(args.specaug_fill_value),
+        specaug_train_only=bool(args.specaug_train_only),
     )
 
-    class _GenerateSamplesCallback(TrainerCallback):
+    class _PrintSamplesCallback(TrainerCallback):
         def on_evaluate(self, args_tr, state, control, **kwargs):  # noqa: ANN001
-            if eval_dataset is None:
+            if eval_dataset is None or int(args.eval_generate_samples) <= 0:
                 return control
-            if int(args.eval_generate_samples) <= 0:
-                return control
-            out_path = os.path.join(args.output_dir, f"eval_generations_step{int(state.global_step)}.jsonl")
-            _generate_and_dump_samples(
+            _distributed_generate_and_print_samples(
                 model=kwargs.get("model", model),
                 processor=processor,
                 dataset=eval_dataset,
-                output_path=out_path,
                 num_samples=int(args.eval_generate_samples),
                 max_new_tokens=int(args.eval_generate_max_new_tokens),
                 do_sample=bool(args.eval_generate_do_sample),
@@ -663,15 +1005,66 @@ def main() -> None:
                 top_p=float(args.eval_generate_top_p),
                 top_k=int(args.eval_generate_top_k),
                 seed=int(args.seed) + int(state.global_step),
+                step_label=str(int(state.global_step)),
                 dataset_audio_placeholder=args.dataset_audio_placeholder,
-                dynamic_prompt=bool(args.eval_generate_dynamic_prompt),
-                dynamic_prompt_deterministic=bool(args.dynamic_prompt_deterministic),
-                dynamic_prompt_id_key=args.dynamic_prompt_id_key,
+                dynamic_prompt=bool(args.dynamic_prompt),
             )
-            print(f"[eval-generate] wrote: {out_path}")
             return control
 
-    callbacks = [_GenerateSamplesCallback()] if eval_dataset is not None and int(args.eval_generate_samples) > 0 else None
+    class _TopKCheckpointCallback(TrainerCallback):
+        def __init__(self, k: int) -> None:
+            self.k = int(k)
+            self._loss_by_step: dict[int, float] = {}
+            self._kept: dict[str, float] = {}
+
+        def on_evaluate(self, args_tr, state, control, metrics=None, **kwargs):  # noqa: ANN001
+            if not _is_world_process_zero_from_args(args_tr):
+                return control
+            if metrics is None:
+                return control
+            loss = metrics.get("eval_loss")
+            if loss is None:
+                return control
+            try:
+                loss_f = float(loss)
+            except Exception:
+                return control
+            if not math.isfinite(loss_f):
+                return control
+            self._loss_by_step[int(state.global_step)] = loss_f
+            return control
+
+        def on_save(self, args_tr, state, control, **kwargs):  # noqa: ANN001
+            if not _is_world_process_zero_from_args(args_tr):
+                return control
+            if self.k <= 0:
+                return control
+            step = int(state.global_step)
+            loss = self._loss_by_step.get(step)
+            if loss is None:
+                return control
+
+            ckpt_dir = kwargs.get("checkpoint_folder") or os.path.join(str(args_tr.output_dir), f"checkpoint-{step}")
+            if isinstance(ckpt_dir, str) and os.path.isdir(ckpt_dir):
+                self._kept[ckpt_dir] = loss
+
+            keep_sorted = sorted(self._kept.items(), key=lambda kv: kv[1])[: self.k]
+            keep_paths = {p for p, _ in keep_sorted}
+
+            for path in glob.glob(os.path.join(str(args_tr.output_dir), "checkpoint-*")):
+                if os.path.isdir(path) and path not in keep_paths:
+                    shutil.rmtree(path, ignore_errors=True)
+                    self._kept.pop(path, None)
+
+            self._kept = {p: self._kept[p] for p in keep_paths if p in self._kept}
+            return control
+
+    callbacks_list: list[TrainerCallback] = []
+    if eval_dataset is not None and int(args.eval_generate_samples) > 0:
+        callbacks_list.append(_PrintSamplesCallback())
+    if int(args.save_top_k) > 0:
+        callbacks_list.append(_TopKCheckpointCallback(int(args.save_top_k)))
+    callbacks = callbacks_list if callbacks_list else None
 
     trainer = SFTTrainer(
         model=model,
@@ -693,7 +1086,7 @@ def main() -> None:
             logging_steps=int(args.logging_steps),
             eval_strategy=str(args.eval_strategy),
             eval_steps=int(args.eval_steps),
-            save_strategy="steps",
+            save_strategy="steps" if str(args.eval_strategy) == "no" else str(args.eval_strategy),
             save_steps=int(args.save_steps),
             optim=str(args.optim),
             seed=int(args.seed),
@@ -707,14 +1100,12 @@ def main() -> None:
     )
 
     trainer.train()
-    # If no periodic eval is configured, still allow dumping a few generations after training.
+    # If no periodic eval is configured, still allow printing a few generations after training.
     if eval_dataset is not None and int(args.eval_generate_samples) > 0 and str(args.eval_strategy) == "no":
-        out_path = os.path.join(args.output_dir, "eval_generations_final.jsonl")
-        _generate_and_dump_samples(
+        _distributed_generate_and_print_samples(
             model=model,
             processor=processor,
             dataset=eval_dataset,
-            output_path=out_path,
             num_samples=int(args.eval_generate_samples),
             max_new_tokens=int(args.eval_generate_max_new_tokens),
             do_sample=bool(args.eval_generate_do_sample),
@@ -722,18 +1113,17 @@ def main() -> None:
             top_p=float(args.eval_generate_top_p),
             top_k=int(args.eval_generate_top_k),
             seed=int(args.seed),
+            step_label="final",
             dataset_audio_placeholder=args.dataset_audio_placeholder,
-            dynamic_prompt=bool(args.eval_generate_dynamic_prompt),
-            dynamic_prompt_deterministic=bool(args.dynamic_prompt_deterministic),
-            dynamic_prompt_id_key=args.dynamic_prompt_id_key,
+            dynamic_prompt=bool(args.dynamic_prompt),
         )
-        print(f"[eval-generate] wrote: {out_path}")
 
     trainer.save_model(args.output_dir)
-    try:
-        processor.save_pretrained(args.output_dir)
-    except Exception:
-        pass
+    if trainer.is_world_process_zero():
+        try:
+            processor.save_pretrained(args.output_dir)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
