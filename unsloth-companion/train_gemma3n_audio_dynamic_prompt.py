@@ -28,7 +28,9 @@ import hashlib
 import math
 import os
 import random
+import re
 import shutil
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -60,8 +62,10 @@ except Exception:
 
 try:
     from transformers import TrainerCallback  # type: ignore
+    from transformers import Trainer  # type: ignore
 except Exception:
     TrainerCallback = object  # type: ignore
+    Trainer = None  # type: ignore
 
 try:
     from trl import SFTConfig, SFTTrainer  # type: ignore
@@ -259,15 +263,40 @@ def _load_audio_array(path: str, target_sr: int) -> "list[float]":
             audio = None
             sr = None
 
-    # Fallback: librosa (handles many formats + resampling).
+    # Fallback: torchaudio / torchcodec (avoids librosa's audioread deprecation warnings).
+    if audio is None or sr is None:
+        if torchaudio is not None and torch is not None:
+            try:
+                wav, sr = torchaudio.load(path)  # float32, channels_first=True
+                if wav.ndim == 2:
+                    wav = wav.mean(dim=0)
+                elif wav.ndim != 1:
+                    wav = wav.reshape(-1)
+                audio = wav.cpu().numpy()
+            except Exception:
+                audio = None
+                sr = None
+
+    # Last resort: librosa (handles many formats; may rely on audioread which is deprecated in librosa>=0.10).
     if audio is None or sr is None:
         if librosa is None:
-            raise RuntimeError(f"Failed to load audio: {path}. Install `soundfile` or `librosa`.")
+            raise RuntimeError(f"Failed to load audio: {path}. Install `soundfile`, `torchaudio` or `librosa`.")
         try:
-            audio, sr = librosa.load(path, sr=None, mono=True)
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"PySoundFile failed\. Trying audioread instead\.",
+                    category=UserWarning,
+                )
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"librosa\.core\.audio\.__audioread_load.*Deprecated.*",
+                    category=FutureWarning,
+                )
+                audio, sr = librosa.load(path, sr=None, mono=True)
         except Exception as e:
             raise RuntimeError(
-                f"Failed to load audio: {path}. Install `soundfile` or `librosa`. Original error: {e}"
+                f"Failed to load audio: {path}. Install `soundfile`, `torchaudio` or `librosa`. Original error: {e}"
             ) from e
 
     audio = np.asarray(audio)
@@ -287,8 +316,19 @@ def _load_audio_array(path: str, target_sr: int) -> "list[float]":
     if int(sr) != int(target_sr):
         resampled = False
 
-        # Prefer librosa.resample if available.
-        if librosa is not None:
+        # Prefer torchaudio resample if available (keeps librosa optional).
+        if AF is not None and torch is not None:
+            try:
+                wav = torch.from_numpy(audio).float().unsqueeze(0)  # [1, T]
+                wav = AF.resample(wav, int(sr), int(target_sr))
+                audio = wav.squeeze(0).cpu().numpy().astype(np.float32)
+                sr = int(target_sr)
+                resampled = True
+            except Exception:
+                resampled = False
+
+        # Fallback: librosa.resample.
+        if (not resampled) and librosa is not None:
             try:
                 audio = librosa.resample(audio, orig_sr=int(sr), target_sr=int(target_sr)).astype(np.float32)
                 sr = int(target_sr)
@@ -296,19 +336,8 @@ def _load_audio_array(path: str, target_sr: int) -> "list[float]":
             except Exception:
                 resampled = False
 
-        # Fallback: torchaudio resample.
         if not resampled:
-            if torchaudio is None:
-                raise RuntimeError(f"Need `librosa` or `torchaudio` to resample {path} from {sr} -> {target_sr}.")
-            try:
-                wav = torch.from_numpy(audio).float().unsqueeze(0)
-                wav = torchaudio.functional.resample(wav, int(sr), int(target_sr))
-                audio = wav.squeeze(0).cpu().numpy().astype(np.float32)
-                sr = int(target_sr)
-            except Exception as e:
-                raise RuntimeError(
-                    f"Need `librosa` or `torchaudio` to resample {path} from {sr} -> {target_sr}. Error: {e}"
-                ) from e
+            raise RuntimeError(f"Need `torchaudio` or `librosa` to resample {path} from {sr} -> {target_sr}.")
 
     if audio.size == 0:
         raise RuntimeError(f"Empty audio after decoding: {path}")
@@ -832,13 +861,26 @@ def parse_args() -> argparse.Namespace:
         "--save_top_k",
         type=int,
         default=0,
-        help="Keep top-K checkpoints by lowest eval_loss (0 disables). Requires eval + save aligned (eval_steps == save_steps).",
+        help=(
+            "Keep K checkpoints (0 disables). "
+            "With eval enabled: keep best K by lowest eval_loss (requires eval_steps == save_steps). "
+            "With eval disabled: keep latest K by step."
+        ),
     )
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--report_to", type=str, default="none")
     p.add_argument("--optim", type=str, default="adamw_8bit")
-    p.add_argument("--dataloader_num_workers", type=int, default=0)
+    p.add_argument("--dataloader_num_workers", type=int, default=10)
     p.add_argument("--per_device_eval_batch_size", type=int, default=1)
+    p.add_argument(
+        "--trl_logit_metrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Whether to keep TRL SFTTrainer's extra metrics (entropy / mean_token_accuracy). "
+            "These require full logits and can cause OOM with large vocab models; default: off."
+        ),
+    )
 
     # Eval loop (Transformers v4.56 uses `eval_strategy` instead of `evaluation_strategy`)
     p.add_argument("--eval_strategy", type=str, default="no", choices=["no", "steps", "epoch"])
@@ -893,9 +935,10 @@ def main() -> None:
     if missing:
         raise RuntimeError(f"Missing required packages: {', '.join(sorted(set(missing)))}")
 
-    # TRL's SFTTrainer computes extra metrics (e.g. entropy) from `outputs.logits`.
-    # Unsloth may omit logits by default; force-enable logits for compatibility.
-    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+    # TRL's SFTTrainer computes extra metrics (entropy / mean_token_accuracy) from `outputs.logits`.
+    # Gemma-3n has a huge vocab (e.g. 262400), so materializing full logits can easily OOM.
+    # Default: disable these metrics and let Unsloth use its fused CE loss path (no logits).
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "1" if bool(args.trl_logit_metrics) else "0"
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -970,11 +1013,11 @@ def main() -> None:
     if eval_dataset is not None:
         eval_dataset = eval_dataset.add_column("__is_eval__", np.ones(len(eval_dataset), dtype=np.bool_))
 
-    if int(args.save_top_k) > 0:
-        if eval_dataset is None or str(args.eval_strategy) == "no":
-            raise ValueError("`--save_top_k` requires `--eval_jsonl` and `--eval_strategy`.")
-        if str(args.eval_strategy) == "steps" and int(args.eval_steps) != int(args.save_steps):
-            raise ValueError("`--save_top_k` requires `--eval_steps == --save_steps` so each checkpoint has eval_loss.")
+    # `--save_top_k`:
+    # - with eval enabled: keep best K checkpoints by lowest eval_loss
+    # - with eval disabled: keep latest K checkpoints by step
+    if int(args.save_top_k) > 0 and eval_dataset is None and str(args.eval_strategy) != "no":
+        raise ValueError("`--save_top_k` with eval requires `--eval_jsonl`.")
 
     collator = DynamicPromptAudioCollator(
         processor=processor,
@@ -994,21 +1037,33 @@ def main() -> None:
         def on_evaluate(self, args_tr, state, control, **kwargs):  # noqa: ANN001
             if eval_dataset is None or int(args.eval_generate_samples) <= 0:
                 return control
-            _distributed_generate_and_print_samples(
-                model=kwargs.get("model", model),
-                processor=processor,
-                dataset=eval_dataset,
-                num_samples=int(args.eval_generate_samples),
-                max_new_tokens=int(args.eval_generate_max_new_tokens),
-                do_sample=bool(args.eval_generate_do_sample),
-                temperature=float(args.eval_generate_temperature),
-                top_p=float(args.eval_generate_top_p),
-                top_k=int(args.eval_generate_top_k),
-                seed=int(args.seed) + int(state.global_step),
-                step_label=str(int(state.global_step)),
-                dataset_audio_placeholder=args.dataset_audio_placeholder,
-                dynamic_prompt=bool(args.dynamic_prompt),
-            )
+            try:
+                _distributed_generate_and_print_samples(
+                    model=kwargs.get("model", model),
+                    processor=processor,
+                    dataset=eval_dataset,
+                    num_samples=int(args.eval_generate_samples),
+                    max_new_tokens=int(args.eval_generate_max_new_tokens),
+                    do_sample=bool(args.eval_generate_do_sample),
+                    temperature=float(args.eval_generate_temperature),
+                    top_p=float(args.eval_generate_top_p),
+                    top_k=int(args.eval_generate_top_k),
+                    seed=int(args.seed) + int(state.global_step),
+                    step_label=str(int(state.global_step)),
+                    dataset_audio_placeholder=args.dataset_audio_placeholder,
+                    dynamic_prompt=bool(args.dynamic_prompt),
+                )
+            except Exception as e:
+                msg = str(e).lower()
+                is_oom = "out of memory" in msg or "cuda error" in msg and "memory" in msg
+                if is_oom and torch is not None and torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    print(f"[eval-gen] skipped due to OOM at step={int(state.global_step)}: {e}")
+                else:
+                    raise
             return control
 
     class _TopKCheckpointCallback(TrainerCallback):
@@ -1059,14 +1114,69 @@ def main() -> None:
             self._kept = {p: self._kept[p] for p in keep_paths if p in self._kept}
             return control
 
+    class _KeepLastKCheckpointsCallback(TrainerCallback):
+        def __init__(self, k: int) -> None:
+            self.k = int(k)
+
+        def on_save(self, args_tr, state, control, **kwargs):  # noqa: ANN001
+            if not _is_world_process_zero_from_args(args_tr):
+                return control
+            if self.k <= 0:
+                return control
+
+            out_dir = str(args_tr.output_dir)
+            checkpoints: list[tuple[int, str]] = []
+            for path in glob.glob(os.path.join(out_dir, "checkpoint-*")):
+                if not os.path.isdir(path):
+                    continue
+                base = os.path.basename(path)
+                m = re.search(r"checkpoint-(\\d+)$", base)
+                step = int(m.group(1)) if m else -1
+                checkpoints.append((step, path))
+
+            checkpoints.sort(key=lambda x: x[0], reverse=True)
+            keep_paths = {p for _, p in checkpoints[: self.k]}
+            for _, path in checkpoints[self.k :]:
+                if path not in keep_paths:
+                    shutil.rmtree(path, ignore_errors=True)
+
+            return control
+
     callbacks_list: list[TrainerCallback] = []
     if eval_dataset is not None and int(args.eval_generate_samples) > 0:
         callbacks_list.append(_PrintSamplesCallback())
-    if int(args.save_top_k) > 0:
-        callbacks_list.append(_TopKCheckpointCallback(int(args.save_top_k)))
+
+    save_top_k = int(args.save_top_k)
+    use_topk_by_loss = bool(eval_dataset is not None and str(args.eval_strategy) != "no")
+    if save_top_k > 0:
+        if use_topk_by_loss:
+            if str(args.eval_strategy) == "steps" and int(args.eval_steps) != int(args.save_steps):
+                raise ValueError("`--save_top_k` requires `--eval_steps == --save_steps` so each checkpoint has eval_loss.")
+            callbacks_list.append(_TopKCheckpointCallback(save_top_k))
+        else:
+            callbacks_list.append(_KeepLastKCheckpointsCallback(save_top_k))
     callbacks = callbacks_list if callbacks_list else None
 
-    trainer = SFTTrainer(
+    if bool(args.trl_logit_metrics):
+        TrainerCls = SFTTrainer
+    else:
+        if Trainer is None:
+            raise RuntimeError("`transformers.Trainer` is required.")
+
+        class _SFTTrainerNoLogitMetrics(SFTTrainer):  # type: ignore[misc]
+            def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):  # noqa: ANN001
+                inputs["use_cache"] = False
+                return Trainer.compute_loss(
+                    self,
+                    model,
+                    inputs,
+                    return_outputs=bool(return_outputs),
+                    num_items_in_batch=num_items_in_batch,
+                )
+
+        TrainerCls = _SFTTrainerNoLogitMetrics
+
+    trainer = TrainerCls(
         model=model,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -1095,6 +1205,8 @@ def main() -> None:
             remove_unused_columns=False,
             packing=False,
             dataset_kwargs={"skip_prepare_dataset": True},
+            prediction_loss_only=not bool(args.trl_logit_metrics),
+            ddp_find_unused_parameters=False,
             gradient_checkpointing_kwargs={"use_reentrant": False},
         ),
     )
