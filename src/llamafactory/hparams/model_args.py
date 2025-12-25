@@ -366,6 +366,22 @@ class ProcessorArguments:
         default="max_length",
         metadata={"help": "Padding strategy used by the audio feature extractor."},
     )
+    audio_specaugment: bool = field(
+        default=False,
+        metadata={"help": "Enable waveform-level SpecAugment (time masking) for audio inputs during training."},
+    )
+    audio_specaugment_mask_param: float = field(
+        default=0.1,
+        metadata={"help": "Maximum masked ratio (0-1) along the time axis for audio SpecAugment."},
+    )
+    audio_specaugment_num_masks: int = field(
+        default=2,
+        metadata={"help": "Number of time masks to apply per audio sample for audio SpecAugment."},
+    )
+    audio_specaugment_fill_value: float = field(
+        default=0.0,
+        metadata={"help": "Fill value used for masked segments in audio SpecAugment."},
+    )
 
     def __post_init__(self):
         if self.image_max_pixels < self.image_min_pixels:
@@ -376,6 +392,12 @@ class ProcessorArguments:
 
         if self.audio_padding not in ["max_length", "longest"]:
             raise ValueError("`audio_padding` must be either 'max_length' or 'longest'.")
+
+        if self.audio_specaugment_mask_param < 0.0 or self.audio_specaugment_mask_param > 1.0:
+            raise ValueError("`audio_specaugment_mask_param` must be in [0, 1].")
+
+        if self.audio_specaugment_num_masks < 0:
+            raise ValueError("`audio_specaugment_num_masks` must be >= 0.")
 
 
 @dataclass

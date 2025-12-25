@@ -33,7 +33,7 @@
     ]
   }
 
-`prompt_pool.text` 会在训练时被追加到最后一个 user 消息后；如果 entry 带有
+`prompt_pool.text` 会在训练时被追加到 system prompt 后；如果 entry 带有
 `completion`，则会覆盖 assistant 的目标文本，从而实现 original/text 的动态切换。
 
 注意：ASR 场景里 `text` 通常是规范化转写（例如 lowercase、no punctuation）。如果某些样本的

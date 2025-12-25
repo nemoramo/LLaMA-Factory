@@ -15,13 +15,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+import random
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from peft import PeftModel
+from torch.utils.data import get_worker_info
 from transformers import DataCollatorForSeq2Seq
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
@@ -30,6 +32,11 @@ from ..extras.packages import is_pillow_available
 
 if is_pillow_available():
     from PIL import Image
+
+try:
+    import torchaudio.functional as AF  # type: ignore
+except Exception:  # noqa: BLE001
+    AF = None
 
 
 if TYPE_CHECKING:
@@ -90,6 +97,12 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
     template: Optional["Template"] = None
     processor: Optional["ProcessorMixin"] = None
+    audio_specaugment: bool = False
+    audio_specaugment_mask_param: float = 0.1
+    audio_specaugment_num_masks: int = 2
+    audio_specaugment_fill_value: float = 0.0
+    _specaug_rng: Optional[random.Random] = field(default=None, init=False, repr=False)
+    _specaug_rng_seeded: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
         if self.template is None:
@@ -104,6 +117,71 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             self.get_rope_func = self.model.model.get_rope_index  # transformers >= 4.52.0
         else:
             self.get_rope_func = None
+
+    def _get_specaug_rng(self) -> random.Random:
+        if self._specaug_rng is None:
+            self._specaug_rng = random.Random()
+
+        if not self._specaug_rng_seeded:
+            worker_info = get_worker_info()
+            worker_id = worker_info.id if worker_info else 0
+
+            rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                try:
+                    rank = int(torch.distributed.get_rank())
+                except Exception:
+                    rank = 0
+
+            worker_seed = int(torch.initial_seed())
+            mixed = (worker_seed + rank * 1000 + worker_id) % (2**32)
+            self._specaug_rng.seed(mixed)
+            self._specaug_rng_seeded = True
+
+        return self._specaug_rng
+
+    def _apply_audio_specaugment(self, audio: np.ndarray) -> np.ndarray:
+        if not self.audio_specaugment:
+            return audio
+
+        if self.audio_specaugment_mask_param <= 0 or self.audio_specaugment_num_masks <= 0:
+            return audio
+
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.ndim != 1:
+            arr = arr.reshape(-1)
+
+        length = int(arr.shape[0])
+        if length <= 1:
+            return arr.astype(np.float32, copy=False)
+
+        out = arr.astype(np.float32, copy=True)
+        max_len = int(length * float(self.audio_specaugment_mask_param))
+        if max_len <= 0:
+            return out
+
+        rng = self._get_specaug_rng()
+        if AF is None:
+            for _ in range(int(self.audio_specaugment_num_masks)):
+                mask_len = rng.randint(0, max_len)
+                if mask_len <= 0:
+                    continue
+                start = rng.randrange(0, max(1, length - mask_len + 1))
+                out[start : start + mask_len] = float(self.audio_specaugment_fill_value)
+            return out
+
+        x = torch.from_numpy(out).unsqueeze(0)  # [1, T]
+        for _ in range(int(self.audio_specaugment_num_masks)):
+            seed = rng.randrange(0, 2**31 - 1)
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(seed)
+                x = AF.mask_along_axis(
+                    x,
+                    mask_param=max_len,
+                    mask_value=float(self.audio_specaugment_fill_value),
+                    axis=1,
+                )
+        return x.squeeze(0).cpu().numpy().astype(np.float32)
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
@@ -189,6 +267,19 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 features[0]["position_ids"] = pos
 
             batch_input_ids[0] = features[0]["input_ids"]
+
+        if self.audio_specaugment and len(batch_audios) != 0:
+            if self.processor is None:
+                raise ValueError("Processor is required for audio SpecAugment.")
+            if self.template is None:
+                raise ValueError("Template is required for audio SpecAugment.")
+
+            audio_sampling_rate = getattr(self.processor, "audio_sampling_rate", 16000)
+            augmented_audios: list[np.ndarray] = []
+            for audio in batch_audios:
+                y, _ = self.template.mm_plugin._load_single_audio(audio, float(audio_sampling_rate))
+                augmented_audios.append(self._apply_audio_specaugment(y))
+            batch_audios = augmented_audios
 
         mm_inputs = self.template.mm_plugin.get_mm_inputs(
             batch_images,

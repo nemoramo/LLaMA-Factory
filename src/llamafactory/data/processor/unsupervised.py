@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ...extras import logging
 from ..data_utils import Role
-from .processor_utils import DatasetProcessor, infer_seqlen
+from .processor_utils import DatasetProcessor, apply_prompt_pool_top1_to_example, infer_seqlen
 
 
 if TYPE_CHECKING:
@@ -59,17 +59,26 @@ class UnsupervisedDatasetProcessor(DatasetProcessor):
     def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
         # build inputs with format `<bos> X` and labels with format `Y <eos>`
         model_inputs = defaultdict(list)
+        has_pool = getattr(self.data_args, "dynamic_prompt_sampling", False) and "_prompt_pool" in examples
         for i in range(len(examples["_prompt"])):
-            if len(examples["_prompt"][i]) % 2 != 1:
+            prompt = examples["_prompt"][i]
+            response = examples["_response"][i]
+            system = examples["_system"][i]
+            if has_pool:
+                prompt, response, system = apply_prompt_pool_top1_to_example(
+                    prompt, response, system, examples["_prompt_pool"][i]
+                )
+
+            if len(prompt) % 2 != 1:
                 logger.warning_rank0(
-                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
+                    "Dropped invalid example: {}".format(prompt + response)
                 )
                 continue
 
             input_ids, labels = self._encode_data_example(
-                prompt=examples["_prompt"][i],
-                response=examples["_response"][i],
-                system=examples["_system"][i],
+                prompt=prompt,
+                response=response,
+                system=system,
                 tools=examples["_tools"][i],
                 images=examples["_images"][i] or [],
                 videos=examples["_videos"][i] or [],

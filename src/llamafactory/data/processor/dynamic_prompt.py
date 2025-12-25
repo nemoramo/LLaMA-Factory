@@ -42,7 +42,7 @@ class DynamicPromptDataset(Dataset):
     Expected aligned fields per sample:
     - _prompt_pool: optional list[...] of candidate *suffix prompts*.
       Each entry can be:
-        * str: suffix appended to the last user message.
+        * str: suffix appended to the system prompt.
         * dict: {"text": "...", "weight": 0.2, "completion": "..."} for weighted suffix + optional target override.
         * list[dict]: full prompt messages to replace current prompt.
     - _prompt: list[{"role": ..., "content": ...}]  (fallback when no pool)
@@ -231,6 +231,39 @@ class DynamicPromptDataset(Dataset):
             return self._choose_from_pool_deterministic(pool, example)
         return self._choose_from_pool(pool)
 
+    @staticmethod
+    def _append_suffix_to_system(system: str | None, suffix: str) -> str:
+        base = "" if system is None else str(system)
+        suffix = "" if suffix is None else str(suffix)
+        if not suffix:
+            return base
+        if not base:
+            return suffix
+        sep = ""
+        if base and not base.endswith(("\n", " ")) and not suffix.startswith(("\n", " ")):
+            sep = "\n"
+        return f"{base}{sep}{suffix}"
+
+    def _build_system_message(self, example: dict[str, Any], chosen: Any | None) -> str | None:
+        """Build system message, optionally applying a sampled pool entry as a suffix."""
+        system = example.get("_system")
+        if chosen is None:
+            return system
+
+        # If pool entry is a full prompt (list[dict]), do not touch system.
+        if isinstance(chosen, list) and all(isinstance(m, dict) for m in chosen):
+            return system
+
+        # Otherwise treat as suffix (string or config dict with "text"/"suffix"/"content").
+        if isinstance(chosen, dict):
+            suffix = str(chosen.get("text") or chosen.get("suffix") or chosen.get("content") or "")
+        else:
+            suffix = str(chosen)
+
+        if not suffix:
+            return system
+        return self._append_suffix_to_system(system, suffix)
+
     def _build_prompt_messages(self, example: dict[str, Any], chosen: Any | None) -> list[dict[str, Any]]:
         """Build prompt messages, optionally applying a sampled pool entry."""
         prompt_messages = example.get("_prompt") or []
@@ -244,35 +277,6 @@ class DynamicPromptDataset(Dataset):
         # If pool entry is a full prompt (list[dict]), use it directly.
         if isinstance(chosen, list) and all(isinstance(m, dict) for m in chosen):
             return copy.deepcopy(chosen)
-
-        # If pool entry is a single message dict (OpenAI-style), append it.
-        if isinstance(chosen, dict) and ("content" in chosen or "role" in chosen):
-            msg = copy.deepcopy(chosen)
-            if "role" not in msg:
-                msg["role"] = Role.USER.value
-            msg.setdefault("content", "")
-            prompt_messages.append(msg)
-            return prompt_messages
-
-        # Otherwise treat as suffix (string or config dict with "text"/"suffix").
-        if isinstance(chosen, dict):
-            suffix = str(chosen.get("text") or chosen.get("suffix") or "")
-        else:
-            suffix = "" if chosen is None else str(chosen)
-
-        if not suffix:
-            return prompt_messages
-
-        for m in reversed(prompt_messages):
-            if m.get("role") == Role.USER.value:
-                base = m.get("content", "")
-                sep = ""
-                if base and not base.endswith(("\n", " ")) and not suffix.startswith(("\n", " ")):
-                    sep = "\n"
-                m["content"] = f"{base}{sep}{suffix}" if base else suffix
-                break
-        else:
-            prompt_messages.append({"role": Role.USER.value, "content": suffix})
 
         return prompt_messages
 
@@ -302,13 +306,14 @@ class DynamicPromptDataset(Dataset):
         example = self.dataset[idx]
 
         chosen = self._sample_pool_choice(example)
+        system = self._build_system_message(example, chosen)
         prompt = self._build_prompt_messages(example, chosen)
         response = self._build_response_messages(example, chosen)
 
         input_ids, labels = self.encoder._encode_data_example(
             prompt=prompt,
             response=response,
-            system=example.get("_system"),
+            system=system,
             tools=example.get("_tools"),
             images=example.get("_images") or [],
             videos=example.get("_videos") or [],
@@ -483,6 +488,33 @@ class DynamicPromptPackedBatchProcessor:
         return self._choose_from_pool(pool)
 
     @staticmethod
+    def _append_suffix_to_system(system: str | None, suffix: str) -> str:
+        base = "" if system is None else str(system)
+        suffix = "" if suffix is None else str(suffix)
+        if not suffix:
+            return base
+        if not base:
+            return suffix
+        sep = ""
+        if base and not base.endswith(("\n", " ")) and not suffix.startswith(("\n", " ")):
+            sep = "\n"
+        return f"{base}{sep}{suffix}"
+
+    def _build_system_message(self, example: dict[str, Any], chosen: Any | None) -> str | None:
+        system = example.get("_system")
+        if chosen is None:
+            return system
+        if isinstance(chosen, list) and all(isinstance(m, dict) for m in chosen):
+            return system
+        if isinstance(chosen, dict):
+            suffix = str(chosen.get("text") or chosen.get("suffix") or chosen.get("content") or "")
+        else:
+            suffix = str(chosen)
+        if not suffix:
+            return system
+        return self._append_suffix_to_system(system, suffix)
+
+    @staticmethod
     def _build_prompt_messages(example: dict[str, Any], chosen: Any | None) -> list[dict[str, Any]]:
         prompt_messages = example.get("_prompt") or []
         if not isinstance(prompt_messages, list):
@@ -494,33 +526,6 @@ class DynamicPromptPackedBatchProcessor:
 
         if isinstance(chosen, list) and all(isinstance(m, dict) for m in chosen):
             return copy.deepcopy(chosen)
-
-        if isinstance(chosen, dict) and ("content" in chosen or "role" in chosen):
-            msg = copy.deepcopy(chosen)
-            if "role" not in msg:
-                msg["role"] = Role.USER.value
-            msg.setdefault("content", "")
-            prompt_messages.append(msg)
-            return prompt_messages
-
-        if isinstance(chosen, dict):
-            suffix = str(chosen.get("text") or chosen.get("suffix") or "")
-        else:
-            suffix = "" if chosen is None else str(chosen)
-
-        if not suffix:
-            return prompt_messages
-
-        for m in reversed(prompt_messages):
-            if m.get("role") == Role.USER.value:
-                base = m.get("content", "")
-                sep = ""
-                if base and not base.endswith(("\n", " ")) and not suffix.startswith(("\n", " ")):
-                    sep = "\n"
-                m["content"] = f"{base}{sep}{suffix}" if base else suffix
-                break
-        else:
-            prompt_messages.append({"role": Role.USER.value, "content": suffix})
 
         return prompt_messages
 
@@ -733,12 +738,13 @@ class DynamicPromptPackedBatchProcessor:
             chosen = self._sample_pool_choice(example)
             prompt_messages = self._build_prompt_messages(example, chosen)
             response_messages = self._build_response_messages(example, chosen)
+            system = self._build_system_message(example, chosen)
 
             try:
                 input_ids, labels = self.encoder._encode_data_example(
                     prompt=prompt_messages,
                     response=response_messages,
-                    system=example.get("_system"),
+                    system=system,
                     tools=example.get("_tools"),
                     images=example.get("_images") or [],
                     videos=example.get("_videos") or [],

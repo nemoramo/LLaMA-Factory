@@ -41,8 +41,8 @@ packing: false
 dynamic_prompt_sampling: true
 
 ### lora
-lora_rank: 16
-lora_alpha: 32
+lora_rank: 8
+lora_alpha: 16
 lora_dropout: 0.05
 
 # LLM 部分：对齐 Unsloth 的 target_modules
@@ -60,12 +60,12 @@ lora_target:
 additional_target: audio_tower,multi_modal_projector
 
 ### training
-output_dir: /data2/mayufeng/llamafactory_saves/gemma3n-e2b-asr-nemo/e4b-hausa-test-v1-unsloth
+output_dir: /data2/mayufeng/llamafactory_saves/gemma3n-e4b-asr-nemo/e4b-hausa-test-v1-unsloth
 overwrite_output_dir: true
 
 num_train_epochs: 5.0
 
-per_device_train_batch_size: 4
+per_device_train_batch_size: 8
 per_device_eval_batch_size: 1
 gradient_accumulation_steps: 8
 
@@ -92,6 +92,10 @@ ddp_find_unused_parameters: false
 seed: 42
 report_to: tensorboard
 audio_padding: longest
+audio_specaugment: true
+audio_specaugment_mask_param: 0.1
+audio_specaugment_num_masks: 2
+audio_specaugment_fill_value: 0.0
 eval_num_samples: 16
 eval_loss_on_full_dataset: true  # loss 用全量 eval；WER/CER 等生成指标用 eval_num_samples 子集
 compute_wer_cer: true

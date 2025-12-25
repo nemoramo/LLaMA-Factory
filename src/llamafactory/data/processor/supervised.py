@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
-from .processor_utils import DatasetProcessor, greedy_knapsack, infer_seqlen
+from .processor_utils import DatasetProcessor, apply_prompt_pool_top1_to_example, greedy_knapsack, infer_seqlen
 
 
 if TYPE_CHECKING:
@@ -89,17 +89,26 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         # build inputs with format `<bos> X Y <eos>` and labels with format `<ignore> ... <ignore> Y <eos>`
         # for multiturn examples, we only mask the prompt part in each prompt-response pair.
         model_inputs = defaultdict(list)
+        has_pool = getattr(self.data_args, "dynamic_prompt_sampling", False) and "_prompt_pool" in examples
         for i in range(len(examples["_prompt"])):
-            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
+            prompt = examples["_prompt"][i]
+            response = examples["_response"][i]
+            system = examples["_system"][i]
+            if has_pool:
+                prompt, response, system = apply_prompt_pool_top1_to_example(
+                    prompt, response, system, examples["_prompt_pool"][i]
+                )
+
+            if len(prompt) % 2 != 1 or len(response) != 1:
                 logger.warning_rank0(
-                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
+                    "Dropped invalid example: {}".format(prompt + response)
                 )
                 continue
 
             input_ids, labels = self._encode_data_example(
-                prompt=examples["_prompt"][i],
-                response=examples["_response"][i],
-                system=examples["_system"][i],
+                prompt=prompt,
+                response=response,
+                system=system,
                 tools=examples["_tools"][i],
                 images=examples["_images"][i] or [],
                 videos=examples["_videos"][i] or [],
@@ -132,17 +141,26 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
         batch_input_ids, batch_labels, batch_images, batch_videos, batch_audios = [], [], [], [], []
         lengths = []
         length2indexes = defaultdict(list)
+        has_pool = getattr(self.data_args, "dynamic_prompt_sampling", False) and "_prompt_pool" in examples
         for i in range(len(examples["_prompt"])):
-            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
+            prompt = examples["_prompt"][i]
+            response = examples["_response"][i]
+            system = examples["_system"][i]
+            if has_pool:
+                prompt, response, system = apply_prompt_pool_top1_to_example(
+                    prompt, response, system, examples["_prompt_pool"][i]
+                )
+
+            if len(prompt) % 2 != 1 or len(response) != 1:
                 logger.warning_rank0(
-                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
+                    "Dropped invalid example: {}".format(prompt + response)
                 )
                 continue
 
             input_ids, labels = self._encode_data_example(
-                prompt=examples["_prompt"][i],
-                response=examples["_response"][i],
-                system=examples["_system"][i],
+                prompt=prompt,
+                response=response,
+                system=system,
                 tools=examples["_tools"][i],
                 images=examples["_images"][i] or [],
                 videos=examples["_videos"][i] or [],

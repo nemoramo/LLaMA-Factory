@@ -143,7 +143,8 @@ class DataArguments:
             "help": (
                 "Enable dynamic prompt sampling at training time (SFT only). "
                 "If a sample provides `prompt_pool`, one entry is chosen randomly per access and "
-                "appended to the last user prompt; otherwise falls back to the existing prompt."
+                "appended to the system prompt; during evaluation tokenization, the top-1 (max-weight) entry is used "
+                "for deterministic eval loss."
             )
         },
     )

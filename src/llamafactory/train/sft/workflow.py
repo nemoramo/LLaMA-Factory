@@ -64,8 +64,19 @@ def run_sft(
         compute_dtype=model_args.compute_dtype,
         **tokenizer_module,
     )
-    train_data_collator = SFTDataCollatorWith4DAttentionMask(pad_to_multiple_of=8, **collator_kwargs)  # for shift short attention
-    eval_data_collator = SFTDataCollatorWith4DAttentionMask(pad_to_multiple_of=None, **collator_kwargs)
+    train_data_collator = SFTDataCollatorWith4DAttentionMask(
+        pad_to_multiple_of=8,
+        audio_specaugment=model_args.audio_specaugment,
+        audio_specaugment_mask_param=model_args.audio_specaugment_mask_param,
+        audio_specaugment_num_masks=model_args.audio_specaugment_num_masks,
+        audio_specaugment_fill_value=model_args.audio_specaugment_fill_value,
+        **collator_kwargs,
+    )  # for shift short attention
+    eval_data_collator = SFTDataCollatorWith4DAttentionMask(
+        pad_to_multiple_of=None,
+        audio_specaugment=False,
+        **collator_kwargs,
+    )
 
     # Metric utils
     metric_module = {}
