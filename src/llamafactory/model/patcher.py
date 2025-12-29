@@ -34,7 +34,12 @@ from .model_utils.packing import configure_packing
 from .model_utils.quantization import configure_quantization
 from .model_utils.rope import configure_rope
 from .model_utils.valuehead import prepare_valuehead_model
-from .model_utils.visual import autocast_projector_dtype, cast_gemma3n_audio_outputs, configure_visual_model
+from .model_utils.visual import (
+    autocast_projector_dtype,
+    cast_gemma3n_audio_outputs,
+    configure_visual_model,
+    patch_gemma3n_audio_token_mask,
+)
 
 
 if TYPE_CHECKING:
@@ -187,6 +192,9 @@ def patch_model(
 
     if add_valuehead:
         prepare_valuehead_model(model)
+
+    if getattr(model.config, "model_type", None) == "gemma3n":
+        patch_gemma3n_audio_token_mask()
 
     if model_args.resize_vocab:
         resize_embedding_layer(

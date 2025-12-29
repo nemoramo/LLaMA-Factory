@@ -50,6 +50,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
+TRAIN_USER_PROMPT = "Transcribe the audio. Output only the text: <audio>"
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -63,8 +65,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prompt",
         type=str,
-        default="Transcribe the audio verbatim. Do not add any commentary. Only output the text: <audio>",
-        help="user 侧的指令模板，必须包含 <audio> 占位符",
+        default=TRAIN_USER_PROMPT,
+        help="user 侧的指令模板，必须包含 <audio> 占位符（默认使用训练对齐的 prompt）",
+    )
+    p.add_argument(
+        "--allow-nontrain-prompt",
+        action="store_true",
+        help=(
+            "允许使用非训练对齐的 --prompt。默认会强制要求 prompt 与 TRAIN_USER_PROMPT 完全一致，"
+            "以避免生成的数据与训练 message 不一致。"
+        ),
     )
     p.add_argument(
         "--audio-key",
@@ -208,6 +218,7 @@ def convert_manifest(
     text_key: str = "text",
     original_text_key: str = "original_text",
     lang_key: str = "lang",
+    allow_nontrain_prompt: bool = False,
     disable_prompt_pool: bool = False,
     original_prob: float = 0.3,
     lang_hint_prob: float = 0.1,
@@ -221,6 +232,12 @@ def convert_manifest(
 ) -> None:
     if "<audio>" not in prompt:
         raise ValueError("prompt 中必须包含 <audio> 占位符，否则多模态对不上。")
+
+    if not allow_nontrain_prompt and prompt != TRAIN_USER_PROMPT:
+        raise ValueError(
+            f"--prompt 必须与训练 prompt 完全一致：{TRAIN_USER_PROMPT!r}；"
+            "如需自定义请加 --allow-nontrain-prompt"
+        )
 
     ensure_parent_dir(output_path)
 
@@ -440,6 +457,7 @@ def main() -> None:
         text_key=args.text_key,
         original_text_key=args.original_text_key,
         lang_key=args.lang_key,
+        allow_nontrain_prompt=args.allow_nontrain_prompt,
         disable_prompt_pool=args.disable_prompt_pool,
         original_prob=args.original_prob,
         lang_hint_prob=args.lang_hint_prob,

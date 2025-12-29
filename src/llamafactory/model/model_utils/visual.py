@@ -16,7 +16,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import transformers
@@ -174,6 +174,158 @@ def cast_gemma3n_audio_outputs(model: "PreTrainedModel", model_args: "ModelArgum
     if audio_tower is not None:
         logger.info_rank0(f"Casting audio tower outputs in {model_args.compute_dtype}.")
         audio_tower.register_forward_hook(_audio_tower_forward_post_hook)
+
+
+def patch_gemma3n_audio_token_mask() -> None:
+    r"""Patch Gemma3n audio token mask to be range-based.
+
+    Upstream Gemma3nModel uses `audio_mask = input_ids >= embed_audio.vocab_offset`, which assumes the vocabulary ends
+    at the last audio token. If users add new tokens (e.g., special tags) beyond the original vocabulary, those token
+    ids will be mis-classified as audio tokens and cause out-of-range indexing in `embed_audio`.
+
+    This patch makes the mask range-based:
+        audio_offset <= input_ids < audio_offset + audio_vocab_size
+
+    It is behavior-preserving for the original (un-resized) vocab, and enables safe vocab resizing.
+    """
+    try:
+        from transformers.models.gemma3n import modeling_gemma3n
+    except Exception:  # noqa: BLE001
+        return
+
+    Gemma3nModel = getattr(modeling_gemma3n, "Gemma3nModel", None)
+    if Gemma3nModel is None:
+        return
+
+    if getattr(Gemma3nModel, "_llamafactory_audio_token_mask_patched", False):
+        return
+
+    can_return_tuple = getattr(modeling_gemma3n, "can_return_tuple", None)
+    if can_return_tuple is None:
+        return
+
+    Gemma3nModelOutputWithPast = getattr(modeling_gemma3n, "Gemma3nModelOutputWithPast", None)
+    Cache = getattr(modeling_gemma3n, "Cache", None)
+    if Gemma3nModelOutputWithPast is None or Cache is None:
+        return
+
+    @can_return_tuple
+    def _patched_forward(  # type: ignore[override]
+        self,
+        input_ids: Optional[torch.LongTensor] = None,  # text inputs
+        pixel_values: Optional[torch.FloatTensor] = None,  # vision inputs
+        input_features: Optional[torch.FloatTensor] = None,  # audio inputs
+        attention_mask: Optional[torch.Tensor] = None,
+        input_features_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[list[torch.FloatTensor], "Cache"]] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        **lm_kwargs,
+    ) -> "Gemma3nModelOutputWithPast":
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        if input_ids is not None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+            # Prepare per-layer inputs from inputs_ids
+            per_layer_inputs_mask = torch.logical_and(input_ids >= 0, input_ids < self.vocab_size_per_layer_input)
+            per_layer_inputs_tokens = torch.where(per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids))
+            per_layer_inputs = self.language_model.get_per_layer_inputs(per_layer_inputs_tokens)
+
+            # Handle vision tokens (>= embed_vision.vocab_offset and < embed_audio.vocab_offset)
+            vision_mask = torch.logical_and(
+                input_ids >= self.embed_vision.vocab_offset, input_ids < self.embed_audio.vocab_offset
+            )
+            dummy_vision_token_id = self.embed_vision.vocab_offset + self.embed_vision.vocab_size - 1
+            vision_input_ids = torch.where(vision_mask, input_ids, dummy_vision_token_id).to(inputs_embeds.device)
+            vision_embeds = self.embed_vision(input_ids=vision_input_ids)
+            expanded_vision_mask = vision_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = torch.where(expanded_vision_mask, vision_embeds, inputs_embeds)
+
+            # Handle audio tokens (>= embed_audio.vocab_offset and < vocab_offset + vocab_size)
+            audio_offset = self.embed_audio.vocab_offset
+            audio_vocab_size = self.embed_audio.vocab_size
+            audio_mask = torch.logical_and(input_ids >= audio_offset, input_ids < (audio_offset + audio_vocab_size))
+            dummy_audio_token_id = audio_offset + audio_vocab_size - 1
+            audio_input_ids = torch.where(audio_mask, input_ids, dummy_audio_token_id).to(inputs_embeds.device)
+            audio_embeds = self.embed_audio(input_ids=audio_input_ids)
+            expanded_audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = torch.where(expanded_audio_mask, audio_embeds, inputs_embeds)
+        else:
+            per_layer_inputs = None
+
+        # Merge text and images
+        if pixel_values is not None:
+            image_features = self.get_image_features(pixel_values)
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            special_image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_features
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+
+        # Merge text and audio
+        if input_features is not None and input_features_mask is not None:
+            audio_features, audio_mask = self.get_audio_features(input_features, ~input_features_mask)
+
+            # The Gemma3nProcessor expects all audio will be 30s in length and inserts 188 audio soft tokens into the
+            # text to account for this. However, the audio preprocessing and encoder do not gurarantee they will
+            # produce 188 soft tokens; they will produce at most that many tokens, but they may produce fewer tokens
+            # depending on the length of the longest audio input in the batch. When we encounter this situation, we pad
+            # the audio feature out to 188 soft tokens with the emebedding of the last token in the embed_audio vocab.
+            audio_padding_toks = torch.tensor([[self.vocab_size - 1]], dtype=torch.long, device=audio_features.device)
+            audio_padding_embs = self.embed_audio(input_ids=audio_padding_toks)
+            audio_features = torch.where(audio_mask.unsqueeze(-1), audio_padding_embs, audio_features)
+
+            audio_batch_size, audio_seq_len, audio_embed_dim = audio_features.shape
+            extra_padding_tokens = self.config.audio_soft_tokens_per_image - audio_seq_len
+            extra_padding_features = audio_padding_embs.expand(audio_batch_size, extra_padding_tokens, audio_embed_dim)
+
+            audio_features = torch.cat((audio_features, extra_padding_features), dim=1)
+            audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            _, special_audio_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, audio_features=audio_features
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask, audio_features)
+
+        outputs = self.language_model(
+            input_ids=None,
+            per_layer_inputs=per_layer_inputs,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+            **lm_kwargs,
+        )
+
+        return Gemma3nModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values if use_cache else None,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=image_features if pixel_values is not None else None,
+            audio_hidden_states=audio_features if input_features is not None else None,
+        )
+
+    Gemma3nModel.forward = _patched_forward  # type: ignore[assignment]
+    setattr(Gemma3nModel, "_llamafactory_audio_token_mask_patched", True)
+    logger.info_rank0("Patched Gemma3nModel audio_mask to be range-based (safe vocab resizing).")
 
 
 def configure_visual_model(config: "PretrainedConfig") -> None:

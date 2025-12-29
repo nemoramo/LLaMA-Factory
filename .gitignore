@@ -182,3 +182,7 @@ generated_predictions.jsonl
 predictions_score.json
 unsloth_compiled_cache/
 *.db
+
+# local experiments / notes (keep workspace clean)
+unsloth-companion/
+instruct.md

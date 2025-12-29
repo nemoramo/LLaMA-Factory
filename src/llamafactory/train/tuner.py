@@ -196,6 +196,27 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
         model = model.to(output_dtype)
         logger.info_rank0(f"Convert model dtype to: {output_dtype}.")
 
+    # Ensure config is consistent with actual tying state.
+    # This matters when LoRA training saves `embed_tokens` and `lm_head` as separate trainable modules.
+    try:
+        if getattr(model.config, "tie_word_embeddings", False):
+            input_emb = model.get_input_embeddings()
+            output_emb = model.get_output_embeddings()
+            if (
+                input_emb is not None
+                and output_emb is not None
+                and hasattr(input_emb, "weight")
+                and hasattr(output_emb, "weight")
+                and input_emb.weight.data_ptr() != output_emb.weight.data_ptr()
+            ):
+                logger.warning_rank0(
+                    "Detected untied input/output embeddings but `tie_word_embeddings=True` in config; "
+                    "setting it to False for export to avoid incorrect weight tying on load."
+                )
+                model.config.tie_word_embeddings = False
+    except Exception as e:
+        logger.warning_rank0(f"Failed to validate tie_word_embeddings before export: {e}.")
+
     model.save_pretrained(
         save_directory=model_args.export_dir,
         max_shard_size=f"{model_args.export_size}GB",

@@ -10,7 +10,7 @@ do_sample: false
 temperature: 0.0
 top_p: 1.0
 num_beams: 1
-max_new_tokens: 128
+max_new_tokens: 256
 
 # 评估用：开启生成才能计算 WER/CER
 predict_with_generate: true

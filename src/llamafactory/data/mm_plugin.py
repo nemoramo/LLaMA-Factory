@@ -183,6 +183,15 @@ class MMPluginMixin:
             processor, "video_processor", getattr(processor, "image_processor", None)
         )
         feature_extractor: SequenceFeatureExtractor = getattr(processor, "feature_extractor", None)
+
+        # Check if processor is actually needed based on inputs and model capabilities.
+        # This allows models with multimodal capabilities to run in text-only mode
+        # when no actual multimodal inputs are provided.
+        requires_image_processor = len(images) != 0 and self.image_token is not None
+        requires_video_processor = len(videos) != 0 and self.video_token is not None
+        requires_audio_processor = len(audios) != 0 and self.audio_token is not None
+        requires_processor = requires_image_processor or requires_video_processor or requires_audio_processor
+
         if len(images) != 0 and self.image_token is None:
             raise ValueError(
                 "This model does not support image input. Please check whether the correct `template` is used."
@@ -198,16 +207,16 @@ class MMPluginMixin:
                 "This model does not support audio input. Please check whether the correct `template` is used."
             )
 
-        if self.image_token is not None and processor is None:
+        if requires_processor and processor is None:
             raise ValueError("Processor was not found, please check and update your model file.")
 
-        if self.image_token is not None and image_processor is None:
+        if requires_image_processor and image_processor is None:
             raise ValueError("Image processor was not found, please check and update your model file.")
 
-        if self.video_token is not None and video_processor is None:
+        if requires_video_processor and video_processor is None:
             raise ValueError("Video processor was not found, please check and update your model file.")
 
-        if self.audio_token is not None and feature_extractor is None:
+        if requires_audio_processor and feature_extractor is None:
             raise ValueError("Audio feature extractor was not found, please check and update your model file.")
 
     def _validate_messages(
@@ -660,8 +669,30 @@ class Gemma3Plugin(BasePlugin):
         audios: list["AudioInput"],
         processor: Optional["MMProcessor"],
     ) -> list[dict[str, str]]:
-        self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
+
+        # Detect if we have actual multimodal inputs or placeholders.
+        # This allows Gemma3 to work in text-only mode when no multimodal content is present.
+        has_mm_inputs = len(images) != 0 or len(videos) != 0 or len(audios) != 0
+        has_mm_placeholder = any(
+            (IMAGE_PLACEHOLDER in m["content"])
+            or (VIDEO_PLACEHOLDER in m["content"])
+            or (AUDIO_PLACEHOLDER in m["content"])
+            for m in messages
+        )
+
+        if processor is None:
+            # Allow text-only usage with Gemma3 templates (no multimodal processor available).
+            # This is useful when training/using Gemma3 for text-only tasks.
+            if not has_mm_inputs and not has_mm_placeholder:
+                return messages
+
+            raise ValueError(
+                "Multimodal inputs/placeholders were found but processor is missing. "
+                "Please check and update your model file."
+            )
+
+        self._validate_input(processor, images, videos, audios)
         num_image_tokens = 0
         messages = deepcopy(messages)
         boi_token: str = getattr(processor, "boi_token")
@@ -702,6 +733,12 @@ class Gemma3Plugin(BasePlugin):
         batch_ids: list[list[int]],
         processor: Optional["MMProcessor"],
     ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        # Handle text-only mode: when no multimodal processor exists and no multimodal inputs are provided,
+        # return token_type_ids with all zeros for proper loss computation during training.
+        # This enables Gemma3 to be used for text-only tasks without requiring a multimodal processor.
+        if processor is None and len(images) == 0 and len(videos) == 0 and len(audios) == 0:
+            return {"token_type_ids": [[0] * len(token_ids) for token_ids in batch_ids]}
+
         self._validate_input(processor, images, videos, audios)
         mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
         mm_inputs.pop("num_crops", None)
