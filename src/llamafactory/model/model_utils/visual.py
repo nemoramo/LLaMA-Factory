@@ -328,6 +328,64 @@ def patch_gemma3n_audio_token_mask() -> None:
     logger.info_rank0("Patched Gemma3nModel audio_mask to be range-based (safe vocab resizing).")
 
 
+def patch_gemma3n_config_vocab_size() -> None:
+    r"""Patch Gemma3nConfig to expose a `vocab_size` attribute for PEFT compatibility.
+
+    PEFT checks whether the vocabulary was resized by comparing:
+        model.config.vocab_size  vs  model.config.__class__.from_pretrained(model_id).vocab_size
+
+    However, upstream `Gemma3nConfig` does not define `vocab_size`; the value lives in `text_config.vocab_size`.
+    This causes checkpoint saving to crash when `save_embedding_layers="auto"` in PEFT.
+
+    We provide `vocab_size` as a property that mirrors `text_config.vocab_size` and supports assignment so that
+    LLaMA-Factory's embedding-resize logic can keep the config consistent.
+    """
+    try:
+        from transformers.models.gemma3n import configuration_gemma3n
+    except Exception:  # noqa: BLE001
+        return
+
+    Gemma3nConfig = getattr(configuration_gemma3n, "Gemma3nConfig", None)
+    if Gemma3nConfig is None:
+        return
+
+    if getattr(Gemma3nConfig, "_llamafactory_vocab_size_patched", False):
+        return
+
+    if hasattr(Gemma3nConfig, "vocab_size"):
+        # Upstream may add it in the future.
+        setattr(Gemma3nConfig, "_llamafactory_vocab_size_patched", True)
+        return
+
+    def _get_vocab_size(self) -> Optional[int]:
+        text_cfg = getattr(self, "text_config", None)
+        if text_cfg is not None and hasattr(text_cfg, "vocab_size"):
+            try:
+                return int(getattr(text_cfg, "vocab_size"))
+            except Exception:  # noqa: BLE001
+                return getattr(text_cfg, "vocab_size")
+        return getattr(self, "_llamafactory_vocab_size", None)
+
+    def _set_vocab_size(self, value) -> None:
+        try:
+            value_int = int(value)
+        except Exception:  # noqa: BLE001
+            value_int = value
+
+        text_cfg = getattr(self, "text_config", None)
+        if text_cfg is not None and hasattr(text_cfg, "vocab_size"):
+            try:
+                setattr(text_cfg, "vocab_size", value_int)
+            except Exception:  # noqa: BLE001
+                pass
+
+        setattr(self, "_llamafactory_vocab_size", value_int)
+
+    Gemma3nConfig.vocab_size = property(_get_vocab_size, _set_vocab_size)  # type: ignore[attr-defined]
+    setattr(Gemma3nConfig, "_llamafactory_vocab_size_patched", True)
+    logger.info_rank0("Patched Gemma3nConfig.vocab_size for PEFT checkpoint saving.")
+
+
 def configure_visual_model(config: "PretrainedConfig") -> None:
     r"""Patch VLMs before loading them."""
     if getattr(config, "text_config", None) and not getattr(config, "hidden_size", None):

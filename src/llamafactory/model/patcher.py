@@ -38,6 +38,7 @@ from .model_utils.visual import (
     autocast_projector_dtype,
     cast_gemma3n_audio_outputs,
     configure_visual_model,
+    patch_gemma3n_config_vocab_size,
     patch_gemma3n_audio_token_mask,
 )
 
@@ -194,6 +195,7 @@ def patch_model(
         prepare_valuehead_model(model)
 
     if getattr(model.config, "model_type", None) == "gemma3n":
+        patch_gemma3n_config_vocab_size()
         patch_gemma3n_audio_token_mask()
 
     if model_args.resize_vocab:
