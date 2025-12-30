@@ -1,0 +1,101 @@
+### model
+model_name_or_path: google/gemma-3n-E4B-it
+template: gemma3n
+trust_remote_code: true
+flash_attn: auto
+
+# (Gemma3n is multimodal; keep non-text towers frozen for text-only endpointing)
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+
+# Add 3 label tokens and resize embeddings (vocab expansion)
+add_special_tokens: "<EOU>,<CONT_USER>,<UNADDRESSED>"
+resize_vocab: true
+
+### method
+stage: sft
+do_train: true
+do_eval: true
+finetuning_type: lora
+
+# Evaluate as token-level accuracy (recommended: keep assistant output as single tag token)
+compute_accuracy: true
+predict_with_generate: false
+
+# Ensure newly-added label tokens are trainable for Gemma3n (it has multiple embedding tables).
+additional_target: embed_tokens,lm_head
+
+### lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  # Use explicit MLP submodule paths to avoid matching Gemma3n's altup_projections ModuleList.
+  - mlp.gate_proj
+  - mlp.up_proj
+  - mlp.down_proj
+
+### dataset
+# Point to your dataset_info.json directory
+dataset_dir: /path/to/your/dataset_dir
+dataset: speech_endpointing_train
+eval_dataset: speech_endpointing_eval
+cutoff_len: 1024
+train_on_prompt: false
+
+# NOTE: Gemma3n has a huge vocab (262k) and upstream `modeling_gemma3n` casts logits to fp32,
+# so packing to full `cutoff_len` can easily OOM (logits fp32 scales with batch * seq_len * vocab).
+# Keep packing disabled for stability; `cutoff_len=1024` still caps max length.
+packing: false
+neat_packing: false
+
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 4
+
+### output
+output_dir: /path/to/output/gemma3n_e4b/speech_endpointing_lora_packing_len1024
+overwrite_output_dir: true
+report_to: tensorboard
+plot_loss: true
+logging_steps: 10
+
+save_steps: 1000
+save_total_limit: 3
+
+eval_strategy: steps
+eval_steps: 1000
+
+load_best_model_at_end: true
+metric_for_best_model: eval_accuracy
+greater_is_better: true
+
+### train
+# Be conservative on micro-batch for 4B-class model at 1024 tokens.
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 32
+
+# Reduce activation memory (slower but safer for Gemma3n-E4B with large trainable embeddings).
+gradient_checkpointing: true
+
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+max_grad_norm: 1.0
+num_train_epochs: 2.0
+
+bf16: true
+ddp_find_unused_parameters: false
+
+### inference (recommended for endpointing)
+do_sample: false
+temperature: 0.0
+top_p: 1.0
+num_beams: 1
+max_new_tokens: 1
