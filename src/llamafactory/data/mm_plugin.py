@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import inspect
+import json
 import math
 import os
 import re
@@ -1636,6 +1637,249 @@ class Qwen2AudioPlugin(BasePlugin):
 
 
 @dataclass
+class FunAudioChatPlugin(BasePlugin):
+    r"""FunAudioChat multimodal plugin (S2T-friendly).
+
+    - Expands each audio placeholder into a variable number of `<|AUDIO|>` tokens according to speech token length.
+    - Builds `speech_ids/speech_attention_mask` (discrete tokens) and `input_features/feature_attention_mask`
+      (continuous waveform features) for FunAudioChatForConditionalGeneration.
+    """
+
+    token_fps: int = 25  # FunAudioChat uses 25Hz discrete frames.
+    _segment_duration_re = re.compile(r"_seg\d+_(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\.wav$")
+
+    def _parse_audio_json(self, audio: str) -> Optional[dict]:
+        audio = audio.strip()
+        if not (audio.startswith("{") and audio.endswith("}")):
+            return None
+        try:
+            obj = json.loads(audio)
+            return obj if isinstance(obj, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _extract_audio_fields(self, audio: "AudioInput") -> tuple[Optional[str], Optional[str]]:
+        r"""Return (path, token_str) if available."""
+        if not isinstance(audio, str):
+            return None, None
+
+        obj = self._parse_audio_json(audio)
+        if obj is None:
+            return audio, None  # treat as plain path
+
+        path = obj.get("path") or obj.get("wav_path") or obj.get("audio_path")
+        token = obj.get("token")
+        return path or None, token or None
+
+    @override
+    def _load_single_audio(self, audio: "AudioInput", sampling_rate: float) -> tuple["NDArray", float]:
+        # Support JSON-encoded audio items (from FunAudioChat dataset format).
+        if isinstance(audio, str):
+            path, _ = self._extract_audio_fields(audio)
+            if path is None or path == "":
+                return np.zeros(0, dtype=np.float32), float(sampling_rate)
+            audio = path
+        return super()._load_single_audio(audio, sampling_rate)
+
+    def _build_speech_strings(
+        self, audios: list["AudioInput"], processor: "MMProcessor"
+    ) -> tuple[list[str], list["AudioInput"], list[bool]]:
+        audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
+        audio_pad_token: str = getattr(processor, "audio_pad_token", "<|audio_pad|>")
+
+        speech: list[str] = []
+        feature_audios: list["AudioInput"] = []
+        feature_exist_mask: list[bool] = []
+
+        for audio in audios:
+            if isinstance(audio, str):
+                path, token = self._extract_audio_fields(audio)
+                if token is not None and token != "":
+                    speech_str = token
+                else:
+                    # Prefer inferring duration from file name to avoid extra audio I/O.
+                    num_frames = None
+                    if path:
+                        m = self._segment_duration_re.search(path)
+                        if m is not None:
+                            try:
+                                start = float(m.group(1))
+                                end = float(m.group(2))
+                                duration = max(0.0, end - start)
+                                num_frames = int(duration * float(self.token_fps))
+                            except Exception:  # noqa: BLE001
+                                num_frames = None
+
+                    if num_frames is None:
+                        # Fallback: infer duration from waveform (no CosyVoice required).
+                        wav, _ = self._load_single_audio(path or audio, float(audio_sampling_rate))
+                        num_frames = int((float(wav.shape[0]) / float(audio_sampling_rate)) * float(self.token_fps))
+
+                    speech_str = audio_pad_token * max(1, int(num_frames))
+
+                speech.append(speech_str)
+                if path is not None and path != "":
+                    feature_audios.append(path)
+                    feature_exist_mask.append(True)
+                else:
+                    feature_exist_mask.append(False)
+
+            else:
+                # NDArray / file-like
+                wav, _ = self._load_single_audio(audio, float(audio_sampling_rate))
+                num_frames = int((float(wav.shape[0]) / float(audio_sampling_rate)) * float(self.token_fps))
+                speech.append(audio_pad_token * max(1, num_frames))
+                feature_audios.append(audio)
+                feature_exist_mask.append(True)
+
+        return speech, feature_audios, feature_exist_mask
+
+    def _get_speech_lengths(self, speech: list[str], processor: "MMProcessor") -> list[int]:
+        speech_tokenizer = getattr(processor, "speech_tokenizer", None)
+        if speech_tokenizer is None:
+            # Fallback: treat each speech string as a single token.
+            return [1] * len(speech)
+
+        audio_group_size = getattr(processor, "audio_group_size", 5)
+        speech_inputs = speech_tokenizer(
+            speech,
+            return_attention_mask=True,
+            return_token_type_ids=False,
+            padding=True,
+            pad_to_multiple_of=audio_group_size,
+            return_tensors="pt",
+        )
+        return speech_inputs["attention_mask"].sum(-1).tolist()
+
+    @override
+    def process_messages(
+        self,
+        messages: list[dict[str, str]],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        processor: Optional["MMProcessor"],
+    ) -> list[dict[str, str]]:
+        self._validate_input(processor, images, videos, audios)
+        if processor is None:
+            raise ValueError("Processor was not found, please check and update your model file.")
+
+        bos_token: str = getattr(processor, "audio_bos_token", "<|audio_bos|>")
+        eos_token: str = getattr(processor, "audio_eos_token", "<|audio_eos|>")
+        audio_group_size: int = getattr(processor, "audio_group_size", 5)
+
+        placeholders = list(
+            dict.fromkeys(  # preserve order, remove duplicates
+                [
+                    AUDIO_PLACEHOLDER,
+                    f"{bos_token}{self.audio_token}{eos_token}",
+                ]
+            )
+        )
+
+        messages = deepcopy(messages)
+        speech, _, _ = self._build_speech_strings(audios, processor)
+        speech_lengths = self._get_speech_lengths(speech, processor)
+
+        def _find_next_placeholder(content: str) -> Optional[str]:
+            best_ph = None
+            best_idx = None
+            for ph in placeholders:
+                idx = content.find(ph)
+                if idx == -1:
+                    continue
+                if best_idx is None or idx < best_idx:
+                    best_idx, best_ph = idx, ph
+            return best_ph
+
+        for message in messages:
+            content = message["content"]
+            while True:
+                ph = _find_next_placeholder(content)
+                if ph is None:
+                    break
+                if len(speech_lengths) == 0:
+                    raise ValueError("Audio placeholders exceed the number of provided audios.")
+
+                speech_length = int(speech_lengths.pop(0))
+                audio_seqlen = (speech_length + (audio_group_size - 1)) // audio_group_size
+                replacement = f"{bos_token}{(self.audio_token or '') * int(max(1, audio_seqlen))}{eos_token}"
+                content = content.replace(ph, replacement, 1)
+
+            message["content"] = content
+
+        if len(speech_lengths) != 0:
+            raise ValueError("The number of audios does not match the number of audio placeholders in messages.")
+
+        return messages
+
+    @override
+    def get_mm_inputs(
+        self,
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        imglens: list[int],
+        vidlens: list[int],
+        audlens: list[int],
+        batch_ids: list[list[int]],
+        processor: Optional["MMProcessor"],
+    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        self._validate_input(processor, images, videos, audios)
+        if processor is None:
+            raise ValueError("Processor was not found, please check and update your model file.")
+
+        mm_inputs: dict[str, Union[list[int], "torch.Tensor"]] = {}
+
+        speech, feature_audios, feature_exist_mask = self._build_speech_strings(audios, processor)
+        audio_group_size = getattr(processor, "audio_group_size", 5)
+        speech_tokenizer = getattr(processor, "speech_tokenizer", None)
+        if speech_tokenizer is None:
+            raise ValueError("Speech tokenizer was not found, please check and update your model file.")
+
+        speech_inputs = speech_tokenizer(
+            speech,
+            return_attention_mask=True,
+            return_token_type_ids=False,
+            padding=True,
+            pad_to_multiple_of=audio_group_size,
+            return_tensors="pt",
+        )
+        mm_inputs["speech_ids"] = speech_inputs.pop("input_ids")
+        mm_inputs["speech_attention_mask"] = speech_inputs.pop("attention_mask")
+
+        # Continuous waveform features are only computed for audios with an available waveform.
+        if len(feature_audios) != 0:
+            feature_extractor = getattr(processor, "feature_extractor", None)
+            if feature_extractor is None:
+                raise ValueError("Audio feature extractor was not found, please check and update your model file.")
+
+            audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
+            audio_padding = getattr(processor, "audio_padding", "max_length")
+            wavs = self._regularize_audios(feature_audios, sampling_rate=audio_sampling_rate)["audios"]
+            wav_inputs = feature_extractor(
+                wavs,
+                sampling_rate=audio_sampling_rate,
+                return_attention_mask=True,
+                padding=audio_padding,
+                return_tensors="pt",
+            )
+            mm_inputs.update(wav_inputs)
+            mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask", None)
+
+            # Align `feature_exist_mask` device with feature tensors.
+            device = None
+            fam = mm_inputs.get("feature_attention_mask", None)
+            if torch.is_tensor(fam):
+                device = fam.device
+            mm_inputs["feature_exist_mask"] = torch.tensor(feature_exist_mask, dtype=torch.bool, device=device)
+        else:
+            mm_inputs["feature_exist_mask"] = torch.tensor(feature_exist_mask, dtype=torch.bool)
+
+        return mm_inputs
+
+
+@dataclass
 class Qwen2VLPlugin(BasePlugin):
     vision_bos_token: str = "<|vision_start|>"
     vision_eos_token: str = "<|vision_end|>"
@@ -2275,6 +2519,7 @@ PLUGINS = {
     "mllama": MllamaPlugin,
     "paligemma": PaliGemmaPlugin,
     "pixtral": PixtralPlugin,
+    "funaudiochat": FunAudioChatPlugin,
     "qwen2_audio": Qwen2AudioPlugin,
     "qwen2_omni": Qwen2OmniPlugin,
     "qwen2_vl": Qwen2VLPlugin,

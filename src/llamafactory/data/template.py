@@ -1889,6 +1889,19 @@ register_template(
 )
 
 
+# FunAudioChat uses ChatML-style formatting with audio placeholders expanded by the multimodal plugin.
+register_template(
+    name="funaudiochat",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    default_system="You are a helpful assistant.",
+    stop_words=["<|im_end|>"],
+    replace_eos=True,
+    mm_plugin=get_mm_plugin(name="funaudiochat", audio_token="<|AUDIO|>"),
+)
+
+
 # copied from qwen template
 register_template(
     name="qwen2_omni",

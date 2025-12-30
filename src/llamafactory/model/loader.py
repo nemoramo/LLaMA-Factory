@@ -54,6 +54,25 @@ class TokenizerModule(TypedDict):
     processor: Optional["ProcessorMixin"]
 
 
+def _try_register_funaudiochat() -> bool:
+    """Best-effort registration for FunAudioChat HF classes.
+
+    FunAudioChat checkpoints may not ship with `auto_map`, so `trust_remote_code` alone is insufficient.
+    """
+    try:
+        from .funaudiochat.register import register_funaudiochat
+
+        register_funaudiochat()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Failed to register FunAudioChat: {e}.")
+        return False
+
+
+def _maybe_register_funaudiochat_from_error(err: Exception) -> bool:
+    return "funaudiochat" in str(err).lower() and _try_register_funaudiochat()
+
+
 def _get_init_kwargs(model_args: "ModelArguments") -> dict[str, Any]:
     r"""Get arguments to load config/tokenizer/model.
 
@@ -102,20 +121,69 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
             **init_kwargs,
         )
     except ValueError:  # try another one
-        processor = AutoProcessor.from_pretrained(
-            model_args.model_name_or_path,
-            use_fast=not model_args.use_fast_tokenizer,
-            **init_kwargs,
-        )
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_args.model_name_or_path,
+                use_fast=not model_args.use_fast_tokenizer,
+                **init_kwargs,
+            )
+        except Exception as e:  # noqa: BLE001
+            if _maybe_register_funaudiochat_from_error(e):
+                processor = AutoProcessor.from_pretrained(
+                    model_args.model_name_or_path,
+                    use_fast=not model_args.use_fast_tokenizer,
+                    **init_kwargs,
+                )
+            else:
+                raise
     except Exception as e:
-        logger.info_rank0(f"Failed to load processor: {e}.")
-        processor = None
+        if _maybe_register_funaudiochat_from_error(e):
+            try:
+                processor = AutoProcessor.from_pretrained(
+                    model_args.model_name_or_path,
+                    use_fast=model_args.use_fast_tokenizer,
+                    **init_kwargs,
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.info_rank0(f"Failed to load processor: {err}.")
+                processor = None
+        else:
+            logger.info_rank0(f"Failed to load processor: {e}.")
+            processor = None
 
     # Avoid load tokenizer, see:
     # https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/models/auto/processing_auto.py#L324
     if processor is not None and "Processor" not in processor.__class__.__name__:
-        logger.debug("The loaded processor is not an instance of Processor. Dropping it.")
-        processor = None
+        # Some checkpoints (notably FunAudioChat) do not ship a proper processor `auto_map`,
+        # so AutoProcessor may silently fall back to returning a tokenizer/feature-extractor.
+        # Detect this case via config and retry after registration.
+        cfg = None
+        try:
+            cfg = AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+        except Exception as e:  # noqa: BLE001
+            if _maybe_register_funaudiochat_from_error(e):
+                cfg = AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+
+        if getattr(cfg, "model_type", None) == "funaudiochat":
+            _try_register_funaudiochat()
+            try:
+                processor = AutoProcessor.from_pretrained(
+                    model_args.model_name_or_path,
+                    use_fast=model_args.use_fast_tokenizer,
+                    **init_kwargs,
+                )
+            except ValueError:
+                processor = AutoProcessor.from_pretrained(
+                    model_args.model_name_or_path,
+                    use_fast=not model_args.use_fast_tokenizer,
+                    **init_kwargs,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.info_rank0(f"Failed to reload processor after FunAudioChat registration: {e}.")
+
+        if processor is not None and "Processor" not in processor.__class__.__name__:
+            logger.debug("The loaded processor is not an instance of Processor. Dropping it.")
+            processor = None
 
     if processor is not None:
         patch_processor(processor, tokenizer, model_args)
@@ -126,7 +194,12 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
 def load_config(model_args: "ModelArguments") -> "PretrainedConfig":
     r"""Load model config."""
     init_kwargs = _get_init_kwargs(model_args)
-    return AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+    try:
+        return AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+    except Exception as e:  # noqa: BLE001
+        if _maybe_register_funaudiochat_from_error(e):
+            return AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+        raise
 
 
 def load_model(

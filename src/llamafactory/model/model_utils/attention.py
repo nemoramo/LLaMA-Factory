@@ -70,6 +70,15 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
 
     if getattr(config, "model_type", None) == "internlm2":  # special case for custom models
         setattr(config, "attn_implementation", requested_attn_implementation)
+    elif getattr(config, "model_type", None) == "funaudiochat":
+        setattr(config, "_attn_implementation", requested_attn_implementation)
+        if hasattr(config, "audio_config"):
+            setattr(config.audio_config, "_attn_implementation", requested_attn_implementation)
+            crq_cfg = getattr(config.audio_config, "crq_transformer_config", None)
+            if isinstance(crq_cfg, dict):
+                crq_cfg["_attn_implementation"] = requested_attn_implementation
+        if hasattr(config, "text_config"):
+            setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
     elif getattr(config, "model_type", None) == "kimi_vl":
         setattr(config.vision_config, "_attn_implementation", requested_attn_implementation)
         setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
@@ -89,3 +98,16 @@ def print_attn_implementation(config: "PretrainedConfig") -> None:
         logger.info_rank0("Using torch SDPA for faster training and inference.")
     else:
         logger.info_rank0("Using vanilla attention implementation.")
+
+    if getattr(config, "model_type", None) == "funaudiochat":
+        if hasattr(config, "audio_config"):
+            audio_attn = getattr(config.audio_config, "_attn_implementation", None)
+            if audio_attn is not None:
+                logger.info_rank0(f"  - audio_config attention: {audio_attn}")
+            crq_cfg = getattr(config.audio_config, "crq_transformer_config", None)
+            if isinstance(crq_cfg, dict) and "_attn_implementation" in crq_cfg:
+                logger.info_rank0(f"  - crq_transformer attention: {crq_cfg['_attn_implementation']}")
+        if hasattr(config, "text_config"):
+            text_attn = getattr(config.text_config, "_attn_implementation", None)
+            if text_attn is not None:
+                logger.info_rank0(f"  - text_config attention: {text_attn}")

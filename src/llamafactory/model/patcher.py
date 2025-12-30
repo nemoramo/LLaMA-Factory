@@ -198,6 +198,11 @@ def patch_model(
         patch_gemma3n_config_vocab_size()
         patch_gemma3n_audio_token_mask()
 
+    if getattr(model.config, "model_type", None) == "funaudiochat":
+        sp_gen_kwargs = getattr(model, "sp_gen_kwargs", None)
+        if isinstance(sp_gen_kwargs, dict):
+            sp_gen_kwargs["disable_speech"] = True
+
     if model_args.resize_vocab:
         resize_embedding_layer(
             model,

@@ -1,0 +1,37 @@
+### model
+model_name_or_path: FunAudioLLM/Fun-Audio-Chat-8B
+template: funaudiochat
+stage: sft
+do_train: true
+finetuning_type: full
+flash_attn: fa2
+bf16: true
+
+### data
+# ShareGPT dataset with an `audios` column.
+# See `examples/funaudiochat/README.md` for the expected audio placeholder + audio list format.
+dataset: your_dataset
+dataset_dir: data
+cutoff_len: 2048
+overwrite_cache: true
+preprocessing_num_workers: 8
+
+### audio
+audio_sampling_rate: 16000
+audio_padding: max_length
+
+### output
+output_dir: saves/funaudiochat/s2t_sft_full
+logging_steps: 10
+save_strategy: steps
+save_steps: 1000
+overwrite_output_dir: true
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-5
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.02
+report_to: none
