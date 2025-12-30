@@ -15,6 +15,7 @@ from typing import Any, Optional
 
 TAGS = ("<EOU>", "<CONT_USER>", "<UNADDRESSED>")
 TAG_RE = re.compile(r"<EOU>|<CONT_USER>|<UNADDRESSED>")
+MERGED_TAGS = ("<EOU>", "<CONT_USER>")  # merge <UNADDRESSED> into <EOU>
 
 
 def _now_ts() -> str:
@@ -43,6 +44,23 @@ def _normalize_tag(text: Optional[str]) -> str:
     if m:
         return m.group(0)
     return text if text else "EMPTY"
+
+
+def _normalize_lang(lang: Optional[str]) -> str:
+    if lang is None:
+        return "UNKNOWN_LANG"
+    s = str(lang).strip()
+    if not s:
+        return "UNKNOWN_LANG"
+    lowered = s.lower()
+    # Unify Hausa naming variants.
+    if lowered in {"ha", "hausa"}:
+        return "hausa"
+    return s
+
+
+def _merge_unaddressed_as_eou(tag: str) -> str:
+    return "<EOU>" if tag == "<UNADDRESSED>" else tag
 
 
 def _post_json(url: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
@@ -187,6 +205,54 @@ def _summarize_tag_confusion(mat: list[list[int]]) -> dict[str, Any]:
     }
 
 
+def _compute_merged_tag_confusion(results: list[dict[str, Any]]) -> list[list[int]]:
+    tag_to_i = {t: i for i, t in enumerate(MERGED_TAGS)}
+    mat = [[0 for _ in MERGED_TAGS] for _ in MERGED_TAGS]
+    for r in results:
+        y = _merge_unaddressed_as_eou(str(r.get("label")))
+        yhat = _merge_unaddressed_as_eou(str(r.get("pred")))
+        if y not in tag_to_i or yhat not in tag_to_i:
+            continue
+        mat[tag_to_i[y]][tag_to_i[yhat]] += 1
+    return mat
+
+
+def _summarize_merged_tag_confusion(mat: list[list[int]]) -> dict[str, Any]:
+    n = len(MERGED_TAGS)
+    assert n == 2, "Merged metrics assume 2-way tag classification."
+
+    row_sum = [sum(mat[i]) for i in range(n)]
+    col_sum = [sum(mat[i][j] for i in range(n)) for j in range(n)]
+    correct = sum(mat[i][i] for i in range(n))
+    total = sum(row_sum)
+
+    per_label: dict[str, dict[str, float]] = {}
+    for i, tag in enumerate(MERGED_TAGS):
+        tp = mat[i][i]
+        p = _safe_div(tp, col_sum[i])
+        r = _safe_div(tp, row_sum[i])
+        f1 = (2 * p * r / (p + r)) if (p + r) else 0.0
+        per_label[tag] = {"precision": p, "recall": r, "f1": f1}
+
+    # KPI definitions after merging <UNADDRESSED> into <EOU>:
+    # - Interrupt: gold <CONT_USER> predicted as merged <EOU>
+    # - Delay: gold merged <EOU> predicted as <CONT_USER>
+    eou_i = 0
+    cont_i = 1
+    interrupt = _safe_div(mat[cont_i][eou_i], row_sum[cont_i])
+    delay = _safe_div(mat[eou_i][cont_i], row_sum[eou_i])
+
+    return {
+        "total": total,
+        "correct": correct,
+        "accuracy": _safe_div(correct, total),
+        "confusion": {MERGED_TAGS[i]: {MERGED_TAGS[j]: mat[i][j] for j in range(n)} for i in range(n)},
+        "per_label": per_label,
+        "kpi": {"Interrupt": interrupt, "Delay": delay},
+        "_row_sum": {MERGED_TAGS[i]: row_sum[i] for i in range(n)},
+    }
+
+
 def _print_eval_block(title: str, tag_summary: dict[str, Any]) -> None:
     print(f"\n--- {title} ---")
     print("Confusion (gold -> pred):")
@@ -208,6 +274,73 @@ def _print_eval_block(title: str, tag_summary: dict[str, Any]) -> None:
     print(
         f"[KPI] FAR_unad={k['FAR_unad']:.4f} | Interrupt={k['Interrupt']:.4f} | Delay={k['Delay']:.4f} | Missed={k['Missed']:.4f}"
     )
+
+
+def _print_eval_block_merged(title: str, tag_summary: dict[str, Any]) -> None:
+    print(f"\n--- {title} ---")
+    print("Confusion (gold -> pred):")
+
+    row_sum = tag_summary.get("_row_sum", {})
+    conf = tag_summary["confusion"]
+    for gold in MERGED_TAGS:
+        row = [conf[gold].get(pred, 0) for pred in MERGED_TAGS]
+        s = int(row_sum.get(gold, sum(row)))
+        print(f"{gold:<14} {row} sum={s:>5d}")
+
+    print(f"Accuracy: {tag_summary['accuracy']:.4f}")
+    print("Per-label precision/recall/f1:")
+    for tag in MERGED_TAGS:
+        m = tag_summary["per_label"][tag]
+        print(f"  {tag:<14} P={m['precision']:.4f} R={m['recall']:.4f} F1={m['f1']:.4f}")
+
+    k = tag_summary["kpi"]
+    print(f"[KPI] Interrupt={k['Interrupt']:.4f} | Delay={k['Delay']:.4f}")
+
+
+def _build_tag_eval_per_lang(
+    all_results: list[dict[str, Any]],
+    valid_tag_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    lang_total: dict[str, int] = {}
+    for r in all_results:
+        lang_total[_normalize_lang(r.get("lang"))] = lang_total.get(_normalize_lang(r.get("lang")), 0) + 1
+
+    lang_groups: dict[str, list[dict[str, Any]]] = {}
+    for r in valid_tag_results:
+        lang_groups.setdefault(_normalize_lang(r.get("lang")), []).append(r)
+
+    out: dict[str, Any] = {}
+    for lang, group in sorted(lang_groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        s = _summarize_tag_confusion(_compute_tag_confusion(group))
+        out[lang] = {
+            "valid": len(group),
+            "invalid": max(lang_total.get(lang, 0) - len(group), 0),
+            "accuracy": s["accuracy"],
+            "confusion_matrix": s["confusion"],
+            "per_label": s["per_label"],
+            "kpi": s["kpi"],
+        }
+    return out
+
+
+def _build_tag_eval_merge_unad_as_eou_per_lang(
+    valid_tag_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    lang_groups: dict[str, list[dict[str, Any]]] = {}
+    for r in valid_tag_results:
+        lang_groups.setdefault(_normalize_lang(r.get("lang")), []).append(r)
+
+    out: dict[str, Any] = {}
+    for lang, group in sorted(lang_groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        s = _summarize_merged_tag_confusion(_compute_merged_tag_confusion(group))
+        out[lang] = {
+            "valid": len(group),
+            "accuracy": s["accuracy"],
+            "confusion_matrix": s["confusion"],
+            "per_label": s["per_label"],
+            "kpi": s["kpi"],
+        }
+    return out
 
 
 def _infer_one(
@@ -243,6 +376,7 @@ def _infer_one(
                 "dialogue_id": sample.dialogue_id,
                 "turn": sample.turn,
                 "lang": sample.lang,
+                "lang_norm": _normalize_lang(sample.lang),
                 "label": sample.label,
                 "pred": pred,
                 "raw_pred": raw_pred,
@@ -263,6 +397,7 @@ def _infer_one(
                 "dialogue_id": sample.dialogue_id,
                 "turn": sample.turn,
                 "lang": sample.lang,
+                "lang_norm": _normalize_lang(sample.lang),
                 "label": sample.label,
                 "pred": "ERROR",
                 "raw_pred": None,
@@ -390,13 +525,28 @@ def main() -> None:
     _print_eval_block("Turn: FIRST (User's 1st msg)", _summarize_tag_confusion(_compute_tag_confusion(first_valid)))
     _print_eval_block("Turn: MULTI (User's >1 msg)", _summarize_tag_confusion(_compute_tag_confusion(multi_valid)))
 
+    # Optional reporting: merge <UNADDRESSED> into <EOU> to compute a relaxed 2-way score.
+    merged_all = _summarize_merged_tag_confusion(_compute_merged_tag_confusion(valid))
+    _print_eval_block_merged("OpenAI backend | ALL | merge <UNADDRESSED> as <EOU>", merged_all)
+    _print_eval_block_merged(
+        "Turn: FIRST | merge <UNADDRESSED> as <EOU>",
+        _summarize_merged_tag_confusion(_compute_merged_tag_confusion(first_valid)),
+    )
+    _print_eval_block_merged(
+        "Turn: MULTI | merge <UNADDRESSED> as <EOU>",
+        _summarize_merged_tag_confusion(_compute_merged_tag_confusion(multi_valid)),
+    )
+
     if args.per_lang:
         lang_groups: dict[str, list[dict[str, Any]]] = {}
         for r in valid:
-            lang = r.get("lang") or "unk"
-            lang_groups.setdefault(lang, []).append(r)
+            lang_groups.setdefault(_normalize_lang(r.get("lang")), []).append(r)
         for lang, group in sorted(lang_groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
             _print_eval_block(f"Language: {lang}", _summarize_tag_confusion(_compute_tag_confusion(group)))
+            _print_eval_block_merged(
+                f"Language: {lang} | merge <UNADDRESSED> as <EOU>",
+                _summarize_merged_tag_confusion(_compute_merged_tag_confusion(group)),
+            )
 
     # Latency / throughput (reported on all requests, regardless of validity)
     latency_ms = [r["latency_ms"] for r in results if r and isinstance(r.get("latency_ms"), int)]
@@ -440,11 +590,17 @@ def main() -> None:
     per_lang_all: dict[str, dict[str, int]] = {}
     for r in results:
         assert r is not None
-        lang = r.get("lang") or "UNKNOWN_LANG"
+        lang = _normalize_lang(r.get("lang"))
         per_lang_all.setdefault(lang, {"total": 0, "correct": 0, "errors": 0})
         per_lang_all[lang]["total"] += 1
         per_lang_all[lang]["correct"] += 1 if r.get("ok") else 0
         per_lang_all[lang]["errors"] += 1 if r.get("pred") == "ERROR" else 0
+
+    tag_eval_per_lang = _build_tag_eval_per_lang(
+        all_results=[r for r in results if r is not None],
+        valid_tag_results=valid,
+    )
+    tag_eval_merge_unad_as_eou_per_lang = _build_tag_eval_merge_unad_as_eou_per_lang(valid)
 
     summary = {
         "run_id": run_id,
@@ -475,6 +631,16 @@ def main() -> None:
             "confusion_matrix": all_summary["confusion"],
             "per_label": all_summary["per_label"],
             "kpi": all_summary["kpi"],
+            "per_lang": tag_eval_per_lang,
+        },
+        "tag_eval_merge_unad_as_eou": {
+            "valid": len(valid),
+            "invalid": invalid,
+            "accuracy": merged_all["accuracy"],
+            "confusion_matrix": merged_all["confusion"],
+            "per_label": merged_all["per_label"],
+            "kpi": merged_all["kpi"],
+            "per_lang": tag_eval_merge_unad_as_eou_per_lang,
         },
         "predictions_jsonl": pred_path,
     }
