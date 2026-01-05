@@ -66,12 +66,17 @@ def get_seqlens_in_batch(attention_mask: "torch.Tensor") -> "torch.Tensor":
     [2, 3, 1, 2, 3]
     ```
     """
+    # Common case: boolean/0-1 padding mask (no per-segment ids).
+    max_num = int(attention_mask.max().item()) if attention_mask.numel() else 0
+    if max_num <= 1:
+        return attention_mask.sum(dim=-1, dtype=torch.int32)
+
+    # Segment-id mask: each segment is labeled with 1..N (0 is padding).
     bsz = attention_mask.size(0)
-    dtype, device = attention_mask.dtype, attention_mask.device
-    max_num = torch.max(attention_mask).item()
-    counts: torch.Tensor = torch.zeros((bsz, max_num), dtype=dtype, device=device)
+    device = attention_mask.device
+    counts: torch.Tensor = torch.zeros((bsz, max_num), dtype=torch.int32, device=device)
     for i in range(max_num):
-        counts[:, i] = torch.sum(attention_mask == (i + 1), dim=-1)
+        counts[:, i] = torch.sum(attention_mask == (i + 1), dim=-1, dtype=torch.int32)
 
     counts = counts.flatten()
     seqlens = counts[counts.nonzero().squeeze(dim=-1)]

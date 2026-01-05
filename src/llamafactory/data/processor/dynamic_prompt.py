@@ -305,20 +305,62 @@ class DynamicPromptDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         example = self.dataset[idx]
 
-        chosen = self._sample_pool_choice(example)
-        system = self._build_system_message(example, chosen)
-        prompt = self._build_prompt_messages(example, chosen)
-        response = self._build_response_messages(example, chosen)
+        pool = example.get("_prompt_pool")
+        has_pool = isinstance(pool, list) and len(pool) > 0
+        deterministic = bool(getattr(self.data_args, "dynamic_prompt_deterministic", False))
+        max_tries = int(getattr(self.data_args, "dynamic_prompt_encode_max_tries", 3) or 3)
+        max_tries = max(1, max_tries)
+        if not has_pool:
+            max_tries = 1
+        if deterministic:
+            max_tries = min(max_tries, 2)
 
-        input_ids, labels = self.encoder._encode_data_example(
-            prompt=prompt,
-            response=response,
-            system=system,
-            tools=example.get("_tools"),
-            images=example.get("_images") or [],
-            videos=example.get("_videos") or [],
-            audios=example.get("_audios") or [],
-        )
+        input_ids: list[int] | None = None
+        labels: list[int] | None = None
+        last_error: ValueError | None = None
+        tried_no_pool = False
+
+        for attempt in range(max_tries):
+            if attempt == 0:
+                chosen = self._sample_pool_choice(example)
+            else:
+                if has_pool and not tried_no_pool:
+                    chosen = None
+                    tried_no_pool = True
+                elif deterministic:
+                    chosen = None
+                else:
+                    chosen = self._choose_from_pool(pool) if has_pool else None
+
+            system = self._build_system_message(example, chosen)
+            prompt = self._build_prompt_messages(example, chosen)
+            response = self._build_response_messages(example, chosen)
+
+            try:
+                input_ids, labels = self.encoder._encode_data_example(
+                    prompt=prompt,
+                    response=response,
+                    system=system,
+                    tools=example.get("_tools"),
+                    images=example.get("_images") or [],
+                    videos=example.get("_videos") or [],
+                    audios=example.get("_audios") or [],
+                )
+                last_error = None
+                break
+            except ValueError as err:
+                last_error = err
+                continue
+
+        if input_ids is None or labels is None or last_error is not None:
+            sample_id = self._get_sample_id(example)
+            audios = example.get("_audios") or []
+            audio_hint = None
+            if isinstance(audios, list) and len(audios) > 0:
+                audio_hint = audios[0]
+            raise ValueError(
+                f"Failed to encode sample idx={idx} id={sample_id!r} audio={audio_hint!r}: {last_error}"
+            ) from last_error
 
         item: dict[str, Any] = {
             "input_ids": input_ids,

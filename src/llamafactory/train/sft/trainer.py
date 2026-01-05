@@ -72,6 +72,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.model_accepts_loss_kwargs = False
 
         self.finetuning_args = finetuning_args
+        self._default_gen_kwargs: dict[str, Any] = gen_kwargs.copy() if gen_kwargs is not None else {}
         if gen_kwargs is not None:
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs
@@ -277,6 +278,22 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return loss, generated_tokens, labels
 
+    @override
+    def predict(
+        self,
+        test_dataset: "Dataset",
+        ignore_keys: Optional[list[str]] = None,
+        metric_key_prefix: str = "test",
+        **gen_kwargs,
+    ) -> "PredictionOutput":
+        # Ensure generation kwargs provided at init are used by `Seq2SeqTrainer.predict()`.
+        # Otherwise Transformers will overwrite `self._gen_kwargs` with an empty dict.
+        if self._default_gen_kwargs:
+            merged = dict(self._default_gen_kwargs)
+            merged.update(gen_kwargs)
+            gen_kwargs = merged
+        return super().predict(test_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix, **gen_kwargs)
+
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
     ) -> None:
@@ -326,6 +343,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         - `{metric_key_prefix}_loss` on the full eval dataset, and
         - generative metrics (WER/CER/ROUGE/BLEU) on a sampled subset.
         """
+        # Ensure generation kwargs provided at init are used by `Seq2SeqTrainer.evaluate()`.
+        # Otherwise Transformers will overwrite `self._gen_kwargs` with an empty dict and fall back to
+        # `model.generation_config` (e.g. max_new_tokens=2048), making CLI overrides ineffective.
+        if self._default_gen_kwargs:
+            merged = dict(self._default_gen_kwargs)
+            merged.update(gen_kwargs)
+            gen_kwargs = merged
+
         has_processing_class = hasattr(self, "processing_class")
         original_padding_side = self.processing_class.padding_side if has_processing_class else None
 

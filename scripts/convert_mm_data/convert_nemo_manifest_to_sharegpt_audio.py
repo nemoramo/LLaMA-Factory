@@ -101,6 +101,18 @@ def parse_args() -> argparse.Namespace:
         help="NeMo manifest 中表示语种的字段名（也会自动尝试 language）",
     )
     p.add_argument(
+        "--default-lang",
+        type=str,
+        default=None,
+        help="当 manifest 中缺失 lang/language 字段时使用的默认语种（例如 african-french）。",
+    )
+    p.add_argument(
+        "--force-lang",
+        type=str,
+        default=None,
+        help="强制覆盖所有样本的语种（优先级高于 manifest/lang-key 与 --default-lang）。",
+    )
+    p.add_argument(
         "--disable-prompt-pool",
         action="store_true",
         help="不输出 prompt_pool（保持旧行为）",
@@ -218,6 +230,8 @@ def convert_manifest(
     text_key: str = "text",
     original_text_key: str = "original_text",
     lang_key: str = "lang",
+    default_lang: Optional[str] = None,
+    force_lang: Optional[str] = None,
     allow_nontrain_prompt: bool = False,
     disable_prompt_pool: bool = False,
     original_prob: float = 0.3,
@@ -274,6 +288,12 @@ def convert_manifest(
             original_text = original_text or normalized_text or ""
 
             lang = obj.get(lang_key) or obj.get("language") or None
+            if isinstance(lang, str):
+                lang = lang.strip() or None
+            if force_lang:
+                lang = str(force_lang).strip() or None
+            elif not lang and default_lang:
+                lang = str(default_lang).strip() or None
 
             has_digits = obj.get("has_digits")
             if has_digits is None:
@@ -457,6 +477,8 @@ def main() -> None:
         text_key=args.text_key,
         original_text_key=args.original_text_key,
         lang_key=args.lang_key,
+        default_lang=args.default_lang,
+        force_lang=args.force_lang,
         allow_nontrain_prompt=args.allow_nontrain_prompt,
         disable_prompt_pool=args.disable_prompt_pool,
         original_prob=args.original_prob,

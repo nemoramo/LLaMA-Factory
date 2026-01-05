@@ -1781,30 +1781,35 @@ class FunAudioChatPlugin(BasePlugin):
         speech, _, _ = self._build_speech_strings(audios, processor)
         speech_lengths = self._get_speech_lengths(speech, processor)
 
-        def _find_next_placeholder(content: str) -> Optional[str]:
-            best_ph = None
-            best_idx = None
+        def _find_next_placeholder(content: str, start: int) -> Optional[tuple[int, str]]:
+            best_ph: Optional[str] = None
+            best_idx: Optional[int] = None
             for ph in placeholders:
-                idx = content.find(ph)
+                idx = content.find(ph, start)
                 if idx == -1:
                     continue
                 if best_idx is None or idx < best_idx:
                     best_idx, best_ph = idx, ph
-            return best_ph
+            if best_idx is None or best_ph is None:
+                return None
+            return best_idx, best_ph
 
         for message in messages:
             content = message["content"]
+            search_start = 0
             while True:
-                ph = _find_next_placeholder(content)
-                if ph is None:
+                found = _find_next_placeholder(content, search_start)
+                if found is None:
                     break
+                idx, ph = found
                 if len(speech_lengths) == 0:
                     raise ValueError("Audio placeholders exceed the number of provided audios.")
 
                 speech_length = int(speech_lengths.pop(0))
                 audio_seqlen = (speech_length + (audio_group_size - 1)) // audio_group_size
                 replacement = f"{bos_token}{(self.audio_token or '') * int(max(1, audio_seqlen))}{eos_token}"
-                content = content.replace(ph, replacement, 1)
+                content = content[:idx] + replacement + content[idx + len(ph) :]
+                search_start = idx + len(replacement)
 
             message["content"] = content
 

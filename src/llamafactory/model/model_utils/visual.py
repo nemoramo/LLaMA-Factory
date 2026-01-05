@@ -460,6 +460,12 @@ _register_composite_model(
     lora_conflict_keys=["timm_model", "subsample_conv_projection"],
 )
 
+_register_composite_model(
+    model_type="funaudiochat",
+    vision_model_keys=["audio_invert_tower"],
+    language_model_keys=["language_model", "lm_head"],
+)
+
 
 # copied from qwen2vl
 _register_composite_model(

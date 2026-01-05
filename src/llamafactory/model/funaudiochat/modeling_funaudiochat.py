@@ -4,6 +4,7 @@
 # You may obtain a copy of the License at
 #
 #    http://www.apache.org/licenses/LICENSE-2.0
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -23,6 +24,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.utils import auto_docstring
 from transformers.models.auto import AutoConfig, AutoModel, AutoModelForCausalLM
 from .configuration_funaudiochat import FunAudioChatAudioEncoderConfig, FunAudioChatConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -854,16 +857,23 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
                 The length of feature shape of each audio in LLM.
         """
+        feature_lens = audio_feature_lengths
         if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
-        else:
-            audio_feature_lengths = None
+            # Some feature extractors may produce an attention mask whose time dimension is off by 1 compared to
+            # `input_features` (e.g., when padding="longest" and frame rounding differs). Align them to avoid
+            # indexing errors.
+            if input_features.dim() == 3 and feature_attention_mask.shape[1] != input_features.shape[-1]:
+                min_len = min(int(feature_attention_mask.shape[1]), int(input_features.shape[-1]))
+                feature_attention_mask = feature_attention_mask[:, :min_len]
+                input_features = input_features[:, :, :min_len]
 
-        audio_feat_lengths, audio_output_lengths = self.continuous_audio_tower._get_feat_extract_output_lengths(
-            audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
-        )
-        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+            feature_lens = torch.sum(feature_attention_mask, dim=1)
+            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+
+        if feature_lens is None:
+            raise ValueError("Either `feature_attention_mask` or `audio_feature_lengths` must be provided.")
+
+        audio_feat_lengths, audio_output_lengths = self.continuous_audio_tower._get_feat_extract_output_lengths(feature_lens)
         audio_outputs = self.continuous_audio_tower(
             input_features,
             feature_lens=feature_lens,
@@ -1048,16 +1058,68 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                 num_audios, max_audio_tokens, embed_dim = audio_features.shape
                 audio_features_mask = torch.arange(max_audio_tokens, device=audio_output_lengths.device)[None, :]
                 audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
-                audio_features = audio_features[audio_features_mask]
 
-                n_audio_tokens = (input_ids == self.config.audio_token_index).sum().item()
-                n_audio_features = audio_features.shape[0]
+                audio_token_mask = input_ids == self.config.audio_token_index
+                n_audio_tokens = int(audio_token_mask.sum().item())
 
+                # Count audio placeholder token runs in row-major order so we can align each audio segment
+                # (speech_ids/audio_features) to its corresponding `<|AUDIO|>` span. This supports both the
+                # standard 1-audio-per-sample layout and packed/multi-audio samples.
+                span_token_counts: list[int] = []
+                for b in range(audio_token_mask.size(0)):
+                    pos = torch.nonzero(audio_token_mask[b], as_tuple=False).flatten()
+                    if pos.numel() == 0:
+                        continue
+
+                    run_len = 1
+                    prev = int(pos[0].item())
+                    for p in pos[1:]:
+                        cur = int(p.item())
+                        if cur == prev + 1:
+                            run_len += 1
+                        else:
+                            span_token_counts.append(run_len)
+                            run_len = 1
+                        prev = cur
+                    span_token_counts.append(run_len)
+
+                # Align audio features to audio placeholder tokens.
+                #
+                # In practice, the number of `<|AUDIO|>` tokens inside `input_ids` can occasionally drift from the
+                # computed `audio_output_lengths` (e.g., truncation on the text side or rare tokenization quirks).
+                # Instead of crashing, we truncate/pad per-sample to keep training/eval running.
+                audio_features_list = []
+                for i in range(num_audios):
+                    token_count = int(span_token_counts[i]) if i < len(span_token_counts) else 0
+                    if token_count == 0:
+                        continue
+
+                    feature_count = int(audio_output_lengths[i].item())
+                    feats = audio_features[i, :feature_count]
+                    if token_count < feature_count:
+                        feats = feats[:token_count]
+                    elif token_count > feature_count:
+                        pad = feats.new_zeros((token_count - feature_count, embed_dim))
+                        feats = torch.cat([feats, pad], dim=0)
+                    audio_features_list.append(feats)
+
+                if len(audio_features_list) != 0:
+                    audio_features = torch.cat(audio_features_list, dim=0)
+                else:
+                    audio_features = audio_features.new_empty((0, embed_dim))
+
+                n_audio_features = int(audio_features.shape[0])
                 if n_audio_tokens != n_audio_features:
-                    raise ValueError(
-                        f"Audio features and audio tokens do not match: tokens: {n_audio_tokens}, features {n_audio_features}"
-                    )
-                special_audio_mask = (input_ids == self.config.audio_token_index).to(inputs_embeds.device)
+                    if not getattr(self, "_warned_audio_token_mismatch", False):
+                        logger.warning(
+                            "Audio features and audio tokens mismatch (tokens=%s, features=%s); "
+                            "truncation/padding fallback was applied.",
+                            n_audio_tokens,
+                            n_audio_features,
+                        )
+                        self._warned_audio_token_mismatch = True
+
+                special_audio_mask = audio_token_mask.to(inputs_embeds.device)
                 special_audio_mask = special_audio_mask.unsqueeze(-1)
                 audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(
@@ -1076,9 +1138,29 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                     mid_speech_labels = mid_speech_labels.view(
                         mid_speech_labels.shape[0], -1, self.audio_tower.group_size
                     )
-                    mid_speech_labels = mid_speech_labels[
-                        audio_features_mask.unsqueeze(-1).expand_as(mid_speech_labels)
-                    ]
+                    mid_speech_labels_list = []
+                    for i in range(num_audios):
+                        token_count = int(span_token_counts[i]) if i < len(span_token_counts) else 0
+                        if token_count == 0:
+                            continue
+
+                        feature_count = int(audio_output_lengths[i].item())
+                        speech = mid_speech_labels[i, :feature_count]
+                        if token_count < feature_count:
+                            speech = speech[:token_count]
+                        elif token_count > feature_count:
+                            pad = speech.new_full(
+                                (token_count - feature_count, self.audio_tower.group_size),
+                                self.config.ignore_index,
+                            )
+                            speech = torch.cat([speech, pad], dim=0)
+                        mid_speech_labels_list.append(speech)
+
+                    if len(mid_speech_labels_list) != 0:
+                        mid_speech_labels = torch.cat(mid_speech_labels_list, dim=0)
+                    else:
+                        mid_speech_labels = mid_speech_labels.new_empty((0, self.audio_tower.group_size))
+                    mid_speech_labels = mid_speech_labels.to(labels.device)
                     speech_labels = speech_labels.masked_scatter(
                         special_audio_mask.expand_as(speech_labels), mid_speech_labels
                     )
@@ -1094,7 +1176,26 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                     # Text LLM
                     labels[labels == self.config.audio_token_index] = self.config.ignore_index
                     if mid_text_labels is not None:
-                        mid_text_labels = mid_text_labels[audio_features_mask]
+                        mid_text_labels_list = []
+                        for i in range(num_audios):
+                            token_count = int(span_token_counts[i]) if i < len(span_token_counts) else 0
+                            if token_count == 0:
+                                continue
+
+                            feature_count = int(audio_output_lengths[i].item())
+                            text = mid_text_labels[i, :feature_count]
+                            if token_count < feature_count:
+                                text = text[:token_count]
+                            elif token_count > feature_count:
+                                pad = text.new_full((token_count - feature_count,), self.config.ignore_index)
+                                text = torch.cat([text, pad], dim=0)
+                            mid_text_labels_list.append(text)
+
+                        if len(mid_text_labels_list) != 0:
+                            mid_text_labels = torch.cat(mid_text_labels_list, dim=0)
+                        else:
+                            mid_text_labels = mid_text_labels.new_empty((0,))
+                        mid_text_labels = mid_text_labels.to(labels.device)
                         labels = labels.masked_scatter(special_audio_mask.squeeze(-1), mid_text_labels)
                         labels.masked_fill_(non_labels_mask, self.config.ignore_index)
 
@@ -1103,8 +1204,22 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         if cache_position is not None:
             lm_kwargs["cache_position"] = cache_position
 
+        lm_attention_mask = attention_mask
+        # Transformers>=4.53 converts 2D `attention_mask` to bool inside `create_causal_mask`, which destroys
+        # our segment-id mask (1..N, 0 padding) required for neat packing + FA2. Qwen3 supports bypassing
+        # mask creation by passing a dict mapping attention types to the raw 2D mask.
+        if (
+            torch.is_tensor(attention_mask)
+            and attention_mask.dim() == 2
+            and attention_mask.dtype != torch.bool
+            and int(attention_mask.max().item()) > 1
+            and getattr(self.language_model.config, "model_type", None) == "qwen3"
+            and getattr(self.language_model.config, "_attn_implementation", None) == "flash_attention_2"
+        ):
+            lm_attention_mask = {"full_attention": attention_mask, "sliding_attention": attention_mask}
+
         outputs = self.language_model(
-            attention_mask=attention_mask,
+            attention_mask=lm_attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -1228,7 +1343,7 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         stopping_criteria: "StoppingCriteriaList",
         generation_config: "GenerationConfig",
         synced_gpus: bool,
-        streamer: Optional["BaseStreamer"],
+        streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
     ) -> Union["GenerateNonBeamOutput", torch.LongTensor]:
         r"""
