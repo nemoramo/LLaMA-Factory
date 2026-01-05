@@ -1688,7 +1688,7 @@ class FunAudioChatPlugin(BasePlugin):
         audio_pad_token: str = getattr(processor, "audio_pad_token", "<|audio_pad|>")
 
         speech: list[str] = []
-        feature_audios: list["AudioInput"] = []
+        feature_audios: list[AudioInput] = []
         feature_exist_mask: list[bool] = []
 
         for audio in audios:
@@ -1834,7 +1834,7 @@ class FunAudioChatPlugin(BasePlugin):
         if processor is None:
             raise ValueError("Processor was not found, please check and update your model file.")
 
-        mm_inputs: dict[str, Union[list[int], "torch.Tensor"]] = {}
+        mm_inputs: dict[str, Union[list[int], torch.Tensor]] = {}
 
         speech, feature_audios, feature_exist_mask = self._build_speech_strings(audios, processor)
         audio_group_size = getattr(processor, "audio_group_size", 5)

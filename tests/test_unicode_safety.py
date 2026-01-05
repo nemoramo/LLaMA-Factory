@@ -60,4 +60,3 @@ def test_no_suspicious_unicode_in_source():
                 findings.append(f"{rel}:{line}:{col}: {code} {name}")
 
     assert not findings, "Found suspicious unicode characters:\n" + "\n".join(findings[:200])
-

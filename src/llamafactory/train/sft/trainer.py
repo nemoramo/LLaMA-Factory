@@ -232,7 +232,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             merged["labels"] = torch.cat([prompt_ignore, tgt_labels], dim=1)
 
             # If a standard 2D position_ids is present, rebuild it for the merged sequence.
-            if "position_ids" in merged and torch.is_tensor(merged["position_ids"]) and merged["position_ids"].dim() == 2:
+            if (
+                "position_ids" in merged
+                and torch.is_tensor(merged["position_ids"])
+                and merged["position_ids"].dim() == 2
+            ):
                 pos = torch.cumsum(merged["attention_mask"].long(), dim=1) - 1
                 merged["position_ids"] = pos.masked_fill(merged["attention_mask"] == 0, 0)
 
@@ -318,7 +322,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             merged = dict(self._default_gen_kwargs)
             merged.update(gen_kwargs)
             gen_kwargs = merged
-        return super().predict(test_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix, **gen_kwargs)
+        return super().predict(
+            test_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix, **gen_kwargs
+        )
 
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True

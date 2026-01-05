@@ -1,4 +1,4 @@
-"""Convert an ASR ShareGPT JSONL into a FunAudioChat-friendly S2T JSONL.
+r"""Convert an ASR ShareGPT JSONL into a FunAudioChat-friendly S2T JSONL.
 
 This script is intended for datasets like:
 

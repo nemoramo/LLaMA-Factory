@@ -50,6 +50,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
+
 TRAIN_USER_PROMPT = "Transcribe the audio. Output only the text: <audio>"
 
 
@@ -249,8 +250,7 @@ def convert_manifest(
 
     if not allow_nontrain_prompt and prompt != TRAIN_USER_PROMPT:
         raise ValueError(
-            f"--prompt 必须与训练 prompt 完全一致：{TRAIN_USER_PROMPT!r}；"
-            "如需自定义请加 --allow-nontrain-prompt"
+            f"--prompt 必须与训练 prompt 完全一致：{TRAIN_USER_PROMPT!r}；如需自定义请加 --allow-nontrain-prompt"
         )
 
     ensure_parent_dir(output_path)
