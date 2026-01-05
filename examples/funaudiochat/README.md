@@ -38,6 +38,38 @@ If `token` is omitted/empty, the plugin will infer the 25Hz frame count from the
 
 See `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`.
 
+## Packing training (reference)
+
+For long-running experiments, we recommend launching via the watchdog script:
+`scripts/monitor_funaudiochat_s2t_training.sh`.
+
+- If training exits (OOM / disconnect / crash), it restarts automatically.
+- With `overwrite_output_dir=false`, LLaMA-Factory resumes from the latest checkpoint in `output_dir`.
+- The script saves reproducibility artifacts into `output_dir`:
+  - `training_command.txt` (the exact command line)
+  - `config_base.yaml` (a copy of the base YAML config file)
+
+### Neat packing reference command
+
+```bash
+export OUTPUT_DIR="/path/to/llamafactory_saves/funaudiochat/s2t_lora_neatpack_run"
+# Optional: initialize from an existing LoRA adapter checkpoint.
+export INIT_ADAPTER_NAME_OR_PATH="/path/to/prev_adapter/checkpoint-XXXXX"
+
+GPUS=0,1,2,3,4,5 NPROC_PER_NODE=6 \
+PACKING=true NEAT_PACKING=true \
+DYNAMIC_PROMPT_LAZY_ALIGN=true DYNAMIC_PROMPT_PACKING_BUFFER_SIZE=1024 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=4 \
+MAX_STEPS=60000 EVAL_STEPS=2000 SAVE_STEPS=2000 \
+DATALOADER_NUM_WORKERS=6 PREPROCESSING_NUM_WORKERS=32 DATALOADER_PREFETCH_FACTOR=4 \
+EVAL_MAX_NEW_TOKENS=512 \
+bash scripts/monitor_funaudiochat_s2t_training.sh
+```
+
+Notes:
+- When packing is enabled, epoch semantics may not match “full dataset passes”; prefer `MAX_STEPS` for scheduling.
+- If `output_dir` already has checkpoints, the script skips `INIT_ADAPTER_NAME_OR_PATH` and resumes from the latest checkpoint.
+
 ## Attention implementation (recommended: `fa2`)
 
 LLaMA-Factory supports 3 attention implementations for FunAudioChat via `flash_attn`:

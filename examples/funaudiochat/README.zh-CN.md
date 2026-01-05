@@ -38,6 +38,37 @@
 
 参见 `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`。
 
+## 打包训练（参考）
+
+长期实验建议通过 watchdog 脚本启动：`scripts/monitor_funaudiochat_s2t_training.sh`。
+
+- 训练进程退出（OOM / 断连 / 崩溃）会自动重启
+- 使用 `overwrite_output_dir=false` 时，LLaMA-Factory 会从 `output_dir` 的最新 checkpoint 自动恢复
+- 脚本会在 `output_dir` 下保存复现信息：
+  - `training_command.txt`（完整命令行）
+  - `config_base.yaml`（启动时使用的基础 YAML 配置副本）
+
+### neat packing 参考命令
+
+```bash
+export OUTPUT_DIR="/path/to/llamafactory_saves/funaudiochat/s2t_lora_neatpack_run"
+# 可选：从已有 LoRA adapter checkpoint 初始化。
+export INIT_ADAPTER_NAME_OR_PATH="/path/to/prev_adapter/checkpoint-XXXXX"
+
+GPUS=0,1,2,3,4,5 NPROC_PER_NODE=6 \
+PACKING=true NEAT_PACKING=true \
+DYNAMIC_PROMPT_LAZY_ALIGN=true DYNAMIC_PROMPT_PACKING_BUFFER_SIZE=1024 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=4 \
+MAX_STEPS=60000 EVAL_STEPS=2000 SAVE_STEPS=2000 \
+DATALOADER_NUM_WORKERS=6 PREPROCESSING_NUM_WORKERS=32 DATALOADER_PREFETCH_FACTOR=4 \
+EVAL_MAX_NEW_TOKENS=512 \
+bash scripts/monitor_funaudiochat_s2t_training.sh
+```
+
+注意：
+- 开启 packing 后，“epoch” 的语义可能不等价于完整数据集遍历，建议用 `MAX_STEPS` 控制训练时长。
+- 如果 `output_dir` 里已经有 checkpoint，脚本会忽略 `INIT_ADAPTER_NAME_OR_PATH`，直接从最新 checkpoint 恢复。
+
 ## Attention 实现（推荐：`fa2`）
 
 LLaMA-Factory 通过 `flash_attn` 参数支持 3 种 FunAudioChat 的 attention 实现：

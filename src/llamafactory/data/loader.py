@@ -270,6 +270,15 @@ def _load_single_dataset(
         if dataset_attr.formatting not in ["alpaca", "sharegpt", "openai"]:
             raise ValueError(f"Lazy alignment does not support formatting: {dataset_attr.formatting}.")
 
+        # Dynamic prompt packing has its own on-the-fly dataset conversion path via `dataset_converter`,
+        # so we can skip the expensive full-dataset alignment (`dataset.map`) for large JSONLs.
+        if getattr(data_args, "dynamic_prompt_sampling", False) and data_args.packing:
+            logger.info_rank0(
+                f"Dynamic prompt packing enabled: skip alignment for dataset {dataset_attr}; "
+                "conversion will run on-the-fly during training."
+            )
+            return dataset
+
         dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
         transform = _LazyAlignTransform(dataset_converter=dataset_converter, id_key=data_args.dynamic_prompt_id_key)
         dataset = dataset.with_transform(transform, output_all_columns=False)
@@ -292,7 +301,11 @@ def _get_merged_dataset(
     if dataset_names is None:
         return None
 
-    if lazy_align and len(dataset_names) > 1:
+    if (
+        lazy_align
+        and len(dataset_names) > 1
+        and not (getattr(data_args, "dynamic_prompt_sampling", False) and data_args.packing and stage == "sft")
+    ):
         raise ValueError("Lazy alignment currently supports a single dataset.")
 
     datasets = {}
@@ -434,7 +447,7 @@ def get_dataset(
     with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
         lazy_align_train = (
             data_args.dynamic_prompt_sampling
-            and getattr(data_args, "dynamic_prompt_lazy_align", True)
+            and (getattr(data_args, "dynamic_prompt_lazy_align", True) or bool(data_args.packing))
             and stage == "sft"
         )
         dataset = _get_merged_dataset(data_args.dataset, model_args, data_args, training_args, stage, lazy_align=lazy_align_train)
@@ -587,11 +600,36 @@ def get_dataset(
                     is_aligned = isinstance(col_names, (list, tuple)) and "_prompt" in col_names and "_response" in col_names
                     if not is_aligned:
                         dataset_names = data_args.dataset or []
-                        if len(dataset_names) != 1:
-                            raise ValueError(
-                                "Dynamic prompt packing with lazy alignment currently supports a single dataset."
-                            )
-                        dataset_attr = next(iter(get_dataset_list(dataset_names, data_args.dataset_dir)))
+                        if len(dataset_names) == 0:
+                            raise ValueError("Dynamic prompt packing: `dataset` is empty.")
+
+                        dataset_attrs = get_dataset_list(dataset_names, data_args.dataset_dir)
+                        dataset_attr = dataset_attrs[0]
+                        # When mixing multiple datasets, dynamic prompt packing can still run alignment on-the-fly
+                        # as long as their conversion schema is identical (same formatting + column/tag mapping).
+                        for other in dataset_attrs[1:]:
+                            if (
+                                other.formatting != dataset_attr.formatting
+                                or other.messages != dataset_attr.messages
+                                or other.system != dataset_attr.system
+                                or other.tools != dataset_attr.tools
+                                or other.images != dataset_attr.images
+                                or other.videos != dataset_attr.videos
+                                or other.audios != dataset_attr.audios
+                                or other.role_tag != dataset_attr.role_tag
+                                or other.content_tag != dataset_attr.content_tag
+                                or other.user_tag != dataset_attr.user_tag
+                                or other.assistant_tag != dataset_attr.assistant_tag
+                                or other.observation_tag != dataset_attr.observation_tag
+                                or other.function_tag != dataset_attr.function_tag
+                                or other.system_tag != dataset_attr.system_tag
+                            ):
+                                raise ValueError(
+                                    "Dynamic prompt packing with on-the-fly alignment requires all mixed datasets "
+                                    "to share the same `formatting` and column/tag mapping. "
+                                    f"Got mismatch between {dataset_attr.dataset_name} and {other.dataset_name}."
+                                )
+
                         dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
                         id_key = data_args.dynamic_prompt_id_key
                         logger.info_rank0(
