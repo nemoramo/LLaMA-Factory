@@ -129,7 +129,33 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
+        self._update_effective_tokens_seen(model, inputs)
         return super().compute_loss(model, inputs, *args, **kwargs)
+
+    def _update_effective_tokens_seen(self, model, inputs) -> None:
+        if not getattr(model, "training", False):
+            return
+
+        labels = inputs.get("labels")
+        if not torch.is_tensor(labels):
+            return
+
+        ignore_index = getattr(getattr(model, "config", None), "ignore_index", IGNORE_INDEX)
+        effective_mask = labels.ne(int(ignore_index))
+
+        audio_token_index = getattr(getattr(model, "config", None), "audio_token_index", None)
+        if audio_token_index is not None:
+            try:
+                effective_mask = effective_mask & labels.ne(int(audio_token_index))
+            except Exception:
+                pass
+
+        effective_tokens = effective_mask.sum()
+        effective_tokens = effective_tokens.to(device=self.args.device, dtype=torch.int64).detach()
+        effective_tokens = self.accelerator.gather(effective_tokens).sum()
+
+        prev = int(getattr(self.state, "num_effective_tokens_seen", 0) or 0)
+        setattr(self.state, "num_effective_tokens_seen", prev + int(effective_tokens.item()))
 
     @override
     def prediction_step(
