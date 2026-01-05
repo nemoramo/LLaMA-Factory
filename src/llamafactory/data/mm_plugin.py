@@ -556,6 +556,9 @@ class MMPluginMixin:
                 audios,
                 sampling_rate=audio_sampling_rate,
             )["audios"]
+            min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
+            if min_samples > 0:
+                audios = [np.pad(a, (0, max(0, min_samples - a.shape[0])), mode="constant") for a in audios]
             mm_inputs.update(
                 feature_extractor(
                     audios,
@@ -1862,6 +1865,9 @@ class FunAudioChatPlugin(BasePlugin):
             audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
             audio_padding = getattr(processor, "audio_padding", "max_length")
             wavs = self._regularize_audios(feature_audios, sampling_rate=audio_sampling_rate)["audios"]
+            min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
+            if min_samples > 0:
+                wavs = [np.pad(w, (0, max(0, min_samples - w.shape[0])), mode="constant") for w in wavs]
             wav_inputs = feature_extractor(
                 wavs,
                 sampling_rate=audio_sampling_rate,

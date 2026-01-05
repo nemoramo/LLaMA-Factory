@@ -64,6 +64,16 @@ Notes:
 - Speed and memory will vary with audio duration distribution, cutoff length, gradient checkpointing, etc.
 - `fa2` is fastest in our tests; `sdpa` may be more memory-efficient depending on your workload.
 
+### Benchmarks (neat packing vs no packing)
+
+In a timed **25-minute** run on **2× NVIDIA H20**, we compared **neat packing** vs **no packing** for FunAudioChat S2T
+using the same training datasets and tracked **effective tokens** (non-ignored labels, excluding audio tokens):
+
+- `neat_packing=true` + dynamic prompt packing (`per_device_train_batch_size=2`): ~**1.00M** effective tokens/GPU/25min (≈**669 tok/s/GPU**)
+- `packing=false` (`per_device_train_batch_size=8`): ~**0.71M** effective tokens/GPU/25min (≈**475 tok/s/GPU**)
+
+Overall, neat packing delivered ~**1.41×** more effective tokens in the same wall-clock window (steady-state throughput in logs was ~**1.77×** higher).
+
 ### Install FlashAttention-2 (`fa2`)
 
 #### 1) Quick install (recommended to try first)
