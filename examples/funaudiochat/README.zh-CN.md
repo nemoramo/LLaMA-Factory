@@ -38,6 +38,25 @@
 
 参见 `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`。
 
+## 批量评测（prompt_pool + normalized WER/WERE）
+
+如果你的评测数据使用了 `prompt_pool`（例如 `*_norm_text_promptpool_*`），并且希望评测时带上
+**language 提示**、使用 **normalized prompt**（与训练对齐），可以直接用脚本：
+
+```bash
+conda activate llamafactory
+python scripts/eval_funaudiochat_s2t_promptpool.py \
+  --model /path/to/checkpoint-XXXXX \
+  --base-model FunAudioLLM/Fun-Audio-Chat-8B \
+  --gpus 6,7
+```
+
+输出默认写到 `--out-root`（默认：`/data2/mayufeng/llamafactory_eval/funaudiochat`），包含：
+
+- `generated_predictions.jsonl`（prompt/predict/label）
+- `normalized_wer_were_eval.json`（调用 `~/projects/speech_related_tools/evaluate/eval_asr_wer_cer.py`）
+- `summary.json`（各测试集路径与指标汇总）
+
 ## 打包训练（参考）
 
 长期实验建议通过 watchdog 脚本启动：`scripts/monitor_funaudiochat_s2t_training.sh`。

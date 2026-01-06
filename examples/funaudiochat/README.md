@@ -38,6 +38,26 @@ If `token` is omitted/empty, the plugin will infer the 25Hz frame count from the
 
 See `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`.
 
+## Batch evaluation (prompt_pool + normalized WER/WERE)
+
+If your eval manifests use `prompt_pool` (e.g., `*_norm_text_promptpool_*`) and you want **language-hinted** prompts
+aligned with training, use:
+
+```bash
+conda activate llamafactory
+python scripts/eval_funaudiochat_s2t_promptpool.py \
+  --model /path/to/checkpoint-XXXXX \
+  --base-model FunAudioLLM/Fun-Audio-Chat-8B \
+  --gpus 6,7
+```
+
+Outputs (per testset + per-language combined) are written under `--out-root` (default:
+`/data2/mayufeng/llamafactory_eval/funaudiochat`) and include:
+
+- `generated_predictions.jsonl` (prompt/predict/label)
+- `normalized_wer_were_eval.json` (from `~/projects/speech_related_tools/evaluate/eval_asr_wer_cer.py`)
+- `summary.json` (paths + metrics)
+
 ## Packing training (reference)
 
 For long-running experiments, we recommend launching via the watchdog script:
