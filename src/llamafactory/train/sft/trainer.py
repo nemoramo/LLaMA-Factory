@@ -292,7 +292,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             merged = dict(self._default_gen_kwargs)
             merged.update(gen_kwargs)
             gen_kwargs = merged
-        return super().predict(test_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix, **gen_kwargs)
+
+        has_processing_class = hasattr(self, "processing_class")
+        original_padding_side = self.processing_class.padding_side if has_processing_class else None
+
+        def _set_left_padding() -> None:
+            if has_processing_class and self.args.predict_with_generate:
+                self.processing_class.padding_side = "left"
+
+        def _restore_padding() -> None:
+            if has_processing_class and original_padding_side is not None:
+                self.processing_class.padding_side = original_padding_side
+
+        try:
+            _set_left_padding()
+            return super().predict(
+                test_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix, **gen_kwargs
+            )
+        finally:
+            _restore_padding()
 
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True

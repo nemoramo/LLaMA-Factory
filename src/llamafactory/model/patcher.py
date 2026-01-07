@@ -159,8 +159,11 @@ def patch_config(
     # deepspeed zero3 is not compatible with low_cpu_mem_usage
     init_kwargs["low_cpu_mem_usage"] = model_args.low_cpu_mem_usage and (not is_deepspeed_zero3_enabled())
 
-    # do not cast data type of the model deepspeed zero3 without qlora
-    if not (is_deepspeed_zero3_enabled() and model_args.quantization_bit is None):
+    # Pass `torch_dtype` to `from_pretrained` when a reduced precision is requested.
+    #
+    # Note: The previous behavior skipped setting `torch_dtype` under DeepSpeed ZeRO-3 (without QLoRA),
+    # which can leave the model in fp32 and significantly increase VRAM usage.
+    if model_args.compute_dtype != torch.float32:
         init_kwargs["torch_dtype"] = model_args.compute_dtype
 
         if init_kwargs["low_cpu_mem_usage"] and not is_fsdp_enabled():  # fsdp does not need device map

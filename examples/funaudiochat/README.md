@@ -79,6 +79,7 @@ export INIT_ADAPTER_NAME_OR_PATH="/path/to/prev_adapter/checkpoint-XXXXX"
 GPUS=0,1,2,3,4,5 NPROC_PER_NODE=6 \
 PACKING=true NEAT_PACKING=true \
 DYNAMIC_PROMPT_LAZY_ALIGN=true DYNAMIC_PROMPT_PACKING_BUFFER_SIZE=1024 \
+DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS=2 DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS=2 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=4 \
 MAX_STEPS=60000 EVAL_STEPS=2000 SAVE_STEPS=2000 \
 DATALOADER_NUM_WORKERS=6 PREPROCESSING_NUM_WORKERS=32 DATALOADER_PREFETCH_FACTOR=4 \
@@ -89,6 +90,9 @@ bash scripts/monitor_funaudiochat_s2t_training.sh
 Notes:
 - When packing is enabled, epoch semantics may not match “full dataset passes”; prefer `MAX_STEPS` for scheduling.
 - If `output_dir` already has checkpoints, the script skips `INIT_ADAPTER_NAME_OR_PATH` and resumes from the latest checkpoint.
+- Dynamic prompt packing knobs (optional):
+  - `DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS` (`dynamic_prompt_packing_prefetch_buffers`): prefetch N *packed buffers* ahead per dataloader worker to reduce stalls at buffer boundaries (uses more CPU/RAM).
+  - `DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS` (`dynamic_prompt_packing_carryover_packs`): carry over N lowest-fill packs to the next buffer so packing can mix across buffer boundaries (better packing efficiency, slightly changes sample order). Set to `0` to disable.
 
 ## Attention implementation (recommended: `fa2`)
 

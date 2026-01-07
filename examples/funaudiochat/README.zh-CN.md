@@ -77,6 +77,7 @@ export INIT_ADAPTER_NAME_OR_PATH="/path/to/prev_adapter/checkpoint-XXXXX"
 GPUS=0,1,2,3,4,5 NPROC_PER_NODE=6 \
 PACKING=true NEAT_PACKING=true \
 DYNAMIC_PROMPT_LAZY_ALIGN=true DYNAMIC_PROMPT_PACKING_BUFFER_SIZE=1024 \
+DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS=2 DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS=2 \
 PER_DEVICE_TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=4 \
 MAX_STEPS=60000 EVAL_STEPS=2000 SAVE_STEPS=2000 \
 DATALOADER_NUM_WORKERS=6 PREPROCESSING_NUM_WORKERS=32 DATALOADER_PREFETCH_FACTOR=4 \
@@ -87,6 +88,9 @@ bash scripts/monitor_funaudiochat_s2t_training.sh
 注意：
 - 开启 packing 后，“epoch” 的语义可能不等价于完整数据集遍历，建议用 `MAX_STEPS` 控制训练时长。
 - 如果 `output_dir` 里已经有 checkpoint，脚本会忽略 `INIT_ADAPTER_NAME_OR_PATH`，直接从最新 checkpoint 恢复。
+- 动态 prompt 打包相关参数（可选）：
+  - `DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS`（`dynamic_prompt_packing_prefetch_buffers`）：每个 dataloader worker 预取 N 个 *packed buffer*，减少 buffer 切换卡顿（更吃 CPU/RAM）。
+  - `DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS`（`dynamic_prompt_packing_carryover_packs`）：把每个 buffer 中最“空”的 N 个 pack 对应的 raw segments 留到下一个 buffer 再一起 pack，实现跨 buffer 混合（更高打包效率，但样本顺序会有轻微变化）。设为 `0` 可关闭。
 
 ## Attention 实现（推荐：`fa2`）
 

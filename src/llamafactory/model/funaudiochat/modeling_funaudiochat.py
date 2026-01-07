@@ -1062,69 +1062,33 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                 audio_token_mask = input_ids == self.config.audio_token_index
                 n_audio_tokens = int(audio_token_mask.sum().item())
 
-                # Count audio placeholder token runs in row-major order so we can align each audio segment
-                # (speech_ids/audio_features) to its corresponding `<|AUDIO|>` span. This supports both the
-                # standard 1-audio-per-sample layout and packed/multi-audio samples.
-                span_token_counts: list[int] = []
-                for b in range(audio_token_mask.size(0)):
-                    pos = torch.nonzero(audio_token_mask[b], as_tuple=False).flatten()
-                    if pos.numel() == 0:
-                        continue
-
-                    run_len = 1
-                    prev = int(pos[0].item())
-                    for p in pos[1:]:
-                        cur = int(p.item())
-                        if cur == prev + 1:
-                            run_len += 1
-                        else:
-                            span_token_counts.append(run_len)
-                            run_len = 1
-                        prev = cur
-                    span_token_counts.append(run_len)
-
-                # Align audio features to audio placeholder tokens.
+                # Align audio features to `<|AUDIO|>` tokens in row-major order.
                 #
-                # In practice, the number of `<|AUDIO|>` tokens inside `input_ids` can occasionally drift from the
-                # computed `audio_output_lengths` (e.g., truncation on the text side or rare tokenization quirks).
-                # Instead of crashing, we truncate/pad per-sample to keep training/eval running.
-                audio_features_list = []
-                for i in range(num_audios):
-                    token_count = int(span_token_counts[i]) if i < len(span_token_counts) else 0
-                    if token_count == 0:
-                        continue
+                # For packed/multi-audio samples, `<|AUDIO|>` tokens are not guaranteed to appear as one contiguous span
+                # per audio (e.g., special tokens may interleave). Instead of relying on contiguous runs, we flatten the
+                # valid audio feature frames (using `audio_output_lengths`) and assign them to all `<|AUDIO|>` token
+                # positions in row-major order. If a mismatch happens (rare), we truncate/pad to avoid crashes.
+                flat_audio_features = audio_features[audio_features_mask]  # [N_audio_frames, D]
+                n_audio_features = int(flat_audio_features.shape[0])
+                if n_audio_tokens != n_audio_features and not getattr(self, "_warned_audio_token_mismatch", False):
+                    logger.warning(
+                        "Audio features and audio tokens mismatch (tokens=%s, features=%s); "
+                        "truncation/padding fallback was applied.",
+                        n_audio_tokens,
+                        n_audio_features,
+                    )
+                    self._warned_audio_token_mismatch = True
 
-                    feature_count = int(audio_output_lengths[i].item())
-                    feats = audio_features[i, :feature_count]
-                    if token_count < feature_count:
-                        feats = feats[:token_count]
-                    elif token_count > feature_count:
-                        pad = feats.new_zeros((token_count - feature_count, embed_dim))
-                        feats = torch.cat([feats, pad], dim=0)
-                    audio_features_list.append(feats)
+                if n_audio_features < n_audio_tokens:
+                    pad = flat_audio_features.new_zeros((n_audio_tokens - n_audio_features, embed_dim))
+                    flat_audio_features = torch.cat([flat_audio_features, pad], dim=0)
+                elif n_audio_features > n_audio_tokens:
+                    flat_audio_features = flat_audio_features[:n_audio_tokens]
 
-                if len(audio_features_list) != 0:
-                    audio_features = torch.cat(audio_features_list, dim=0)
-                else:
-                    audio_features = audio_features.new_empty((0, embed_dim))
-
-                n_audio_features = int(audio_features.shape[0])
-                if n_audio_tokens != n_audio_features:
-                    if not getattr(self, "_warned_audio_token_mismatch", False):
-                        logger.warning(
-                            "Audio features and audio tokens mismatch (tokens=%s, features=%s); "
-                            "truncation/padding fallback was applied.",
-                            n_audio_tokens,
-                            n_audio_features,
-                        )
-                        self._warned_audio_token_mismatch = True
-
-                special_audio_mask = audio_token_mask.to(inputs_embeds.device)
-                special_audio_mask = special_audio_mask.unsqueeze(-1)
-                audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(
-                    special_audio_mask.expand_as(inputs_embeds), audio_features
-                )
+                audio_token_mask = audio_token_mask.to(inputs_embeds.device)
+                special_audio_mask = audio_token_mask.unsqueeze(-1)
+                flat_audio_features = flat_audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask.expand_as(inputs_embeds), flat_audio_features)
 
                 # 开始构建labels
                 if labels is not None:
@@ -1138,32 +1102,18 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                     mid_speech_labels = mid_speech_labels.view(
                         mid_speech_labels.shape[0], -1, self.audio_tower.group_size
                     )
-                    mid_speech_labels_list = []
-                    for i in range(num_audios):
-                        token_count = int(span_token_counts[i]) if i < len(span_token_counts) else 0
-                        if token_count == 0:
-                            continue
+                    flat_mid_speech_labels = mid_speech_labels[audio_features_mask]  # [N_audio_frames, group]
+                    n_speech = int(flat_mid_speech_labels.shape[0])
+                    if n_speech < n_audio_tokens:
+                        pad = flat_mid_speech_labels.new_full(
+                            (n_audio_tokens - n_speech, self.audio_tower.group_size),
+                            self.config.ignore_index,
+                        )
+                        flat_mid_speech_labels = torch.cat([flat_mid_speech_labels, pad], dim=0)
+                    elif n_speech > n_audio_tokens:
+                        flat_mid_speech_labels = flat_mid_speech_labels[:n_audio_tokens]
 
-                        feature_count = int(audio_output_lengths[i].item())
-                        speech = mid_speech_labels[i, :feature_count]
-                        if token_count < feature_count:
-                            speech = speech[:token_count]
-                        elif token_count > feature_count:
-                            pad = speech.new_full(
-                                (token_count - feature_count, self.audio_tower.group_size),
-                                self.config.ignore_index,
-                            )
-                            speech = torch.cat([speech, pad], dim=0)
-                        mid_speech_labels_list.append(speech)
-
-                    if len(mid_speech_labels_list) != 0:
-                        mid_speech_labels = torch.cat(mid_speech_labels_list, dim=0)
-                    else:
-                        mid_speech_labels = mid_speech_labels.new_empty((0, self.audio_tower.group_size))
-                    mid_speech_labels = mid_speech_labels.to(labels.device)
-                    speech_labels = speech_labels.masked_scatter(
-                        special_audio_mask.expand_as(speech_labels), mid_speech_labels
-                    )
+                    speech_labels[audio_token_mask.to(labels.device)] = flat_mid_speech_labels.to(labels.device)
                     non_labels_mask = labels == self.config.ignore_index
                     speech_labels = speech_labels.masked_fill(non_labels_mask.unsqueeze(-1), self.config.ignore_index)
 
@@ -1176,27 +1126,15 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                     # Text LLM
                     labels[labels == self.config.audio_token_index] = self.config.ignore_index
                     if mid_text_labels is not None:
-                        mid_text_labels_list = []
-                        for i in range(num_audios):
-                            token_count = int(span_token_counts[i]) if i < len(span_token_counts) else 0
-                            if token_count == 0:
-                                continue
+                        flat_mid_text_labels = mid_text_labels[audio_features_mask]  # [N_audio_frames]
+                        n_text = int(flat_mid_text_labels.shape[0])
+                        if n_text < n_audio_tokens:
+                            pad = flat_mid_text_labels.new_full((n_audio_tokens - n_text,), self.config.ignore_index)
+                            flat_mid_text_labels = torch.cat([flat_mid_text_labels, pad], dim=0)
+                        elif n_text > n_audio_tokens:
+                            flat_mid_text_labels = flat_mid_text_labels[:n_audio_tokens]
 
-                            feature_count = int(audio_output_lengths[i].item())
-                            text = mid_text_labels[i, :feature_count]
-                            if token_count < feature_count:
-                                text = text[:token_count]
-                            elif token_count > feature_count:
-                                pad = text.new_full((token_count - feature_count,), self.config.ignore_index)
-                                text = torch.cat([text, pad], dim=0)
-                            mid_text_labels_list.append(text)
-
-                        if len(mid_text_labels_list) != 0:
-                            mid_text_labels = torch.cat(mid_text_labels_list, dim=0)
-                        else:
-                            mid_text_labels = mid_text_labels.new_empty((0,))
-                        mid_text_labels = mid_text_labels.to(labels.device)
-                        labels = labels.masked_scatter(special_audio_mask.squeeze(-1), mid_text_labels)
+                        labels[audio_token_mask.to(labels.device)] = flat_mid_text_labels.to(labels.device)
                         labels.masked_fill_(non_labels_mask, self.config.ignore_index)
 
 

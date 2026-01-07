@@ -573,6 +573,8 @@ def get_dataset(
 
                     buffer_size = int(getattr(data_args, "dynamic_prompt_packing_buffer_size", 20000) or 20000)
                     shuffle_packs = bool(getattr(data_args, "dynamic_prompt_packing_shuffle", True))
+                    prefetch_buffers = int(getattr(data_args, "dynamic_prompt_packing_prefetch_buffers", 0) or 0)
+                    carryover_packs = int(getattr(data_args, "dynamic_prompt_packing_carryover_packs", 0) or 0)
 
                     num_shards = int(getattr(data_args, "dynamic_prompt_packing_num_shards", 0) or 0)
                     if num_shards <= 0:
@@ -650,6 +652,8 @@ def get_dataset(
                         shuffle_packs=shuffle_packs,
                         num_shards=num_shards,
                         global_shuffle=global_shuffle,
+                        prefetch_buffers=prefetch_buffers,
+                        carryover_packs=carryover_packs,
                     )
                     logger.info_rank0(
                         "Wrapped train dataset with buffered knapsack packing "

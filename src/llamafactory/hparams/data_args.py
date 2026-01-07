@@ -237,6 +237,28 @@ class DataArguments:
         metadata={"help": "Shuffle packed sequences inside each buffer for dynamic prompt packing."},
     )
 
+    dynamic_prompt_packing_prefetch_buffers: int = field(
+        default=2,
+        metadata={
+            "help": (
+                "Prefetch N *packed buffers* ahead (per dataloader worker) when using dynamic prompt packing. "
+                "This helps hide stalls at buffer boundaries, but increases CPU/RAM usage. "
+                "Set to 0 to disable."
+            )
+        },
+    )
+
+    dynamic_prompt_packing_carryover_packs: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Hold back N lowest-fill packed sequences from each buffer and carry their raw segments to the next "
+                "buffer, so packing can mix across buffer boundaries. This can improve packing efficiency when "
+                "buffer_size is small, at the cost of slightly changing sample order. Set to 0 to disable."
+            )
+        },
+    )
+
     def __post_init__(self):
         def split_arg(arg):
             if isinstance(arg, str):
