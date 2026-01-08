@@ -1412,8 +1412,10 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
 
         # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
         if return_dict_in_generate and self.config.is_encoder_decoder:
-            model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
-            (model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None)
+            _encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            _encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
 
         # keep track of which sequences are already finished
         batch_size, cur_len = input_ids.shape[:2]
