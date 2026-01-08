@@ -19,12 +19,14 @@ import copy
 import hashlib
 import math
 import random
+import threading
+from queue import Empty, Full, Queue
 from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any
 
 import torch
-from torch.utils.data import Dataset, get_worker_info
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
@@ -695,8 +697,17 @@ class DynamicPromptPackedBatchProcessor:
         return item
 
     def __call__(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        items, lengths = self.encode_examples(examples)
+        packed, _, _ = self.pack_encoded_items(items, lengths, carryover_packs=0)
+        return packed
+
+    def encode_examples(self, examples: dict[str, list[Any]]) -> tuple[list[dict[str, Any]], list[int]]:
+        """Encode a raw buffer into per-sample segments (input_ids/labels + optional media).
+
+        Returns (items, lengths). Invalid/too-long samples are dropped (with limited warnings).
+        """
         if not examples:
-            return {}
+            return [], []
 
         prompt_col = examples.get("_prompt")
         if isinstance(prompt_col, list):
@@ -705,7 +716,7 @@ class DynamicPromptPackedBatchProcessor:
             first_col = next((v for v in examples.values() if isinstance(v, list)), None)
             batch_size = len(first_col) if isinstance(first_col, list) else 0
         if batch_size == 0:
-            return {}
+            return [], []
 
         for k, v in examples.items():
             if isinstance(v, list) and len(v) != batch_size:
@@ -722,8 +733,6 @@ class DynamicPromptPackedBatchProcessor:
                 f"{self._seen_samples} raw samples (latest buffer_size={batch_size})."
             )
 
-        rng = self._get_rng()
-
         cutoff_len = int(self.data_args.cutoff_len)
         if cutoff_len <= 0:
             raise ValueError(f"Invalid cutoff_len for packing: {self.data_args.cutoff_len}")
@@ -731,15 +740,8 @@ class DynamicPromptPackedBatchProcessor:
         target_len = cutoff_len + 1
         capacity = target_len - 1
 
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = self.tokenizer.eos_token_id
-        if pad_token_id is None:
-            raise ValueError("tokenizer.pad_token_id and tokenizer.eos_token_id are both None.")
-
         items: list[dict[str, Any]] = []
         lengths: list[int] = []
-        length2indexes: dict[int, list[int]] = defaultdict(list)
 
         dropped_invalid = 0
         dropped_long = 0
@@ -819,9 +821,7 @@ class DynamicPromptPackedBatchProcessor:
             if example.get("_audios") is not None:
                 item["audios"] = example.get("_audios") or []
 
-            index = len(items)
             items.append(item)
-            length2indexes[l].append(index)
             lengths.append(l)
 
         self._warned = warned
@@ -872,14 +872,50 @@ class DynamicPromptPackedBatchProcessor:
             self._last_log_dropped_long_total = dropped_long_total
             self._last_log_dropped_encode_total = dropped_encode_total
 
-        if not items:
-            return {}
+        return items, lengths
 
-        knapsacks = greedy_knapsack(lengths.copy(), capacity)
+    def pack_encoded_items(
+        self, items: list[dict[str, Any]], lengths: list[int], *, carryover_packs: int = 0
+    ) -> tuple[dict[str, list[Any]], list[dict[str, Any]], list[int]]:
+        """Pack already-encoded segments into fixed-length packed sequences.
+
+        Returns (packed, carry_items, carry_lengths). `carryover_packs` holds back a number of lowest-fill packed
+        sequences (by sum(lengths)/capacity) and returns their raw segments for cross-buffer mixing.
+        """
+        if not items:
+            return {}, [], []
+
+        if len(items) != len(lengths):
+            raise ValueError(f"Dynamic prompt packing internal error: len(items)={len(items)} != len(lengths)={len(lengths)}")
+
+        cutoff_len = int(self.data_args.cutoff_len)
+        if cutoff_len <= 0:
+            raise ValueError(f"Invalid cutoff_len for packing: {self.data_args.cutoff_len}")
+
+        target_len = cutoff_len + 1
+        capacity = target_len - 1
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("tokenizer.pad_token_id and tokenizer.eos_token_id are both None.")
+
+        length2indexes: dict[int, list[int]] = defaultdict(list)
+        for i, l in enumerate(lengths):
+            if l <= 0 or l > capacity:
+                continue
+            length2indexes[int(l)].append(i)
+
+        if not length2indexes:
+            return {}, [], []
+
+        rng = self._get_rng()
+        knapsacks = greedy_knapsack([int(l) for l in lengths if 0 < int(l) <= capacity], capacity)
         if self.shuffle_packs:
             rng.shuffle(knapsacks)
 
-        model_inputs: dict[str, list[Any]] = defaultdict(list)
+        packs: list[list[int]] = []
         for knapsack in knapsacks:
             if not knapsack:
                 continue
@@ -893,17 +929,40 @@ class DynamicPromptPackedBatchProcessor:
                 continue
 
             for start in range(0, len(picked), self.max_samples_per_pack):
-                segments = [items[i] for i in picked[start : start + self.max_samples_per_pack]]
-                packed = self._pack_segments(
-                    segments,
-                    pad_token_id=int(pad_token_id),
-                    target_len=target_len,
-                    capacity=capacity,
-                )
-                for k, v in packed.items():
-                    model_inputs[k].append(v)
+                pack = picked[start : start + self.max_samples_per_pack]
+                if pack:
+                    packs.append(pack)
 
-        return dict(model_inputs)
+        if not packs:
+            return {}, [], []
+
+        carryover_packs = int(carryover_packs or 0)
+        keep_pack_ids: set[int] = set()
+        if carryover_packs > 0 and len(packs) > carryover_packs:
+            fills = [sum(lengths[i] for i in pack) for pack in packs]
+            worst = sorted(range(len(packs)), key=lambda j: fills[j])[:carryover_packs]
+            keep_pack_ids = set(worst)
+
+        model_inputs: dict[str, list[Any]] = defaultdict(list)
+        carry_indices: list[int] = []
+        for j, pack in enumerate(packs):
+            if j in keep_pack_ids:
+                carry_indices.extend(pack)
+                continue
+
+            segments = [items[i] for i in pack]
+            packed = self._pack_segments(
+                segments,
+                pad_token_id=int(pad_token_id),
+                target_len=target_len,
+                capacity=capacity,
+            )
+            for k, v in packed.items():
+                model_inputs[k].append(v)
+
+        carry_items = [items[i] for i in carry_indices] if carry_indices else []
+        carry_lengths = [lengths[i] for i in carry_indices] if carry_indices else []
+        return dict(model_inputs), carry_items, carry_lengths
 
 
 def build_dynamic_prompt_packed_iterable_dataset(
@@ -921,6 +980,8 @@ def build_dynamic_prompt_packed_iterable_dataset(
     shuffle_packs: bool = True,
     num_shards: int = 0,
     global_shuffle: bool = True,
+    prefetch_buffers: int = 0,
+    carryover_packs: int = 0,
 ):
     """Build a sharded HF IterableDataset for buffered dynamic prompt packing."""
     try:
@@ -1002,15 +1063,207 @@ def build_dynamic_prompt_packed_iterable_dataset(
         max_samples_per_pack=max_samples_per_pack,
         shuffle_packs=shuffle_packs,
     )
-    packed = iterable_ds.map(
-        packer,
-        batched=True,
-        batch_size=int(buffer_size),
-        remove_columns=remove_columns,
-    )
+
+    prefetch_buffers = int(prefetch_buffers or 0)
+    if prefetch_buffers < 0:
+        raise ValueError(f"Invalid prefetch_buffers for dynamic prompt packing: {prefetch_buffers}")
+
+    carryover_packs = int(carryover_packs or 0)
+    if carryover_packs < 0:
+        raise ValueError(f"Invalid carryover_packs for dynamic prompt packing: {carryover_packs}")
+
+    if carryover_packs > 0:
+        logger.info_rank0(
+            "Dynamic prompt packing: enable cross-buffer carryover (carryover_packs={}). "
+            "This may improve packing efficiency but slightly changes sample order.".format(carryover_packs)
+        )
+        if prefetch_buffers <= 0:
+            prefetch_buffers = 1
+
+    if prefetch_buffers > 0:
+        logger.info_rank0(
+            "Dynamic prompt packing: enable packed-buffer prefetch (prefetch_buffers={}). "
+            "This may reduce dataloader stalls but increases CPU/RAM usage.".format(prefetch_buffers)
+        )
+        return _DynamicPromptPackedPrefetchDataset(
+            iterable_ds=iterable_ds,
+            packer=packer,
+            buffer_size=int(buffer_size),
+            prefetch_buffers=prefetch_buffers,
+            carryover_packs=carryover_packs,
+        )
+
+    packed = iterable_ds.map(packer, batched=True, batch_size=int(buffer_size), remove_columns=remove_columns)
     # Repeat indefinitely to avoid DDP hangs when `max_steps` exceeds one full pass. Training length should be
     # controlled via `max_steps`. Each "cycle" still uses every raw sample at most once (per rank shard).
     return packed.repeat(None)
+
+
+class _DynamicPromptPackedPrefetchDataset(IterableDataset):
+    """Torch IterableDataset that prefetches *packed buffers* in a background thread.
+
+    Why:
+      HF IterableDataset.map(batched=True, batch_size=buffer_size) processes an entire buffer before yielding any
+      packed example. This can create periodic stalls at buffer boundaries when the dataloader queue is filled by
+      items from the current buffer only. Prefetching a small number of packed buffers ahead helps hide these stalls.
+
+    Notes:
+      - Prefetch is per dataloader worker process.
+      - Increasing `prefetch_buffers` increases CPU/RAM usage (packed samples are large Python lists).
+    """
+
+    def __init__(
+        self,
+        *,
+        iterable_ds,
+        packer: DynamicPromptPackedBatchProcessor,
+        buffer_size: int,
+        prefetch_buffers: int,
+        carryover_packs: int = 0,
+    ) -> None:
+        self.iterable_ds = iterable_ds
+        self.packer = packer
+        self.buffer_size = int(buffer_size)
+        self.prefetch_buffers = int(prefetch_buffers)
+        self.carryover_packs = int(carryover_packs or 0)
+
+        if self.buffer_size <= 0:
+            raise ValueError(f"Invalid buffer_size for dynamic prompt packing: {self.buffer_size}")
+        if self.prefetch_buffers <= 0:
+            raise ValueError(f"Invalid prefetch_buffers for dynamic prompt packing: {self.prefetch_buffers}")
+        if self.carryover_packs < 0:
+            raise ValueError(f"Invalid carryover_packs for dynamic prompt packing: {self.carryover_packs}")
+
+    @staticmethod
+    def _take_raw_batch(raw_iter, batch_size: int) -> dict[str, list[Any]] | None:
+        rows: list[dict[str, Any]] = []
+        for _ in range(batch_size):
+            try:
+                row = next(raw_iter)
+            except StopIteration:
+                break
+            if row is None:
+                continue
+            if not isinstance(row, dict):
+                raise ValueError(f"Dynamic prompt packing expected dict rows, got: {type(row)}")
+            rows.append(row)
+
+        if not rows:
+            return None
+
+        keys = list(rows[0].keys())
+        examples: dict[str, list[Any]] = {k: [] for k in keys}
+        for row in rows:
+            for k in keys:
+                examples[k].append(row.get(k))
+        return examples
+
+    @staticmethod
+    def _yield_packed_examples(packed: dict[str, list[Any]]):
+        if not packed:
+            return
+
+        keys = list(packed.keys())
+        if not keys:
+            return
+
+        first = packed.get(keys[0])
+        if not isinstance(first, list) or len(first) == 0:
+            return
+
+        n = len(first)
+        for k in keys[1:]:
+            v = packed.get(k)
+            if isinstance(v, list) and len(v) != n:
+                raise ValueError(
+                    "Dynamic prompt packing produced inconsistent packed column lengths: "
+                    f"len({k})={len(v)} vs len({keys[0]})={n}"
+                )
+
+        for i in range(n):
+            yield {k: packed[k][i] for k in keys}
+
+    @staticmethod
+    def _queue_put(q: Queue, item: Any, stop: threading.Event, timeout_s: float = 0.5) -> bool:
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=timeout_s)
+                return True
+            except Full:
+                continue
+        return False
+
+    def __iter__(self):
+        # Repeat indefinitely. Training length should be controlled via `max_steps`.
+        while True:
+            raw_iter = iter(self.iterable_ds)
+            yield from self._iter_one_pass_with_prefetch(raw_iter)
+
+    def _iter_one_pass_with_prefetch(self, raw_iter):
+        sentinel = object()
+        q: Queue = Queue(maxsize=self.prefetch_buffers)
+        stop = threading.Event()
+        error: list[BaseException] = []
+
+        def producer():
+            try:
+                carry_items: list[dict[str, Any]] = []
+                carry_lengths: list[int] = []
+                while not stop.is_set():
+                    examples = self._take_raw_batch(raw_iter, self.buffer_size)
+                    if examples is None:
+                        break
+
+                    if self.carryover_packs > 0:
+                        items, lengths = self.packer.encode_examples(examples)
+                        if items:
+                            pool_items = carry_items + items
+                            pool_lengths = carry_lengths + lengths
+                            packed, carry_items, carry_lengths = self.packer.pack_encoded_items(
+                                pool_items, pool_lengths, carryover_packs=self.carryover_packs
+                            )
+                        else:
+                            packed = {}
+                    else:
+                        packed = self.packer(examples)
+                    if not packed:
+                        continue
+
+                    if not self._queue_put(q, packed, stop):
+                        break
+
+                if self.carryover_packs > 0 and carry_items and not stop.is_set():
+                    packed, _, _ = self.packer.pack_encoded_items(carry_items, carry_lengths, carryover_packs=0)
+                    if packed:
+                        self._queue_put(q, packed, stop)
+
+                self._queue_put(q, sentinel, stop)
+            except BaseException as err:  # pragma: no cover
+                error.append(err)
+                self._queue_put(q, sentinel, stop)
+
+        t = threading.Thread(target=producer, daemon=True)
+        t.start()
+
+        try:
+            while True:
+                try:
+                    buf = q.get(timeout=0.5)
+                except Empty:
+                    if not t.is_alive() and q.empty():
+                        break
+                    continue
+
+                if buf is sentinel:
+                    break
+
+                yield from self._yield_packed_examples(buf)
+
+            if error:
+                raise error[0]
+        finally:
+            stop.set()
+            t.join(timeout=1.0)
 
 
 class DynamicPromptProcessor(DatasetProcessor):

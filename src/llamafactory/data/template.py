@@ -270,7 +270,7 @@ class Template:
 
     def fix_jinja_template(self, tokenizer: "PreTrainedTokenizer") -> None:
         r"""Replace the jinja template in the tokenizer."""
-        if tokenizer.chat_template is None or self.replace_jinja_template:
+        if getattr(tokenizer, "chat_template", None) is None or self.replace_jinja_template:
             try:
                 tokenizer.chat_template = self._get_jinja_template(tokenizer)
             except ValueError as e:
@@ -600,7 +600,14 @@ def parse_template(tokenizer: "PreTrainedTokenizer") -> "Template":
 def get_template_and_fix_tokenizer(tokenizer: "PreTrainedTokenizer", data_args: "DataArguments") -> "Template":
     r"""Get chat template and fixes the tokenizer."""
     if data_args.template is None:
-        if isinstance(tokenizer.chat_template, str):
+        if tokenizer.__class__.__name__ == "MistralCommonTokenizer":
+            logger.warning_rank0(
+                "`template` was not specified. "
+                "`MistralCommonTokenizer` does not support automatic template parsing; "
+                "please set `template` explicitly (e.g. `mistral`, `pixtral`, or `voxtral`)."
+            )
+            template = TEMPLATES["empty"]  # placeholder
+        elif isinstance(tokenizer.chat_template, str):
             logger.warning_rank0("`template` was not specified, try parsing the chat template from the tokenizer.")
             template = parse_template(tokenizer)
         else:
@@ -1703,6 +1710,17 @@ register_template(
     format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
     template_class=Llama2Template,
     mm_plugin=get_mm_plugin(name="pixtral", image_token="[IMG]"),
+)
+
+
+# Voxtral (mistral-common audio)
+register_template(
+    name="voxtral",
+    format_user=StringFormatter(slots=["[INST]{{content}}[/INST]"]),
+    format_system=StringFormatter(slots=["{{content}}\n\n"]),
+    format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
+    mm_plugin=get_mm_plugin(name="voxtral"),
+    template_class=Llama2Template,
 )
 
 

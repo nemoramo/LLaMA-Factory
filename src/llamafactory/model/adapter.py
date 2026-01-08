@@ -154,6 +154,7 @@ def _setup_lora_tuning(
         else:
             logger.info_rank0("Fine-tuning method: {}".format("DoRA" if finetuning_args.use_dora else "LoRA"))
 
+    model_type = getattr(config, "model_type", None)
     adapter_to_resume = None
 
     if model_args.adapter_name_or_path is not None:
@@ -211,6 +212,18 @@ def _setup_lora_tuning(
 
         logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
 
+    if (
+        is_trainable
+        and adapter_to_resume is not None
+        and model_type == "funaudiochat"
+        and finetuning_args.funaudiochat_full_audio_tuning
+    ):
+        logger.warning_rank0(
+            "`funaudiochat_full_audio_tuning` is enabled, but an existing adapter is loaded. "
+            "The adapter config fixes `modules_to_save`, so audio encoder/adapter full tuning may not take effect. "
+            "Start from scratch or set `create_new_adapter=true` to apply it."
+        )
+
     if is_trainable and adapter_to_resume is None:  # create new lora weights while training
         if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
             target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
@@ -231,6 +244,19 @@ def _setup_lora_tuning(
             target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
 
         target_modules = patch_target_modules(model, finetuning_args, target_modules)
+        if model_type == "funaudiochat" and finetuning_args.funaudiochat_full_audio_tuning:
+            audio_prefixes = ("continuous_audio_tower", "audio_tower", "audio_invert_tower")
+            filtered_modules = []
+            for module_name in target_modules:
+                if any(module_name == prefix or module_name.startswith(prefix + ".") for prefix in audio_prefixes):
+                    continue
+                filtered_modules.append(module_name)
+
+            if len(filtered_modules) != len(target_modules):
+                logger.info_rank0(
+                    "FunAudioChat: excluding audio modules from LoRA targets: {}.".format(",".join(audio_prefixes))
+                )
+            target_modules = filtered_modules
 
         if (
             finetuning_args.use_dora
@@ -247,8 +273,35 @@ def _setup_lora_tuning(
                 if module in [input_embeddings, output_embeddings]:
                     module_names.add(name.split(".")[-1])
 
-            finetuning_args.additional_target = module_names
+            finetuning_args.additional_target = list(module_names)
             logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+
+        if model_type == "funaudiochat" and finetuning_args.funaudiochat_full_audio_tuning:
+            # NOTE:
+            # - For `continuous_audio_tower`, we can wrap the whole module.
+            # - For `audio_tower`, we must NOT wrap the whole module since FunAudioChat calls
+            #   attributes/methods on it (e.g. `.group_size`, `._get_feat_extract_output_lengths`).
+            #   Instead, wrap the trainable submodules to keep `audio_tower` interface intact.
+            extra_targets = [
+                "continuous_audio_tower",
+                "audio_tower.embed_tokens",
+                "audio_tower.output_matching",
+                "audio_tower.continual_output_matching",
+            ]
+            if finetuning_args.additional_target is None:
+                finetuning_args.additional_target = extra_targets
+            else:
+                if isinstance(finetuning_args.additional_target, set):
+                    finetuning_args.additional_target = list(finetuning_args.additional_target)
+                for target in extra_targets:
+                    if target not in finetuning_args.additional_target:
+                        finetuning_args.additional_target.append(target)
+
+            logger.info_rank0(
+                "FunAudioChat: full-tuning audio encoder + adapter via `additional_target`: {}.".format(
+                    ",".join(extra_targets)
+                )
+            )
 
         if finetuning_args.finetuning_type == "lora":
             peft_kwargs = {

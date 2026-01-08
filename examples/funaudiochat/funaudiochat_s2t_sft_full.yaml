@@ -19,6 +19,10 @@ preprocessing_num_workers: 8
 ### audio
 audio_sampling_rate: 16000
 audio_padding: max_length
+audio_specaugment: true
+audio_specaugment_mask_param: 0.1      # 时间轴最大mask比例(0~1)
+audio_specaugment_num_masks: 2
+audio_specaugment_fill_value: 0.0
 
 ### output
 output_dir: saves/funaudiochat/s2t_sft_full

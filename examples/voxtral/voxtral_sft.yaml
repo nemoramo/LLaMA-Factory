@@ -1,0 +1,36 @@
+# Example: Voxtral SFT (audio -> text)
+
+### model
+model_name_or_path: mistralai/Voxtral-Mini-3B-2507
+template: voxtral
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+
+### dataset
+# Replace these with your dataset settings.
+dataset_dir: data
+dataset: your_voxtral_dataset_name
+cutoff_len: 4096
+preprocessing_num_workers: 8
+
+# Voxtral prompting:
+# - Default: official transcription request template (recommended for ASR).
+voxtral_transcription_language: en
+# - Chat mode (ShareGPT messages with <audio> placeholders):
+# voxtral_chat_template: true
+
+### output
+output_dir: saves/voxtral/voxtral_sft_lora
+overwrite_output_dir: false
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-4
+num_train_epochs: 1.0
+bf16: true
+logging_steps: 10
+save_steps: 500

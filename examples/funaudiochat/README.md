@@ -38,6 +38,73 @@ If `token` is omitted/empty, the plugin will infer the 25Hz frame count from the
 
 See `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`.
 
+## Mixed tuning: LLM LoRA + full audio encoder/adapter
+
+If you want **LoRA on the language model** but **full-parameter tuning on FunAudioChat audio encoder + adapter**:
+
+- `finetuning_type: lora`
+- `funaudiochat_full_audio_tuning: true`
+
+This makes `continuous_audio_tower` and `audio_tower` (its embedding + matching layers) trainable
+(saved as `modules_to_save` in the LoRA adapter),
+while LoRA stays on the language model.
+
+## Batch evaluation (prompt_pool + normalized WER/WERE)
+
+If your eval manifests use `prompt_pool` (e.g., `*_norm_text_promptpool_*`) and you want **language-hinted** prompts
+aligned with training, use:
+
+```bash
+conda activate llamafactory
+python scripts/eval_funaudiochat_s2t_promptpool.py \
+  --model /path/to/checkpoint-XXXXX \
+  --base-model FunAudioLLM/Fun-Audio-Chat-8B \
+  --gpus 6,7
+```
+
+Outputs (per testset + per-language combined) are written under `--out-root` (default:
+`/data2/mayufeng/llamafactory_eval/funaudiochat`) and include:
+
+- `generated_predictions.jsonl` (prompt/predict/label)
+- `normalized_wer_were_eval.json` (from `~/projects/speech_related_tools/evaluate/eval_asr_wer_cer.py`)
+- `summary.json` (paths + metrics)
+
+## Packing training (reference)
+
+For long-running experiments, we recommend launching via the watchdog script:
+`scripts/monitor_funaudiochat_s2t_training.sh`.
+
+- If training exits (OOM / disconnect / crash), it restarts automatically.
+- With `overwrite_output_dir=false`, LLaMA-Factory resumes from the latest checkpoint in `output_dir`.
+- The script saves reproducibility artifacts into `output_dir`:
+  - `training_command.txt` (the exact command line)
+  - `config_base.yaml` (a copy of the base YAML config file)
+
+### Neat packing reference command
+
+```bash
+export OUTPUT_DIR="/path/to/llamafactory_saves/funaudiochat/s2t_lora_neatpack_run"
+# Optional: initialize from an existing LoRA adapter checkpoint.
+export INIT_ADAPTER_NAME_OR_PATH="/path/to/prev_adapter/checkpoint-XXXXX"
+
+GPUS=0,1,2,3,4,5 NPROC_PER_NODE=6 \
+PACKING=true NEAT_PACKING=true \
+DYNAMIC_PROMPT_LAZY_ALIGN=true DYNAMIC_PROMPT_PACKING_BUFFER_SIZE=1024 \
+DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS=2 DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS=2 \
+PER_DEVICE_TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=4 \
+MAX_STEPS=60000 EVAL_STEPS=2000 SAVE_STEPS=2000 \
+DATALOADER_NUM_WORKERS=6 PREPROCESSING_NUM_WORKERS=32 DATALOADER_PREFETCH_FACTOR=4 \
+EVAL_MAX_NEW_TOKENS=512 \
+bash scripts/monitor_funaudiochat_s2t_training.sh
+```
+
+Notes:
+- When packing is enabled, epoch semantics may not match “full dataset passes”; prefer `MAX_STEPS` for scheduling.
+- If `output_dir` already has checkpoints, the script skips `INIT_ADAPTER_NAME_OR_PATH` and resumes from the latest checkpoint.
+- Dynamic prompt packing knobs (optional):
+  - `DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS` (`dynamic_prompt_packing_prefetch_buffers`): prefetch N *packed buffers* ahead per dataloader worker to reduce stalls at buffer boundaries (uses more CPU/RAM).
+  - `DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS` (`dynamic_prompt_packing_carryover_packs`): carry over N lowest-fill packs to the next buffer so packing can mix across buffer boundaries (better packing efficiency, slightly changes sample order). Set to `0` to disable.
+
 ## Attention implementation (recommended: `fa2`)
 
 LLaMA-Factory supports 3 attention implementations for FunAudioChat via `flash_attn`:
@@ -63,6 +130,16 @@ These numbers are from a controlled local benchmark on **NVIDIA H20 (sm90)**, **
 Notes:
 - Speed and memory will vary with audio duration distribution, cutoff length, gradient checkpointing, etc.
 - `fa2` is fastest in our tests; `sdpa` may be more memory-efficient depending on your workload.
+
+### Benchmarks (neat packing vs no packing)
+
+In a timed **25-minute** run on **2× NVIDIA H20**, we compared **neat packing** vs **no packing** for FunAudioChat S2T
+using the same training datasets and tracked **effective tokens** (non-ignored labels, excluding audio tokens):
+
+- `neat_packing=true` + dynamic prompt packing (`per_device_train_batch_size=2`): ~**1.00M** effective tokens/GPU/25min (≈**669 tok/s/GPU**)
+- `packing=false` (`per_device_train_batch_size=8`): ~**0.71M** effective tokens/GPU/25min (≈**475 tok/s/GPU**)
+
+Overall, neat packing delivered ~**1.41×** more effective tokens in the same wall-clock window (steady-state throughput in logs was ~**1.77×** higher).
 
 ### Install FlashAttention-2 (`fa2`)
 

@@ -27,6 +27,24 @@ class DataArguments:
         default=None,
         metadata={"help": "Which template to use for constructing prompts in training and inference."},
     )
+    voxtral_chat_template: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Voxtral only: use chat-style templating (ShareGPT messages) instead of the official "
+                "transcription request template. Default is False (transcription template)."
+            )
+        },
+    )
+    voxtral_transcription_language: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Voxtral only (transcription template): language code used in the `lang: xx [TRANSCRIBE]` prefix "
+                "when the dataset does not provide a per-sample language."
+            )
+        },
+    )
     dataset: Optional[str] = field(
         default=None,
         metadata={"help": "The name of dataset(s) to use for training. Use commas to separate multiple datasets."},
@@ -230,6 +248,28 @@ class DataArguments:
     dynamic_prompt_packing_shuffle: bool = field(
         default=True,
         metadata={"help": "Shuffle packed sequences inside each buffer for dynamic prompt packing."},
+    )
+
+    dynamic_prompt_packing_prefetch_buffers: int = field(
+        default=2,
+        metadata={
+            "help": (
+                "Prefetch N *packed buffers* ahead (per dataloader worker) when using dynamic prompt packing. "
+                "This helps hide stalls at buffer boundaries, but increases CPU/RAM usage. "
+                "Set to 0 to disable."
+            )
+        },
+    )
+
+    dynamic_prompt_packing_carryover_packs: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Hold back N lowest-fill packed sequences from each buffer and carry their raw segments to the next "
+                "buffer, so packing can mix across buffer boundaries. This can improve packing efficiency when "
+                "buffer_size is small, at the cost of slightly changing sample order. Set to 0 to disable."
+            )
+        },
     )
 
     def __post_init__(self):

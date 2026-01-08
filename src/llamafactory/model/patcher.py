@@ -56,6 +56,60 @@ if is_transformers_version_greater_than("4.57.0"):
 logger = logging.get_logger(__name__)
 
 
+def patch_voxtral_inplace_audio_embed() -> None:
+    """Patch Voxtral to avoid in-place autograd error when replacing audio placeholder embeddings.
+
+    Upstream Voxtral uses `inputs_embeds[audio_mask] = audio_embeds`, which fails when `inputs_embeds` is a leaf
+    tensor requiring gradients (e.g. under some PEFT/accelerate setups). We clone `inputs_embeds` before assignment.
+    """
+    try:
+        from transformers.models.voxtral.modeling_voxtral import VoxtralForConditionalGeneration
+    except Exception:  # noqa: BLE001
+        return
+
+    if getattr(VoxtralForConditionalGeneration, "_llamafactory_inplace_audio_embed_patched", False):
+        return
+
+    def _patched_forward(
+        self,
+        input_ids=None,
+        input_features=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        cache_position=None,
+        logits_to_keep=0,
+        **kwargs,
+    ):
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if input_features is not None:
+            audio_embeds = self.get_audio_embeds(input_features)
+            audio_token_mask = input_ids == self.config.audio_token_id
+            inputs_embeds = inputs_embeds.clone()
+            inputs_embeds[audio_token_mask] = audio_embeds
+
+        return self.language_model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
+        )
+
+    VoxtralForConditionalGeneration.forward = _patched_forward  # type: ignore[assignment]
+    setattr(VoxtralForConditionalGeneration, "_llamafactory_inplace_audio_embed_patched", True)
+    logger.info_rank0("Patched Voxtral in-place audio embedding replacement to be autograd-safe.")
+
+
 def patch_qwen3_omni_moe_thinker_text_sparse_moe_block():
     if is_transformers_version_greater_than("4.57.0"):
         from .model_utils.moe import Qwen3OmniMoeThinkerTextSparseMoeBlock
@@ -159,8 +213,11 @@ def patch_config(
     # deepspeed zero3 is not compatible with low_cpu_mem_usage
     init_kwargs["low_cpu_mem_usage"] = model_args.low_cpu_mem_usage and (not is_deepspeed_zero3_enabled())
 
-    # do not cast data type of the model deepspeed zero3 without qlora
-    if not (is_deepspeed_zero3_enabled() and model_args.quantization_bit is None):
+    # Pass `torch_dtype` to `from_pretrained` when a reduced precision is requested.
+    #
+    # Note: The previous behavior skipped setting `torch_dtype` under DeepSpeed ZeRO-3 (without QLoRA),
+    # which can leave the model in fp32 and significantly increase VRAM usage.
+    if model_args.compute_dtype != torch.float32:
         init_kwargs["torch_dtype"] = model_args.compute_dtype
 
         if init_kwargs["low_cpu_mem_usage"] and not is_fsdp_enabled():  # fsdp does not need device map
@@ -197,6 +254,9 @@ def patch_model(
     if getattr(model.config, "model_type", None) == "gemma3n":
         patch_gemma3n_config_vocab_size()
         patch_gemma3n_audio_token_mask()
+
+    if getattr(model.config, "model_type", None) == "voxtral":
+        patch_voxtral_inplace_audio_embed()
 
     if getattr(model.config, "model_type", None) == "funaudiochat":
         sp_gen_kwargs = getattr(model, "sp_gen_kwargs", None)

@@ -558,6 +558,9 @@ class MMPluginMixin:
                 audios,
                 sampling_rate=audio_sampling_rate,
             )["audios"]
+            min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
+            if min_samples > 0:
+                audios = [np.pad(a, (0, max(0, min_samples - a.shape[0])), mode="constant") for a in audios]
             mm_inputs.update(
                 feature_extractor(
                     audios,
@@ -1639,6 +1642,104 @@ class Qwen2AudioPlugin(BasePlugin):
 
 
 @dataclass
+class VoxtralPlugin(BasePlugin):
+    r"""Voxtral multimodal plugin.
+
+    Voxtral expects `input_features` to be stacked along the batch dimension by 30-second chunks.
+    We therefore cannot batch feature extraction across audios with padding-to-longest (it would over-pad
+    shorter audios and change the number of chunks). Instead, we extract features per audio and then
+    concatenate chunks in-order.
+    """
+
+    max_source_positions: int = 3000  # Whisper mel frames per 30s.
+    pad_to_multiple_of: int = 480000  # 30s at 16kHz.
+
+    def _validate_input(  # type: ignore[override]
+        self,
+        processor: Optional["MMProcessor"],
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+    ) -> None:
+        # Voxtral always supports audio; do not gate on `audio_token` presence.
+        if len(images) != 0 and self.image_token is None:
+            raise ValueError(
+                "This model does not support image input. Please check whether the correct `template` is used."
+            )
+        if len(videos) != 0 and self.video_token is None:
+            raise ValueError(
+                "This model does not support video input. Please check whether the correct `template` is used."
+            )
+
+        if len(audios) != 0:
+            if processor is None:
+                raise ValueError("Processor was not found, please check and update your model file.")
+            if getattr(processor, "feature_extractor", None) is None:
+                raise ValueError("Audio feature extractor was not found, please check and update your model file.")
+
+    @override
+    def get_mm_inputs(
+        self,
+        images: list["ImageInput"],
+        videos: list["VideoInput"],
+        audios: list["AudioInput"],
+        imglens: list[int],
+        vidlens: list[int],
+        audlens: list[int],
+        batch_ids: list[list[int]],
+        processor: Optional["MMProcessor"],
+    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        self._validate_input(processor, images, videos, audios)
+        if processor is None:
+            raise ValueError("Processor was not found, please check and update your model file.")
+        if len(audios) == 0:
+            return {}
+
+        feature_extractor: SequenceFeatureExtractor = getattr(processor, "feature_extractor", None)
+        if feature_extractor is None:
+            raise ValueError("Audio feature extractor was not found, please check and update your model file.")
+
+        audio_sampling_rate = int(getattr(processor, "audio_sampling_rate", 16000))
+        min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
+
+        input_features_list: list["torch.Tensor"] = []
+        for audio in audios:
+            # Normalize `file://` URIs to local paths.
+            if isinstance(audio, str) and audio.startswith("file://"):
+                audio = audio[7:]
+
+            wav, _ = self._load_single_audio(audio, float(audio_sampling_rate))
+            if min_samples > 0:
+                wav = np.pad(wav, (0, max(0, min_samples - wav.shape[0])), mode="constant")
+
+            wav_inputs = feature_extractor(
+                wav,
+                sampling_rate=audio_sampling_rate,
+                padding=True,
+                truncation=False,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_attention_mask=False,
+                return_tensors="pt",
+            )
+            feats: "torch.Tensor" = wav_inputs["input_features"]  # (1, 128, T)
+            if feats.ndim != 3:
+                raise ValueError(f"Unexpected Voxtral input_features shape: {tuple(feats.shape)}")
+
+            # Safety: pad mel frames to a multiple of `max_source_positions` before chunking.
+            if feats.shape[-1] % self.max_source_positions != 0:
+                pad_len = self.max_source_positions - (feats.shape[-1] % self.max_source_positions)
+                feats = torch.nn.functional.pad(feats, (0, pad_len))
+
+            chunked = feats[0].reshape(feats.shape[1], -1, self.max_source_positions).transpose(0, 1)
+            input_features_list.append(chunked)
+
+        if len(input_features_list) == 0:
+            return {}
+
+        return {"input_features": torch.cat(input_features_list, dim=0)}
+
+
+@dataclass
 class FunAudioChatPlugin(BasePlugin):
     r"""FunAudioChat multimodal plugin (S2T-friendly).
 
@@ -1864,6 +1965,9 @@ class FunAudioChatPlugin(BasePlugin):
             audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
             audio_padding = getattr(processor, "audio_padding", "max_length")
             wavs = self._regularize_audios(feature_audios, sampling_rate=audio_sampling_rate)["audios"]
+            min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
+            if min_samples > 0:
+                wavs = [np.pad(w, (0, max(0, min_samples - w.shape[0])), mode="constant") for w in wavs]
             wav_inputs = feature_extractor(
                 wavs,
                 sampling_rate=audio_sampling_rate,
@@ -2528,6 +2632,7 @@ PLUGINS = {
     "pixtral": PixtralPlugin,
     "funaudiochat": FunAudioChatPlugin,
     "qwen2_audio": Qwen2AudioPlugin,
+    "voxtral": VoxtralPlugin,
     "qwen2_omni": Qwen2OmniPlugin,
     "qwen2_vl": Qwen2VLPlugin,
     "qwen3_vl": Qwen3VLPlugin,

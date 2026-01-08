@@ -31,6 +31,9 @@ from .processor import (
     PretrainDatasetProcessor,
     SupervisedDatasetProcessor,
     UnsupervisedDatasetProcessor,
+    VoxtralPackedSupervisedDatasetProcessor,
+    VoxtralSupervisedDatasetProcessor,
+    VoxtralUnsupervisedDatasetProcessor,
 )
 from .processor.dynamic_prompt import (
     DynamicPromptDataset,
@@ -270,6 +273,15 @@ def _load_single_dataset(
         if dataset_attr.formatting not in ["alpaca", "sharegpt", "openai"]:
             raise ValueError(f"Lazy alignment does not support formatting: {dataset_attr.formatting}.")
 
+        # Dynamic prompt packing has its own on-the-fly dataset conversion path via `dataset_converter`,
+        # so we can skip the expensive full-dataset alignment (`dataset.map`) for large JSONLs.
+        if getattr(data_args, "dynamic_prompt_sampling", False) and data_args.packing:
+            logger.info_rank0(
+                f"Dynamic prompt packing enabled: skip alignment for dataset {dataset_attr}; "
+                "conversion will run on-the-fly during training."
+            )
+            return dataset
+
         dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
         transform = _LazyAlignTransform(dataset_converter=dataset_converter, id_key=data_args.dynamic_prompt_id_key)
         dataset = dataset.with_transform(transform, output_all_columns=False)
@@ -292,7 +304,11 @@ def _get_merged_dataset(
     if dataset_names is None:
         return None
 
-    if lazy_align and len(dataset_names) > 1:
+    if (
+        lazy_align
+        and len(dataset_names) > 1
+        and not (getattr(data_args, "dynamic_prompt_sampling", False) and data_args.packing and stage == "sft")
+    ):
         raise ValueError("Lazy alignment currently supports a single dataset.")
 
     datasets = {}
@@ -319,23 +335,29 @@ def _get_dataset_processor(
     do_generate: bool = False,
 ) -> "DatasetProcessor":
     r"""Return the corresponding dataset processor."""
+    is_voxtral = processor is not None and processor.__class__.__name__ == "VoxtralProcessor"
     if stage == "pt":
         dataset_processor_class = PretrainDatasetProcessor
     elif stage == "sft" and not do_generate:
-        if data_args.packing:
-            if data_args.neat_packing:  # hack datasets to have int32 attention mask
-                from datasets.arrow_writer import OptimizedTypedSequence, TypedSequence
+        if data_args.packing and data_args.neat_packing:  # hack datasets to have int32 attention mask
+            from datasets.arrow_writer import OptimizedTypedSequence, TypedSequence
 
-                def __init__(self, data, **kwargs):
-                    return TypedSequence.__init__(
-                        self,
-                        data,
-                        type=kwargs.pop("type", None),
-                        try_type=kwargs.pop("try_type", None),
-                        optimized_int_type=kwargs.pop("optimized_int_type", None),
-                    )
+            def __init__(self, data, **kwargs):
+                return TypedSequence.__init__(
+                    self,
+                    data,
+                    type=kwargs.pop("type", None),
+                    try_type=kwargs.pop("try_type", None),
+                    optimized_int_type=kwargs.pop("optimized_int_type", None),
+                )
 
-                OptimizedTypedSequence.__init__ = __init__
+            OptimizedTypedSequence.__init__ = __init__
+
+        if is_voxtral:
+            dataset_processor_class = (
+                VoxtralPackedSupervisedDatasetProcessor if data_args.packing else VoxtralSupervisedDatasetProcessor
+            )
+        elif data_args.packing:
             dataset_processor_class = PackedSupervisedDatasetProcessor
         else:
             dataset_processor_class = SupervisedDatasetProcessor
@@ -345,7 +367,7 @@ def _get_dataset_processor(
     elif stage == "kto":
         dataset_processor_class = FeedbackDatasetProcessor
     else:
-        dataset_processor_class = UnsupervisedDatasetProcessor
+        dataset_processor_class = VoxtralUnsupervisedDatasetProcessor if is_voxtral else UnsupervisedDatasetProcessor
 
     return dataset_processor_class(template=template, tokenizer=tokenizer, processor=processor, data_args=data_args)
 
@@ -432,7 +454,7 @@ def get_dataset(
     with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
         lazy_align_train = (
             data_args.dynamic_prompt_sampling
-            and getattr(data_args, "dynamic_prompt_lazy_align", True)
+            and (getattr(data_args, "dynamic_prompt_lazy_align", True) or bool(data_args.packing))
             and stage == "sft"
         )
         dataset = _get_merged_dataset(
@@ -556,6 +578,8 @@ def get_dataset(
 
                     buffer_size = int(getattr(data_args, "dynamic_prompt_packing_buffer_size", 20000) or 20000)
                     shuffle_packs = bool(getattr(data_args, "dynamic_prompt_packing_shuffle", True))
+                    prefetch_buffers = int(getattr(data_args, "dynamic_prompt_packing_prefetch_buffers", 0) or 0)
+                    carryover_packs = int(getattr(data_args, "dynamic_prompt_packing_carryover_packs", 0) or 0)
 
                     num_shards = int(getattr(data_args, "dynamic_prompt_packing_num_shards", 0) or 0)
                     if num_shards <= 0:
@@ -585,11 +609,36 @@ def get_dataset(
                     )
                     if not is_aligned:
                         dataset_names = data_args.dataset or []
-                        if len(dataset_names) != 1:
-                            raise ValueError(
-                                "Dynamic prompt packing with lazy alignment currently supports a single dataset."
-                            )
-                        dataset_attr = next(iter(get_dataset_list(dataset_names, data_args.dataset_dir)))
+                        if len(dataset_names) == 0:
+                            raise ValueError("Dynamic prompt packing: `dataset` is empty.")
+
+                        dataset_attrs = get_dataset_list(dataset_names, data_args.dataset_dir)
+                        dataset_attr = dataset_attrs[0]
+                        # When mixing multiple datasets, dynamic prompt packing can still run alignment on-the-fly
+                        # as long as their conversion schema is identical (same formatting + column/tag mapping).
+                        for other in dataset_attrs[1:]:
+                            if (
+                                other.formatting != dataset_attr.formatting
+                                or other.messages != dataset_attr.messages
+                                or other.system != dataset_attr.system
+                                or other.tools != dataset_attr.tools
+                                or other.images != dataset_attr.images
+                                or other.videos != dataset_attr.videos
+                                or other.audios != dataset_attr.audios
+                                or other.role_tag != dataset_attr.role_tag
+                                or other.content_tag != dataset_attr.content_tag
+                                or other.user_tag != dataset_attr.user_tag
+                                or other.assistant_tag != dataset_attr.assistant_tag
+                                or other.observation_tag != dataset_attr.observation_tag
+                                or other.function_tag != dataset_attr.function_tag
+                                or other.system_tag != dataset_attr.system_tag
+                            ):
+                                raise ValueError(
+                                    "Dynamic prompt packing with on-the-fly alignment requires all mixed datasets "
+                                    "to share the same `formatting` and column/tag mapping. "
+                                    f"Got mismatch between {dataset_attr.dataset_name} and {other.dataset_name}."
+                                )
+
                         dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
                         id_key = data_args.dynamic_prompt_id_key
                         logger.info_rank0(
@@ -610,6 +659,8 @@ def get_dataset(
                         shuffle_packs=shuffle_packs,
                         num_shards=num_shards,
                         global_shuffle=global_shuffle,
+                        prefetch_buffers=prefetch_buffers,
+                        carryover_packs=carryover_packs,
                     )
                     logger.info_rank0(
                         "Wrapped train dataset with buffered knapsack packing "
