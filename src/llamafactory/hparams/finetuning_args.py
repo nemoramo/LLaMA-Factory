@@ -502,6 +502,15 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to freeze the language model in MLLM training."},
     )
+    funaudiochat_full_audio_tuning: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether or not to fully fine-tune FunAudioChat audio encoder + adapter (continuous_audio_tower + audio_tower) "
+                "while keeping the language model in LoRA/OFT."
+            )
+        },
+    )
     compute_accuracy: bool = field(
         default=False,
         metadata={"help": "Whether or not to compute the token-level accuracy at evaluation."},

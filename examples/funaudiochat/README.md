@@ -38,6 +38,17 @@ If `token` is omitted/empty, the plugin will infer the 25Hz frame count from the
 
 See `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`.
 
+## Mixed tuning: LLM LoRA + full audio encoder/adapter
+
+If you want **LoRA on the language model** but **full-parameter tuning on FunAudioChat audio encoder + adapter**:
+
+- `finetuning_type: lora`
+- `funaudiochat_full_audio_tuning: true`
+
+This makes `continuous_audio_tower` and `audio_tower` (its embedding + matching layers) trainable
+(saved as `modules_to_save` in the LoRA adapter),
+while LoRA stays on the language model.
+
 ## Batch evaluation (prompt_pool + normalized WER/WERE)
 
 If your eval manifests use `prompt_pool` (e.g., `*_norm_text_promptpool_*`) and you want **language-hinted** prompts

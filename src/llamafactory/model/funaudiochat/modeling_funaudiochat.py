@@ -873,7 +873,10 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         if feature_lens is None:
             raise ValueError("Either `feature_attention_mask` or `audio_feature_lengths` must be provided.")
 
-        audio_feat_lengths, audio_output_lengths = self.continuous_audio_tower._get_feat_extract_output_lengths(feature_lens)
+        # When training with LoRA + `modules_to_save`, PEFT may wrap `continuous_audio_tower` with a
+        # `ModulesToSaveWrapper` (which doesn't expose tower-specific helper methods).
+        continuous_audio_tower = getattr(self.continuous_audio_tower, "original_module", self.continuous_audio_tower)
+        audio_feat_lengths, audio_output_lengths = continuous_audio_tower._get_feat_extract_output_lengths(feature_lens)
         audio_outputs = self.continuous_audio_tower(
             input_features,
             feature_lens=feature_lens,
