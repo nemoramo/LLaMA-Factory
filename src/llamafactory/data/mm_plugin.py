@@ -1656,10 +1656,10 @@ class VoxtralPlugin(BasePlugin):
 
     def _validate_input(  # type: ignore[override]
         self,
-        processor: Optional["MMProcessor"],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        processor: MMProcessor | None,
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
     ) -> None:
         # Voxtral always supports audio; do not gate on `audio_token` presence.
         if len(images) != 0 and self.image_token is None:
@@ -1680,15 +1680,15 @@ class VoxtralPlugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         if processor is None:
             raise ValueError("Processor was not found, please check and update your model file.")
@@ -1702,7 +1702,7 @@ class VoxtralPlugin(BasePlugin):
         audio_sampling_rate = int(getattr(processor, "audio_sampling_rate", 16000))
         min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
 
-        input_features_list: list["torch.Tensor"] = []
+        input_features_list: list[torch.Tensor] = []
         for audio in audios:
             # Normalize `file://` URIs to local paths.
             if isinstance(audio, str) and audio.startswith("file://"):
@@ -1721,7 +1721,7 @@ class VoxtralPlugin(BasePlugin):
                 return_attention_mask=False,
                 return_tensors="pt",
             )
-            feats: "torch.Tensor" = wav_inputs["input_features"]  # (1, 128, T)
+            feats: torch.Tensor = wav_inputs["input_features"]  # (1, 128, T)
             if feats.ndim != 3:
                 raise ValueError(f"Unexpected Voxtral input_features shape: {tuple(feats.shape)}")
 
