@@ -1,4 +1,4 @@
-"""Adjust prompt_pool weights for language-hint prompts in a JSONL dataset.
+r"""Adjust prompt_pool weights for language-hint prompts in a JSONL dataset.
 
 Many ASR datasets use `prompt_pool` entries like:
 

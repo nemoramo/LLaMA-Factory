@@ -214,12 +214,7 @@ class DataArguments:
 
     dynamic_prompt_packing_log_interval: int = field(
         default=0,
-        metadata={
-            "help": (
-                "Log dynamic prompt packing progress every N buffers. "
-                "Set to 0 to disable."
-            )
-        },
+        metadata={"help": ("Log dynamic prompt packing progress every N buffers. Set to 0 to disable.")},
     )
 
     dynamic_prompt_packing_max_samples_per_pack: int = field(

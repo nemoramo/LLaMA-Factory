@@ -64,11 +64,7 @@ def select_prompt_pool_top1(pool: list[Any]) -> Any:
         raise ValueError("prompt_pool is empty.")
 
     best_item = pool[0]
-    best_weight = (
-        _sanitize_prompt_pool_weight(best_item.get("weight", 1.0))
-        if isinstance(best_item, dict)
-        else 1.0
-    )
+    best_weight = _sanitize_prompt_pool_weight(best_item.get("weight", 1.0)) if isinstance(best_item, dict) else 1.0
 
     for item in pool[1:]:
         weight = _sanitize_prompt_pool_weight(item.get("weight", 1.0)) if isinstance(item, dict) else 1.0
