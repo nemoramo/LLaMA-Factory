@@ -17,6 +17,7 @@
 
 import json
 import os
+from contextlib import contextmanager
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -46,6 +47,44 @@ logger = logging.get_logger(__name__)
 
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
+
+    @contextmanager
+    def _temporary_funaudiochat_eval_audio_attn(
+        self, model: torch.nn.Module, implementation: str = "sdpa"
+    ) -> "Any":
+        r"""Temporarily switch FunAudioChat audio encoder attention for eval/predict.
+
+        FunAudioChat's audio encoder may run under fp32 during `generate()` (evaluation), which can
+        crash FlashAttention-2. We keep training-time attention unchanged, and only switch the audio
+        encoder to SDPA/eager during generation in eval/predict.
+        """
+        unwrapped_model = model.module if hasattr(model, "module") else model
+        config = getattr(unwrapped_model, "config", None)
+        if getattr(config, "model_type", None) != "funaudiochat":
+            yield
+            return
+
+        audio_config = getattr(config, "audio_config", None)
+        if audio_config is None:
+            yield
+            return
+
+        original_impl = getattr(audio_config, "_attn_implementation", None)
+        if original_impl not in ("flash_attention_2", "flash_attention_3"):
+            yield
+            return
+
+        setattr(audio_config, "_attn_implementation", implementation)
+        try:
+            yield
+        finally:
+            if original_impl is None:
+                try:
+                    delattr(audio_config, "_attn_implementation")
+                except AttributeError:
+                    pass
+            else:
+                setattr(audio_config, "_attn_implementation", original_impl)
 
     def __init__(
         self,
@@ -248,13 +287,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 # 2) Generation pass (remove labels to avoid loss computation during generation).
                 gen_inputs = dict(inputs)
                 gen_inputs.pop("labels", None)
-                _, generated_tokens, _ = super().prediction_step(
-                    model,
-                    gen_inputs,
-                    prediction_loss_only=False,
-                    ignore_keys=ignore_keys,
-                    **gen_kwargs,
-                )
+                with self._temporary_funaudiochat_eval_audio_attn(model):
+                    _, generated_tokens, _ = super().prediction_step(
+                        model,
+                        gen_inputs,
+                        prediction_loss_only=False,
+                        ignore_keys=ignore_keys,
+                        **gen_kwargs,
+                    )
         else:
             # Default behavior (no generation, or loss-only evaluation).
             # Keep labels when `prediction_loss_only=True` so eval_loss is available.
@@ -263,13 +303,23 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 step_inputs = _prepare_loss_inputs(step_inputs)
             if self.args.predict_with_generate and not prediction_loss_only:
                 step_inputs.pop("labels", None)
-            loss, generated_tokens, _ = super().prediction_step(
-                model,
-                step_inputs,
-                prediction_loss_only=prediction_loss_only,
-                ignore_keys=ignore_keys,
-                **gen_kwargs,
-            )
+            if self.args.predict_with_generate and not prediction_loss_only:
+                with self._temporary_funaudiochat_eval_audio_attn(model):
+                    loss, generated_tokens, _ = super().prediction_step(
+                        model,
+                        step_inputs,
+                        prediction_loss_only=prediction_loss_only,
+                        ignore_keys=ignore_keys,
+                        **gen_kwargs,
+                    )
+            else:
+                loss, generated_tokens, _ = super().prediction_step(
+                    model,
+                    step_inputs,
+                    prediction_loss_only=prediction_loss_only,
+                    ignore_keys=ignore_keys,
+                    **gen_kwargs,
+                )
 
         if generated_tokens is not None and self.args.predict_with_generate:
             # Remove prompt part in the generated tokens.

@@ -416,8 +416,21 @@ def get_train_args(args: Optional[Union[dict[str, Any], list[str]]] = None) -> _
         and training_args.ddp_find_unused_parameters is None
         and finetuning_args.finetuning_type == "lora"
     ):
-        logger.info_rank0("Set `ddp_find_unused_parameters` to False in DDP training since LoRA is enabled.")
-        training_args.ddp_find_unused_parameters = False
+        if getattr(finetuning_args, "funaudiochat_full_audio_tuning", False):
+            logger.info_rank0(
+                "Set `ddp_find_unused_parameters` to True in DDP training since FunAudioChat full audio tuning may have "
+                "unused parameters across batches."
+            )
+            training_args.ddp_find_unused_parameters = True
+            if model_args.use_reentrant_gc:
+                model_args.use_reentrant_gc = False
+                logger.warning_rank0(
+                    "Set `use_reentrant_gc` to False since DDP training with `ddp_find_unused_parameters=True` may be "
+                    "incompatible with reentrant gradient checkpointing."
+                )
+        else:
+            logger.info_rank0("Set `ddp_find_unused_parameters` to False in DDP training since LoRA is enabled.")
+            training_args.ddp_find_unused_parameters = False
 
     if finetuning_args.stage in ["rm", "ppo"] and finetuning_args.finetuning_type in ["full", "freeze"]:
         can_resume_from_checkpoint = False

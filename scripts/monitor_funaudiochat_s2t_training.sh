@@ -10,9 +10,16 @@
 
 set -euo pipefail
 
-WORK_DIR="/home/mayufeng/projects/LLaMA-Factory"
-CONFIG_FILE="examples/funaudiochat/funaudiochat_s2t_sft_full.yaml"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_WORK_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+WORK_DIR="${WORK_DIR:-${DEFAULT_WORK_DIR}}"
+CONFIG_FILE="${CONFIG_FILE:-examples/funaudiochat/funaudiochat_s2t_sft_full.yaml}"
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-llamafactory}"
+
+PYTHONPATH_OVERRIDE="${WORK_DIR}/src"
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  PYTHONPATH_OVERRIDE="${PYTHONPATH_OVERRIDE}:${PYTHONPATH}"
+fi
 
 GPUS="${GPUS:-0,1,2,3,4,5}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
@@ -35,6 +42,8 @@ DYNAMIC_PROMPT_LAZY_ALIGN="${DYNAMIC_PROMPT_LAZY_ALIGN:-true}"
 DYNAMIC_PROMPT_PACKING_BUFFER_SIZE="${DYNAMIC_PROMPT_PACKING_BUFFER_SIZE:-2000}"
 DYNAMIC_PROMPT_PACKING_LOG_INTERVAL="${DYNAMIC_PROMPT_PACKING_LOG_INTERVAL:-10}"
 DYNAMIC_PROMPT_PACKING_GLOBAL_SHUFFLE="${DYNAMIC_PROMPT_PACKING_GLOBAL_SHUFFLE:-false}"
+DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS="${DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS:-2}"
+DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS="${DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS:-0}"
 
 # Target ~60GB VRAM on H20; adjust if you see frequent OOMs.
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
@@ -58,6 +67,9 @@ LOAD_BEST_MODEL_AT_END="${LOAD_BEST_MODEL_AT_END:-false}"
 METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-eval_loss}"
 GREATER_IS_BETTER="${GREATER_IS_BETTER:-}"
 INIT_ADAPTER_NAME_OR_PATH="${INIT_ADAPTER_NAME_OR_PATH:-}"
+IGNORE_DATA_SKIP="${IGNORE_DATA_SKIP:-true}"
+CREATE_NEW_ADAPTER="${CREATE_NEW_ADAPTER:-false}"
+FUNAUDIOCHAT_FULL_AUDIO_TUNING="${FUNAUDIOCHAT_FULL_AUDIO_TUNING:-false}"
 
 MAX_RESTARTS="${MAX_RESTARTS:-999999}"
 RESTART_SLEEP_SECONDS="${RESTART_SLEEP_SECONDS:-10}"
@@ -162,12 +174,16 @@ Saved at: $(date)
 Command:
   conda run -n ${CONDA_ENV_NAME} --no-capture-output \\
     env CUDA_VISIBLE_DEVICES=${GPUS} FORCE_TORCHRUN=1 NPROC_PER_NODE=${NPROC_PER_NODE} PYTORCH_ALLOC_CONF=expandable_segments:True \\
-      PYTHONNOUSERSITE=1 DISABLE_VERSION_CHECK=1 TOKENIZERS_PARALLELISM=false \\
+      PYTHONPATH=${PYTHONPATH_OVERRIDE} PYTHONNOUSERSITE=1 DISABLE_VERSION_CHECK=1 TOKENIZERS_PARALLELISM=false \\
       llamafactory-cli train ${CONFIG_FILE} \\
         dataset=${DATASET} dataset_dir=${DATASET_DIR} dynamic_prompt_sampling=true dynamic_prompt_lazy_align=${DYNAMIC_PROMPT_LAZY_ALIGN} \\
         dynamic_prompt_packing_buffer_size=${DYNAMIC_PROMPT_PACKING_BUFFER_SIZE} dynamic_prompt_packing_log_interval=${DYNAMIC_PROMPT_PACKING_LOG_INTERVAL} \\
         dynamic_prompt_packing_global_shuffle=${DYNAMIC_PROMPT_PACKING_GLOBAL_SHUFFLE} \\
+        dynamic_prompt_packing_prefetch_buffers=${DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS} \\
+        dynamic_prompt_packing_carryover_packs=${DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS} \\
         cutoff_len=${CUTOFF_LEN} ${packing_args[*]} \\
+        ignore_data_skip=${IGNORE_DATA_SKIP} \\
+        create_new_adapter=${CREATE_NEW_ADAPTER} funaudiochat_full_audio_tuning=${FUNAUDIOCHAT_FULL_AUDIO_TUNING} \\
         eval_dataset=${EVAL_DATASET} eval_strategy=steps eval_steps=${EVAL_STEPS} per_device_eval_batch_size=${PER_DEVICE_EVAL_BATCH_SIZE} \\
         predict_with_generate=true compute_wer_cer=true eval_num_samples=${EVAL_NUM_SAMPLES} eval_loss_on_full_dataset=false \\
         do_sample=false temperature=0.0 top_p=1.0 num_beams=1 max_new_tokens=${EVAL_MAX_NEW_TOKENS} \\
@@ -191,20 +207,26 @@ EOF
     FORCE_TORCHRUN=1 \
     NPROC_PER_NODE="${NPROC_PER_NODE}" \
     PYTORCH_ALLOC_CONF=expandable_segments:True \
+    PYTHONPATH="${PYTHONPATH_OVERRIDE}" \
     PYTHONNOUSERSITE=1 \
     DISABLE_VERSION_CHECK=1 \
     TOKENIZERS_PARALLELISM=false \
     llamafactory-cli train "${CONFIG_FILE}" \
     dataset="${DATASET}" \
     dataset_dir="${DATASET_DIR}" \
-    dynamic_prompt_sampling=true \
-    dynamic_prompt_lazy_align="${DYNAMIC_PROMPT_LAZY_ALIGN}" \
-    dynamic_prompt_packing_buffer_size="${DYNAMIC_PROMPT_PACKING_BUFFER_SIZE}" \
-    dynamic_prompt_packing_log_interval="${DYNAMIC_PROMPT_PACKING_LOG_INTERVAL}" \
-    dynamic_prompt_packing_global_shuffle="${DYNAMIC_PROMPT_PACKING_GLOBAL_SHUFFLE}" \
-    cutoff_len="${CUTOFF_LEN}" \
-    "${packing_args[@]}" \
-    eval_dataset="${EVAL_DATASET}" \
+	    dynamic_prompt_sampling=true \
+	    dynamic_prompt_lazy_align="${DYNAMIC_PROMPT_LAZY_ALIGN}" \
+	    dynamic_prompt_packing_buffer_size="${DYNAMIC_PROMPT_PACKING_BUFFER_SIZE}" \
+	    dynamic_prompt_packing_log_interval="${DYNAMIC_PROMPT_PACKING_LOG_INTERVAL}" \
+	    dynamic_prompt_packing_global_shuffle="${DYNAMIC_PROMPT_PACKING_GLOBAL_SHUFFLE}" \
+	    dynamic_prompt_packing_prefetch_buffers="${DYNAMIC_PROMPT_PACKING_PREFETCH_BUFFERS}" \
+	    dynamic_prompt_packing_carryover_packs="${DYNAMIC_PROMPT_PACKING_CARRYOVER_PACKS}" \
+	    cutoff_len="${CUTOFF_LEN}" \
+	    "${packing_args[@]}" \
+	    ignore_data_skip="${IGNORE_DATA_SKIP}" \
+	    create_new_adapter="${CREATE_NEW_ADAPTER}" \
+	    funaudiochat_full_audio_tuning="${FUNAUDIOCHAT_FULL_AUDIO_TUNING}" \
+	    eval_dataset="${EVAL_DATASET}" \
     eval_strategy=steps \
     eval_steps="${EVAL_STEPS}" \
     per_device_eval_batch_size="${PER_DEVICE_EVAL_BATCH_SIZE}" \
