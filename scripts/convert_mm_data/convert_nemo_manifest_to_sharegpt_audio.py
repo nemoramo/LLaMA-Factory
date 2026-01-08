@@ -442,6 +442,8 @@ def convert_manifest(
                 ],
                 "audios": [audio_path],
             }
+            if lang:
+                sample["lang"] = lang
             if pool:
                 sample["prompt_pool"] = pool
 

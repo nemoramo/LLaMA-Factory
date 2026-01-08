@@ -27,6 +27,24 @@ class DataArguments:
         default=None,
         metadata={"help": "Which template to use for constructing prompts in training and inference."},
     )
+    voxtral_chat_template: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Voxtral only: use chat-style templating (ShareGPT messages) instead of the official "
+                "transcription request template. Default is False (transcription template)."
+            )
+        },
+    )
+    voxtral_transcription_language: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Voxtral only (transcription template): language code used in the `lang: xx [TRANSCRIBE]` prefix "
+                "when the dataset does not provide a per-sample language."
+            )
+        },
+    )
     dataset: Optional[str] = field(
         default=None,
         metadata={"help": "The name of dataset(s) to use for training. Use commas to separate multiple datasets."},

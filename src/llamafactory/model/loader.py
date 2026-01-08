@@ -94,19 +94,56 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
     Note: including inplace operation of model_args.
     """
     init_kwargs = _get_init_kwargs(model_args)
+    cfg = None
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            use_fast=model_args.use_fast_tokenizer,
-            split_special_tokens=model_args.split_special_tokens,
-            padding_side="right",
-            **init_kwargs,
-        )
+        cfg = AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+    except Exception as e:  # noqa: BLE001
+        if _maybe_register_funaudiochat_from_error(e):
+            cfg = AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+        else:
+            logger.debug(f"Failed to load config before tokenizer: {e}.")
+
+    tokenizer_extra_kwargs: dict[str, Any] = {}
+    processor_extra_kwargs: dict[str, Any] = {}
+    is_voxtral = getattr(cfg, "model_type", None) == "voxtral"
+    if is_voxtral:
+        try:
+            from mistral_common.protocol.instruct.validator import ValidationMode
+
+            tokenizer_extra_kwargs["mode"] = ValidationMode.finetuning
+            processor_extra_kwargs["mode"] = ValidationMode.finetuning
+        except Exception as e:  # noqa: BLE001
+            raise ImportError(
+                "Voxtral requires `mistral-common` to be installed. "
+                "Install it with `pip install mistral-common`."
+            ) from e
+
+    try:
+        if is_voxtral:
+            init_kwargs = {k: v for k, v in init_kwargs.items() if k != "trust_remote_code"}
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_args.model_name_or_path,
+                padding_side="right",
+                **tokenizer_extra_kwargs,
+                **init_kwargs,
+            )
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_args.model_name_or_path,
+                use_fast=model_args.use_fast_tokenizer,
+                split_special_tokens=model_args.split_special_tokens,
+                padding_side="right",
+                **tokenizer_extra_kwargs,
+                **init_kwargs,
+            )
     except ValueError:  # try another one
+        if is_voxtral:
+            raise
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             use_fast=not model_args.use_fast_tokenizer,
             padding_side="right",
+            **tokenizer_extra_kwargs,
             **init_kwargs,
         )
     except Exception as e:
@@ -115,16 +152,27 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
     patch_tokenizer(tokenizer, model_args)
 
     try:
-        processor = AutoProcessor.from_pretrained(
-            model_args.model_name_or_path,
-            use_fast=model_args.use_fast_tokenizer,
-            **init_kwargs,
-        )
+        if is_voxtral:
+            processor = AutoProcessor.from_pretrained(
+                model_args.model_name_or_path,
+                **processor_extra_kwargs,
+                **init_kwargs,
+            )
+        else:
+            processor = AutoProcessor.from_pretrained(
+                model_args.model_name_or_path,
+                use_fast=model_args.use_fast_tokenizer,
+                **processor_extra_kwargs,
+                **init_kwargs,
+            )
     except ValueError:  # try another one
         try:
+            if is_voxtral:
+                raise
             processor = AutoProcessor.from_pretrained(
                 model_args.model_name_or_path,
                 use_fast=not model_args.use_fast_tokenizer,
+                **processor_extra_kwargs,
                 **init_kwargs,
             )
         except Exception as e:  # noqa: BLE001
@@ -132,6 +180,7 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
                 processor = AutoProcessor.from_pretrained(
                     model_args.model_name_or_path,
                     use_fast=not model_args.use_fast_tokenizer,
+                    **processor_extra_kwargs,
                     **init_kwargs,
                 )
             else:
@@ -142,6 +191,7 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
                 processor = AutoProcessor.from_pretrained(
                     model_args.model_name_or_path,
                     use_fast=model_args.use_fast_tokenizer,
+                    **processor_extra_kwargs,
                     **init_kwargs,
                 )
             except Exception as err:  # noqa: BLE001

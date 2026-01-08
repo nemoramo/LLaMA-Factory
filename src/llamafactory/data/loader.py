@@ -31,6 +31,9 @@ from .processor import (
     PretrainDatasetProcessor,
     SupervisedDatasetProcessor,
     UnsupervisedDatasetProcessor,
+    VoxtralPackedSupervisedDatasetProcessor,
+    VoxtralSupervisedDatasetProcessor,
+    VoxtralUnsupervisedDatasetProcessor,
 )
 from .processor.dynamic_prompt import (
     DynamicPromptDataset,
@@ -330,23 +333,29 @@ def _get_dataset_processor(
     do_generate: bool = False,
 ) -> "DatasetProcessor":
     r"""Return the corresponding dataset processor."""
+    is_voxtral = processor is not None and processor.__class__.__name__ == "VoxtralProcessor"
     if stage == "pt":
         dataset_processor_class = PretrainDatasetProcessor
     elif stage == "sft" and not do_generate:
-        if data_args.packing:
-            if data_args.neat_packing:  # hack datasets to have int32 attention mask
-                from datasets.arrow_writer import OptimizedTypedSequence, TypedSequence
+        if data_args.packing and data_args.neat_packing:  # hack datasets to have int32 attention mask
+            from datasets.arrow_writer import OptimizedTypedSequence, TypedSequence
 
-                def __init__(self, data, **kwargs):
-                    return TypedSequence.__init__(
-                        self,
-                        data,
-                        type=kwargs.pop("type", None),
-                        try_type=kwargs.pop("try_type", None),
-                        optimized_int_type=kwargs.pop("optimized_int_type", None),
-                    )
+            def __init__(self, data, **kwargs):
+                return TypedSequence.__init__(
+                    self,
+                    data,
+                    type=kwargs.pop("type", None),
+                    try_type=kwargs.pop("try_type", None),
+                    optimized_int_type=kwargs.pop("optimized_int_type", None),
+                )
 
-                OptimizedTypedSequence.__init__ = __init__
+            OptimizedTypedSequence.__init__ = __init__
+
+        if is_voxtral:
+            dataset_processor_class = (
+                VoxtralPackedSupervisedDatasetProcessor if data_args.packing else VoxtralSupervisedDatasetProcessor
+            )
+        elif data_args.packing:
             dataset_processor_class = PackedSupervisedDatasetProcessor
         else:
             dataset_processor_class = SupervisedDatasetProcessor
@@ -356,7 +365,7 @@ def _get_dataset_processor(
     elif stage == "kto":
         dataset_processor_class = FeedbackDatasetProcessor
     else:
-        dataset_processor_class = UnsupervisedDatasetProcessor
+        dataset_processor_class = VoxtralUnsupervisedDatasetProcessor if is_voxtral else UnsupervisedDatasetProcessor
 
     return dataset_processor_class(template=template, tokenizer=tokenizer, processor=processor, data_args=data_args)
 
