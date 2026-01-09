@@ -22,6 +22,8 @@ Notes:
 - `dynamic_prompt_sampling=true` is required so prompt_pool top1 entry is appended to the system prompt
   during evaluation tokenization (aligned with training promptpool behavior).
 - This script is meant to be run inside the `llamafactory` conda env.
+
+Author: yufeng.ma
 """
 
 from __future__ import annotations

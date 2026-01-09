@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""FunAudioChat model registration.
+
+Author: yufeng.ma
+"""
+
 _REGISTERED = False
 
 

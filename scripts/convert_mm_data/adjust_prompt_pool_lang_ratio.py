@@ -14,6 +14,8 @@
 
 r"""Adjust prompt_pool weights for language-hint prompts in a JSONL dataset.
 
+Author: yufeng.ma
+
 Many ASR datasets use `prompt_pool` entries like:
 
   - "Just provide a lowercased, normalized transcription ..."

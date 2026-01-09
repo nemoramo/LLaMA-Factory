@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""FunAudioChat modeling implementation.
+
+Author: yufeng.ma
+"""
+
 import logging
 import math
 import os

@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""FunAudioChat model package.
+
+Author: yufeng.ma
+"""
+
 from .configuration_funaudiochat import FunAudioChatAudioEncoderConfig, FunAudioChatConfig
 from .modeling_funaudiochat import FunAudioChatForConditionalGeneration
 from .processing_funaudiochat import FunAudioChatProcessor

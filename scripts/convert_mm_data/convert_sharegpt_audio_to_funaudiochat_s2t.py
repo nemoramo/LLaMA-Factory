@@ -14,6 +14,8 @@
 
 r"""Convert an ASR ShareGPT JSONL into a FunAudioChat-friendly S2T JSONL.
 
+Author: yufeng.ma
+
 This script is intended for datasets like:
 
 Input (jsonl, each line):
