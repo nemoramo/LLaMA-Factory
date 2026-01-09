@@ -886,7 +886,9 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         # When training with LoRA + `modules_to_save`, PEFT may wrap `continuous_audio_tower` with a
         # `ModulesToSaveWrapper` (which doesn't expose tower-specific helper methods).
         continuous_audio_tower = getattr(self.continuous_audio_tower, "original_module", self.continuous_audio_tower)
-        audio_feat_lengths, audio_output_lengths = continuous_audio_tower._get_feat_extract_output_lengths(feature_lens)
+        audio_feat_lengths, audio_output_lengths = continuous_audio_tower._get_feat_extract_output_lengths(
+            feature_lens
+        )
         audio_outputs = self.continuous_audio_tower(
             input_features,
             feature_lens=feature_lens,
@@ -1100,7 +1102,9 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                 audio_token_mask = audio_token_mask.to(inputs_embeds.device)
                 special_audio_mask = audio_token_mask.unsqueeze(-1)
                 flat_audio_features = flat_audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask.expand_as(inputs_embeds), flat_audio_features)
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    special_audio_mask.expand_as(inputs_embeds), flat_audio_features
+                )
 
                 # 开始构建labels
                 if labels is not None:

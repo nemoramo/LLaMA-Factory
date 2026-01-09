@@ -20,9 +20,9 @@ import hashlib
 import math
 import random
 import threading
-from queue import Empty, Full, Queue
 from collections import defaultdict
 from collections.abc import Sequence
+from queue import Empty, Full, Queue
 from typing import Any
 
 import torch
@@ -886,7 +886,9 @@ class DynamicPromptPackedBatchProcessor:
             return {}, [], []
 
         if len(items) != len(lengths):
-            raise ValueError(f"Dynamic prompt packing internal error: len(items)={len(items)} != len(lengths)={len(lengths)}")
+            raise ValueError(
+                f"Dynamic prompt packing internal error: len(items)={len(items)} != len(lengths)={len(lengths)}"
+            )
 
         cutoff_len = int(self.data_args.cutoff_len)
         if cutoff_len <= 0:
@@ -1074,16 +1076,16 @@ def build_dynamic_prompt_packed_iterable_dataset(
 
     if carryover_packs > 0:
         logger.info_rank0(
-            "Dynamic prompt packing: enable cross-buffer carryover (carryover_packs={}). "
-            "This may improve packing efficiency but slightly changes sample order.".format(carryover_packs)
+            f"Dynamic prompt packing: enable cross-buffer carryover (carryover_packs={carryover_packs}). "
+            "This may improve packing efficiency but slightly changes sample order."
         )
         if prefetch_buffers <= 0:
             prefetch_buffers = 1
 
     if prefetch_buffers > 0:
         logger.info_rank0(
-            "Dynamic prompt packing: enable packed-buffer prefetch (prefetch_buffers={}). "
-            "This may reduce dataloader stalls but increases CPU/RAM usage.".format(prefetch_buffers)
+            f"Dynamic prompt packing: enable packed-buffer prefetch (prefetch_buffers={prefetch_buffers}). "
+            "This may reduce dataloader stalls but increases CPU/RAM usage."
         )
         return _DynamicPromptPackedPrefetchDataset(
             iterable_ds=iterable_ds,

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Batch ASR evaluation for FunAudioChat (S2T) using prompt_pool (language hint + normalized prompt).
+"""Batch ASR evaluation for FunAudioChat (S2T) using prompt_pool (language hint + normalized prompt).
 
 What it does:
 1) Runs LLaMA-Factory `do_predict=true predict_with_generate=true` on a fixed suite of Hausa/Swahili testsets.
@@ -21,9 +20,9 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 
 @dataclass(frozen=True)
