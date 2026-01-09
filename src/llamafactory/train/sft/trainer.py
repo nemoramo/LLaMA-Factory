@@ -59,32 +59,66 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         encoder to SDPA/eager during generation in eval/predict.
         """
         unwrapped_model = model.module if hasattr(model, "module") else model
-        config = getattr(unwrapped_model, "config", None)
-        if getattr(config, "model_type", None) != "funaudiochat":
+
+        def _iter_funaudiochat_audio_encoder_configs(m: torch.nn.Module):
+            visited: set[int] = set()
+            stack: list[Any] = [m]
+            while stack:
+                cur = stack.pop()
+                if cur is None:
+                    continue
+                cur_id = id(cur)
+                if cur_id in visited:
+                    continue
+                visited.add(cur_id)
+
+                cfg = getattr(cur, "config", None)
+                if cfg is not None:
+                    model_type = getattr(cfg, "model_type", None)
+                    if model_type == "funaudiochat" and getattr(cfg, "audio_config", None) is not None:
+                        yield getattr(cfg, "audio_config")
+                    elif model_type == "funaudiochat_audio_encoder":
+                        yield cfg
+
+                # Common wrappers (DDP/Deepspeed/PEFT) and known FunAudioChat submodules.
+                for attr in (
+                    "module",
+                    "base_model",
+                    "model",
+                    "continuous_audio_tower",
+                    "audio_tower",
+                    "audio_invert_tower",
+                ):
+                    nxt = getattr(cur, attr, None)
+                    if nxt is not None:
+                        stack.append(nxt)
+
+        patched: list[tuple[Any, Optional[str]]] = []
+        seen_cfg: set[int] = set()
+        for audio_cfg in _iter_funaudiochat_audio_encoder_configs(unwrapped_model):
+            if audio_cfg is None:
+                continue
+            cfg_id = id(audio_cfg)
+            if cfg_id in seen_cfg:
+                continue
+            seen_cfg.add(cfg_id)
+
+            original_impl = getattr(audio_cfg, "_attn_implementation", None)
+            if original_impl not in ("flash_attention_2", "flash_attention_3"):
+                continue
+
+            setattr(audio_cfg, "_attn_implementation", implementation)
+            patched.append((audio_cfg, original_impl))
+
+        if not patched:
             yield
             return
 
-        audio_config = getattr(config, "audio_config", None)
-        if audio_config is None:
-            yield
-            return
-
-        original_impl = getattr(audio_config, "_attn_implementation", None)
-        if original_impl not in ("flash_attention_2", "flash_attention_3"):
-            yield
-            return
-
-        setattr(audio_config, "_attn_implementation", implementation)
         try:
             yield
         finally:
-            if original_impl is None:
-                try:
-                    delattr(audio_config, "_attn_implementation")
-                except AttributeError:
-                    pass
-            else:
-                setattr(audio_config, "_attn_implementation", original_impl)
+            for audio_cfg, original_impl in patched:
+                setattr(audio_cfg, "_attn_implementation", original_impl)
 
     def __init__(
         self,
