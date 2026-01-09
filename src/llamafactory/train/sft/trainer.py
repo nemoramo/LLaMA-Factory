@@ -120,6 +120,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             for audio_cfg, original_impl in patched:
                 setattr(audio_cfg, "_attn_implementation", original_impl)
 
+    @contextmanager
+    def _temporary_generate_autocast(self) -> "Any":
+        r"""Enable CUDA autocast during `generate()` in eval/predict.
+
+        Transformers' `Seq2SeqTrainer.prediction_step()` calls `model.generate()` without autocast. For mixed-dtype
+        models (e.g., LoRA + fp32 trainable modules_to_save), this can crash with dtype mismatches in linear layers.
+        """
+        device_type = getattr(getattr(self, "args", None), "device", None)
+        device_type = getattr(device_type, "type", None) or "cuda"
+        use_fp16 = bool(getattr(self.args, "fp16", False))
+        use_bf16 = bool(getattr(self.args, "bf16", False))
+        if device_type == "cuda" and (use_fp16 or use_bf16):
+            dtype = torch.float16 if use_fp16 else torch.bfloat16
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                yield
+        else:
+            yield
+
     def __init__(
         self,
         finetuning_args: "FinetuningArguments",
@@ -301,13 +319,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 gen_inputs = dict(inputs)
                 gen_inputs.pop("labels", None)
                 loss = None
-                _, generated_tokens, _ = super().prediction_step(
-                    model,
-                    gen_inputs,
-                    prediction_loss_only=False,
-                    ignore_keys=ignore_keys,
-                    **gen_kwargs,
-                )
+                with self._temporary_generate_autocast(), self.compute_loss_context_manager():
+                    _, generated_tokens, _ = super().prediction_step(
+                        model,
+                        gen_inputs,
+                        prediction_loss_only=False,
+                        ignore_keys=ignore_keys,
+                        **gen_kwargs,
+                    )
             else:
                 # 1) Loss-only pass (keeps labels) to preserve `{metric_key_prefix}_loss`.
                 loss_inputs = _prepare_loss_inputs(dict(inputs))
@@ -322,13 +341,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 gen_inputs = dict(inputs)
                 gen_inputs.pop("labels", None)
                 with self._temporary_funaudiochat_eval_audio_attn(model):
-                    _, generated_tokens, _ = super().prediction_step(
-                        model,
-                        gen_inputs,
-                        prediction_loss_only=False,
-                        ignore_keys=ignore_keys,
-                        **gen_kwargs,
-                    )
+                    with self._temporary_generate_autocast(), self.compute_loss_context_manager():
+                        _, generated_tokens, _ = super().prediction_step(
+                            model,
+                            gen_inputs,
+                            prediction_loss_only=False,
+                            ignore_keys=ignore_keys,
+                            **gen_kwargs,
+                        )
         else:
             # Default behavior (no generation, or loss-only evaluation).
             # Keep labels when `prediction_loss_only=True` so eval_loss is available.
@@ -339,13 +359,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 step_inputs.pop("labels", None)
             if self.args.predict_with_generate and not prediction_loss_only:
                 with self._temporary_funaudiochat_eval_audio_attn(model):
-                    loss, generated_tokens, _ = super().prediction_step(
-                        model,
-                        step_inputs,
-                        prediction_loss_only=prediction_loss_only,
-                        ignore_keys=ignore_keys,
-                        **gen_kwargs,
-                    )
+                    with self._temporary_generate_autocast(), self.compute_loss_context_manager():
+                        loss, generated_tokens, _ = super().prediction_step(
+                            model,
+                            step_inputs,
+                            prediction_loss_only=prediction_loss_only,
+                            ignore_keys=ignore_keys,
+                            **gen_kwargs,
+                        )
             else:
                 loss, generated_tokens, _ = super().prediction_step(
                     model,
