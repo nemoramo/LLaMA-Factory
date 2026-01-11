@@ -75,7 +75,7 @@ def select_prompt_pool_top1(pool: list[Any]) -> Any:
     return best_item
 
 
-def append_suffix_to_system(system: str | None, suffix: str) -> str:
+def append_suffix_to_system(system: Optional[str], suffix: str) -> str:
     r"""Append a suffix to the system prompt with a newline separator when needed."""
     base = "" if system is None else str(system)
     suffix = "" if suffix is None else str(suffix)
