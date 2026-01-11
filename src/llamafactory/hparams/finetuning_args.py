@@ -490,6 +490,23 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether to use the DFT loss."},
     )
+    use_chunked_ce_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to use chunked cross entropy loss (torchtune-style, computes CE in token chunks "
+                "to reduce peak memory from fp32 upcasting)."
+            )
+        },
+    )
+    chunked_ce_num_chunks: int = field(
+        default=8,
+        metadata={"help": "Number of token chunks used by chunked cross entropy loss."},
+    )
+    chunked_ce_upcast_logits: bool = field(
+        default=True,
+        metadata={"help": "Whether to upcast logits to fp32 per chunk before computing cross entropy."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},

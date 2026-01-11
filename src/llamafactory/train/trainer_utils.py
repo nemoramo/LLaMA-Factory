@@ -651,6 +651,87 @@ def dft_loss_func(outputs, labels, num_items_in_batch=None):
     return loss
 
 
+def chunked_ce_loss_func(
+    outputs,
+    labels: torch.Tensor,
+    num_items_in_batch: Optional[torch.Tensor] = None,
+    ignore_index: int = IGNORE_INDEX,
+    num_output_chunks: int = 8,
+    upcast_logits: bool = True,
+    shift_labels: bool = False,
+) -> torch.Tensor:
+    r"""Chunked cross entropy loss (torchtune-style).
+
+    Computes CE on token chunks to reduce peak memory when upcasting bf16/fp16 logits to fp32.
+    """
+    logits = None
+    if isinstance(outputs, dict):
+        logits = outputs.get("logits")
+        if logits is None:
+            logits = outputs.get("text_logits")
+
+    if logits is None and hasattr(outputs, "logits"):
+        logits = getattr(outputs, "logits")
+    if logits is None and hasattr(outputs, "text_logits"):
+        logits = getattr(outputs, "text_logits")
+    if logits is None and isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+        logits = outputs[0]
+
+    if logits is None:
+        if isinstance(outputs, dict):
+            return outputs.get("loss", torch.tensor(0.0))
+        return getattr(outputs, "loss", torch.tensor(0.0))
+
+    if not torch.is_tensor(logits):
+        raise TypeError(f"Expected logits to be a torch.Tensor, got {type(logits)}.")
+
+    if shift_labels:
+        labels = torch.nn.functional.pad(labels, (0, 1), value=ignore_index)
+        labels = labels[..., 1:].contiguous()
+        logits = logits[..., :-1, :].contiguous()
+
+    if logits.dim() != 3 or labels.dim() != 2 or logits.shape[:2] != labels.shape:
+        raise ValueError(
+            f"Invalid shapes for chunked CE loss: logits={tuple(logits.shape)}, labels={tuple(labels.shape)}."
+        )
+
+    valid_tokens = labels.ne(ignore_index)
+    total_valid_tokens = valid_tokens.sum()
+    if total_valid_tokens.item() == 0:
+        return torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+
+    vocab_size = logits.size(-1)
+    logit_chunks = logits.tensor_split(num_output_chunks, dim=1)
+    label_chunks = labels.tensor_split(num_output_chunks, dim=1)
+
+    total_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+    for logit_chunk, label_chunk in zip(logit_chunks, label_chunks):
+        flat_logits = logit_chunk.reshape(-1, vocab_size)
+        if upcast_logits:
+            flat_logits = flat_logits.float()
+        flat_labels = label_chunk.reshape(-1).to(flat_logits.device)
+        total_loss = total_loss + torch.nn.functional.cross_entropy(
+            flat_logits, flat_labels, ignore_index=ignore_index, reduction="sum"
+        )
+
+    if num_items_in_batch is not None:
+        if torch.is_tensor(num_items_in_batch):
+            num_items_in_batch = num_items_in_batch.to(total_loss.device)
+        loss = total_loss / num_items_in_batch
+    else:
+        loss = total_loss / total_valid_tokens.to(total_loss.device)
+
+    speech_loss = None
+    if isinstance(outputs, dict):
+        speech_loss = outputs.get("speech_loss")
+    else:
+        speech_loss = getattr(outputs, "speech_loss", None)
+    if speech_loss is not None:
+        loss = loss + speech_loss
+
+    return loss
+
+
 def _dft_cross_entropy(
     source: torch.Tensor,
     target: torch.Tensor,

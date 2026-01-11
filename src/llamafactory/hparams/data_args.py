@@ -167,6 +167,17 @@ class DataArguments:
         },
     )
 
+    dynamic_prompt_packing: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable on-the-fly buffered packing (encode+pack) at training time (SFT only). "
+                "This uses the dynamic prompt packing pipeline (IterableDataset + buffered knapsack packing) even when "
+                "`dynamic_prompt_sampling` is disabled. Requires `packing=true` and does not support streaming."
+            )
+        },
+    )
+
     dynamic_prompt_lazy_align: bool = field(
         default=True,
         metadata={
@@ -203,8 +214,9 @@ class DataArguments:
         default=True,
         metadata={
             "help": (
-                "When using dynamic prompt packing (`dynamic_prompt_sampling` + `packing`), shuffle the map-style "
-                "dataset once (with `seed`) before converting it to an iterable dataset for buffered encode+pack."
+                "When using on-the-fly buffered packing (`dynamic_prompt_packing` or `dynamic_prompt_sampling` + `packing`), "
+                "shuffle the map-style dataset once (with `seed`) before converting it to an iterable dataset for "
+                "buffered encode+pack."
             )
         },
     )
@@ -223,7 +235,7 @@ class DataArguments:
         default=20000,
         metadata={
             "help": (
-                "Buffer size for dynamic prompt packing (`dynamic_prompt_sampling` + `packing`). "
+                "Buffer size for dynamic prompt packing (`dynamic_prompt_packing` or `dynamic_prompt_sampling` + `packing`). "
                 "The dataset encodes/tokenizes in buffered batches and packs each buffer with greedy knapsack. "
                 "Larger values improve packing efficiency but increase CPU/memory usage."
             )
@@ -312,10 +324,16 @@ class DataArguments:
         if self.streaming and self.max_samples is not None:
             raise ValueError("`max_samples` is incompatible with `streaming`.")
 
+        if self.streaming and getattr(self, "dynamic_prompt_packing", False):
+            raise ValueError("`dynamic_prompt_packing` does not support `streaming`.")
+
         if self.mask_history and self.train_on_prompt:
             raise ValueError("`mask_history` is incompatible with `train_on_prompt`.")
 
         if self.neat_packing:
+            self.packing = True
+
+        if getattr(self, "dynamic_prompt_packing", False):
             self.packing = True
 
         if self.packing:

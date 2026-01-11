@@ -18,6 +18,7 @@
 import json
 import os
 from contextlib import contextmanager
+from functools import partial
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -177,10 +178,28 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.accelerator.clip_grad_norm_ = MethodType(clip_grad_norm_old_version, self.accelerator)
             self.add_callback(BAdamCallback)
 
+        if finetuning_args.use_dft_loss and finetuning_args.use_chunked_ce_loss:
+            raise ValueError("`use_dft_loss` and `use_chunked_ce_loss` are mutually exclusive.")
+
         if finetuning_args.use_dft_loss:
             from ..trainer_utils import dft_loss_func
 
             self.compute_loss_func = dft_loss_func
+
+        if finetuning_args.use_chunked_ce_loss:
+            from ..trainer_utils import chunked_ce_loss_func
+
+            if self.label_smoother is not None:
+                logger.warning_rank0("Label smoothing will be ignored when `use_chunked_ce_loss=True`.")
+
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            shift_labels = not bool(getattr(getattr(unwrapped_model, "config", None), "is_encoder_decoder", False))
+            self.compute_loss_func = partial(
+                chunked_ce_loss_func,
+                num_output_chunks=finetuning_args.chunked_ce_num_chunks,
+                upcast_logits=finetuning_args.chunked_ce_upcast_logits,
+                shift_labels=shift_labels,
+            )
 
         # Verify FP8 status after trainer initialization (accelerator should be available)
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
@@ -219,8 +238,84 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.data_collator = original_data_collator
 
     @override
-    def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+    def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch: Optional[torch.Tensor] = None):
+        # HF Trainer pops labels when label smoothing is enabled, then calls `LabelSmoother(outputs, labels)`.
+        # This breaks models that need labels inside `forward()` to build auxiliary targets (e.g. FunAudioChat
+        # needs labels to build speech labels / speech_loss), and it also breaks any ModelOutput that doesn't
+        # expose a dict key named `logits` (FunAudioChat uses `text_logits`).
+        #
+        # We keep labels in the forward pass and compute label smoothing on the returned logits explicitly.
+        if self.label_smoother is None and self.compute_loss_func is None:
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        labels = inputs.get("labels") if "labels" in inputs else None
+        if self.model_accepts_loss_kwargs and num_items_in_batch is not None:
+            inputs = {**inputs, "num_items_in_batch": num_items_in_batch}
+
+        outputs = model(**inputs)
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is None:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            return (loss, outputs) if return_outputs else loss
+
+        if self.compute_loss_func is not None:
+            loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
+            return (loss, outputs) if return_outputs else loss
+
+        # Label smoothing for decoder-only models: shift labels by 1 token.
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        shift_labels = not bool(getattr(getattr(unwrapped_model, "config", None), "is_encoder_decoder", False))
+
+        # Locate logits for LabelSmoother. Prefer standard `logits`, fall back to `text_logits` (FunAudioChat),
+        # then to attribute `.logits`, and finally to the first tuple element for legacy tuple outputs.
+        logits = None
+        if isinstance(outputs, dict):
+            logits = outputs.get("logits")
+            if logits is None:
+                logits = outputs.get("text_logits")
+        if logits is None and hasattr(outputs, "logits"):
+            logits = getattr(outputs, "logits")
+        if logits is None and hasattr(outputs, "text_logits"):
+            logits = getattr(outputs, "text_logits")
+        if logits is None and isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+            logits = outputs[0]
+
+        if logits is None:
+            raise ValueError(
+                "Cannot locate logits for label smoothing. Expected `logits`/`text_logits` in model outputs."
+            )
+
+        loss = self.label_smoother({"logits": logits}, labels, shift_labels=shift_labels)
+
+        # FunAudioChat returns `speech_loss` separately; keep it in the total loss when label smoothing is enabled.
+        speech_loss = None
+        if isinstance(outputs, dict):
+            speech_loss = outputs.get("speech_loss")
+        else:
+            speech_loss = getattr(outputs, "speech_loss", None)
+        if speech_loss is not None:
+            loss = loss + speech_loss
+
+        if (
+            self.args.average_tokens_across_devices
+            and (self.model_accepts_loss_kwargs or self.compute_loss_func)
+            and num_items_in_batch is not None
+        ):
+            loss *= self.accelerator.num_processes
+
+        return (loss, outputs) if return_outputs else loss
 
     @override
     def prediction_step(
