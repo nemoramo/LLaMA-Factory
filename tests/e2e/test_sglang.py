@@ -41,7 +41,7 @@ MESSAGES = [
 ]
 
 
-@pytest.mark.runs_on(["cuda", "xpu", "hpu"])
+@pytest.mark.runs_on(["cuda"])
 @pytest.mark.skipif(not is_sglang_available(), reason="SGLang is not installed")
 @pytest.mark.skipif(not HAS_ACCELERATOR, reason="SGLang requires an accelerator (CUDA, XPU, HPU)")
 def test_chat():
@@ -52,7 +52,7 @@ def test_chat():
     print(response.response_text)
 
 
-@pytest.mark.runs_on(["cuda", "xpu", "hpu"])
+@pytest.mark.runs_on(["cuda"])
 @pytest.mark.skipif(not is_sglang_available(), reason="SGLang is not installed")
 @pytest.mark.skipif(not HAS_ACCELERATOR, reason="SGLang requires an accelerator (CUDA, XPU, HPU)")
 def test_stream_chat():
