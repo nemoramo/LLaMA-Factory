@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 
 @dataclass
@@ -486,6 +487,17 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to use the Muon optimizer."},
     )
+    module_lr_groups: Optional[Union[list[dict[str, Any]], str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional per-module learning rate and scheduler overrides. "
+                "Provide a YAML list of dicts (or a JSON list string). "
+                "Each item must include: `patterns` (list[str]) and `lr` (float). "
+                "Optional keys: `name`, `lr_scheduler_type`, `warmup_ratio`, `warmup_steps`, `lr_scheduler_kwargs`."
+            )
+        },
+    )
     use_dft_loss: bool = field(
         default=False,
         metadata={"help": "Whether to use the DFT loss."},
@@ -587,6 +599,77 @@ class FinetuningArguments(
         self.apollo_target: list[str] = split_arg(self.apollo_target)
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
 
+        if isinstance(self.module_lr_groups, str) and self.module_lr_groups.strip().startswith("["):
+            self.module_lr_groups = json.loads(self.module_lr_groups)
+
+        if self.module_lr_groups is not None:
+            if not isinstance(self.module_lr_groups, list):
+                raise ValueError("`module_lr_groups` must be a list of dicts (or a JSON list string).")
+
+            normalized_groups: list[dict[str, Any]] = []
+            for idx, raw_group in enumerate(self.module_lr_groups):
+                if not isinstance(raw_group, dict):
+                    raise ValueError(f"`module_lr_groups[{idx}]` must be a dict, got {type(raw_group)}.")
+
+                name = str(raw_group.get("name") or f"group{idx}")
+
+                patterns = raw_group.get("patterns", None)
+                if patterns is None:
+                    raise ValueError(f"`module_lr_groups[{idx}].patterns` is required.")
+                if isinstance(patterns, str):
+                    patterns = [item.strip() for item in patterns.split(",") if item.strip()]
+                if not isinstance(patterns, list) or not patterns or any(not isinstance(p, str) or not p for p in patterns):
+                    raise ValueError(f"`module_lr_groups[{idx}].patterns` must be a non-empty list of strings.")
+
+                lr = raw_group.get("lr", None)
+                if lr is None:
+                    raise ValueError(f"`module_lr_groups[{idx}].lr` is required.")
+                lr = float(lr)
+                if lr <= 0:
+                    raise ValueError(f"`module_lr_groups[{idx}].lr` must be > 0, got {lr}.")
+
+                lr_scheduler_type = raw_group.get("lr_scheduler_type", None)
+                if lr_scheduler_type is not None:
+                    lr_scheduler_type = str(lr_scheduler_type)
+
+                warmup_ratio = raw_group.get("warmup_ratio", None)
+                if warmup_ratio is not None:
+                    warmup_ratio = float(warmup_ratio)
+                    if warmup_ratio < 0 or warmup_ratio > 1:
+                        raise ValueError(
+                            f"`module_lr_groups[{idx}].warmup_ratio` must be in [0, 1], got {warmup_ratio}."
+                        )
+
+                warmup_steps = raw_group.get("warmup_steps", None)
+                if warmup_steps is not None:
+                    warmup_steps = int(warmup_steps)
+                    if warmup_steps < 0:
+                        raise ValueError(f"`module_lr_groups[{idx}].warmup_steps` must be >= 0, got {warmup_steps}.")
+
+                lr_scheduler_kwargs = raw_group.get("lr_scheduler_kwargs", None)
+                if isinstance(lr_scheduler_kwargs, str) and lr_scheduler_kwargs.strip().startswith("{"):
+                    lr_scheduler_kwargs = json.loads(lr_scheduler_kwargs)
+                if lr_scheduler_kwargs is not None and not isinstance(lr_scheduler_kwargs, dict):
+                    raise ValueError(
+                        f"`module_lr_groups[{idx}].lr_scheduler_kwargs` must be a dict (or JSON dict string)."
+                    )
+
+                normalized_groups.append(
+                    {
+                        "name": name,
+                        "patterns": patterns,
+                        "lr": lr,
+                        "lr_scheduler_type": lr_scheduler_type,
+                        "warmup_ratio": warmup_ratio,
+                        "warmup_steps": warmup_steps,
+                        "lr_scheduler_kwargs": lr_scheduler_kwargs,
+                    }
+                )
+
+            self.module_lr_groups = normalized_groups
+            if len(self.module_lr_groups) == 0:
+                raise ValueError("`module_lr_groups` must contain at least one group.")
+
         assert self.finetuning_type in ["lora", "oft", "freeze", "full"], "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
@@ -611,6 +694,18 @@ class FinetuningArguments(
 
         if int(self.use_galore) + int(self.use_apollo) + (self.use_badam) > 1:
             raise ValueError("Cannot use GaLore, APOLLO or BAdam together.")
+
+        if self.module_lr_groups is not None and (
+            self.use_galore
+            or self.use_apollo
+            or self.use_badam
+            or self.loraplus_lr_ratio is not None
+            or self.use_adam_mini
+            or self.use_muon
+        ):
+            raise ValueError(
+                "`module_lr_groups` cannot be combined with GaLore/APOLLO/BAdam/LoRA+/Adam-mini/Muon optimizers."
+            )
 
         if self.pissa_init and (self.stage in ["ppo", "kto"] or self.use_ref_model):
             raise ValueError("Cannot use PiSSA for current training stage.")

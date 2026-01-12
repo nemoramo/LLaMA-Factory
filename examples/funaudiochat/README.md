@@ -49,6 +49,38 @@ This makes `continuous_audio_tower` and `audio_tower` (its embedding + matching 
 (saved as `modules_to_save` in the LoRA adapter),
 while LoRA stays on the language model.
 
+## Per-module LR & scheduler (module_lr_groups)
+
+If you want to use **different learning rates and/or LR schedulers for different modules**
+(e.g., a smaller LR for `continuous_audio_tower` and a larger LR for LoRA on `language_model`), set:
+
+```yaml
+# Global defaults (used for unmatched trainable parameters).
+learning_rate: 3.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.02
+
+module_lr_groups:
+  - name: audio
+    patterns: ["continuous_audio_tower"]
+    lr: 1.0e-5
+    lr_scheduler_type: constant_with_warmup
+  - name: projector
+    patterns:
+      - continuous_audio_tower.proj
+      - audio_tower.embed_tokens
+      - audio_tower.output_matching
+      - audio_tower.continual_output_matching
+    lr: 3.0e-5
+  - name: llm
+    patterns: ["language_model"]
+    lr: 3.0e-5
+```
+
+Notes:
+- Pattern matching is **prefix-based** on `model.named_parameters()` (with PEFT prefixes like `base_model.model.` stripped), and the **longest matching prefix wins**.
+- `module_lr_groups` is incompatible with GaLore/APOLLO/BAdam/LoRA+/Adam-mini/Muon optimizers.
+
 ## Batch evaluation (prompt_pool + normalized WER/WERE)
 
 If your eval manifests use `prompt_pool` (e.g., `*_norm_text_promptpool_*`) and you want **language-hinted** prompts

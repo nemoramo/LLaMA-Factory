@@ -195,6 +195,115 @@ def _get_decay_parameter_names(model: "PreTrainedModel") -> list[str]:
     return decay_parameters
 
 
+def _normalize_module_lr_param_name(name: str) -> str:
+    # PEFT wraps the base model and prefixes parameter names.
+    for prefix in ("base_model.model.", "base_model."):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    return name
+
+
+def _match_module_lr_group_idx(param_name: str, module_lr_groups: list[dict[str, Any]]) -> Optional[int]:
+    best_group_idx: Optional[int] = None
+    best_pattern_len = -1
+    for group_idx, group in enumerate(module_lr_groups):
+        for pattern in group["patterns"]:
+            if param_name.startswith(pattern) and len(pattern) > best_pattern_len:
+                best_group_idx = group_idx
+                best_pattern_len = len(pattern)
+    return best_group_idx
+
+
+def _create_module_lr_optimizer(
+    model: "PreTrainedModel",
+    training_args: "TrainingArguments",
+    finetuning_args: "FinetuningArguments",
+) -> "torch.optim.Optimizer":
+    if finetuning_args.module_lr_groups is None:
+        raise ValueError("Unexpected: `module_lr_groups` is None.")
+
+    decay_param_names = set(_get_decay_parameter_names(model))
+    module_lr_groups: list[dict[str, Any]] = finetuning_args.module_lr_groups
+
+    buckets: dict[tuple[Optional[int], bool], list[torch.nn.Parameter]] = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        normalized_name = _normalize_module_lr_param_name(name)
+        group_idx = _match_module_lr_group_idx(normalized_name, module_lr_groups)
+        is_decay = name in decay_param_names
+        buckets.setdefault((group_idx, is_decay), []).append(param)
+
+    optim_class, optim_kwargs = Trainer.get_optimizer_cls_and_kwargs(training_args)
+
+    schedule_cfgs_per_param_group: list[dict[str, Any]] = []
+    param_groups: list[dict[str, Any]] = []
+
+    def add_param_group(params: list[torch.nn.Parameter], lr: float, weight_decay: float, schedule_cfg: dict[str, Any]):
+        if not params:
+            return
+        param_groups.append({"params": params, "lr": lr, "weight_decay": weight_decay})
+        schedule_cfgs_per_param_group.append(schedule_cfg)
+
+    def pack_schedule_cfg(group: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "name": group.get("name"),
+            "lr_scheduler_type": group.get("lr_scheduler_type"),
+            "warmup_ratio": group.get("warmup_ratio"),
+            "warmup_steps": group.get("warmup_steps"),
+            "lr_scheduler_kwargs": group.get("lr_scheduler_kwargs"),
+        }
+
+    for group_idx, group in enumerate(module_lr_groups):
+        lr = float(group["lr"])
+        schedule_cfg = pack_schedule_cfg(group)
+        add_param_group(buckets.get((group_idx, False), []), lr=lr, weight_decay=0.0, schedule_cfg=schedule_cfg)
+        add_param_group(
+            buckets.get((group_idx, True), []), lr=lr, weight_decay=training_args.weight_decay, schedule_cfg=schedule_cfg
+        )
+
+    default_schedule_cfg = {
+        "name": "default",
+        "lr_scheduler_type": None,
+        "warmup_ratio": None,
+        "warmup_steps": None,
+        "lr_scheduler_kwargs": None,
+    }
+    add_param_group(
+        buckets.get((None, False), []),
+        lr=training_args.learning_rate,
+        weight_decay=0.0,
+        schedule_cfg=default_schedule_cfg,
+    )
+    add_param_group(
+        buckets.get((None, True), []),
+        lr=training_args.learning_rate,
+        weight_decay=training_args.weight_decay,
+        schedule_cfg=default_schedule_cfg,
+    )
+
+    if not param_groups:
+        raise ValueError("No trainable parameters found for `module_lr_groups` optimizer.")
+
+    optimizer = optim_class(param_groups, **optim_kwargs)
+    setattr(optimizer, "_llamafactory_module_lr_schedules", schedule_cfgs_per_param_group)
+
+    group_summaries = []
+    for group_idx, group in enumerate(module_lr_groups):
+        num_params = len(buckets.get((group_idx, False), [])) + len(buckets.get((group_idx, True), []))
+        group_summaries.append(f"{group.get('name', f'group{group_idx}')}={num_params}")
+        if num_params == 0:
+            logger.warning_rank0(f"module_lr_groups[{group_idx}] matched no trainable parameters: {group}.")
+    default_num_params = len(buckets.get((None, False), [])) + len(buckets.get((None, True), []))
+    group_summaries.append(f"default={default_num_params}")
+    logger.info_rank0(
+        "Using module_lr_groups optimizer with %d param groups (%s).", len(optimizer.param_groups), ", ".join(group_summaries)
+    )
+
+    return optimizer
+
+
 def _create_galore_optimizer(
     model: "PreTrainedModel",
     training_args: "TrainingArguments",
@@ -527,6 +636,9 @@ def create_custom_optimizer(
     training_args: "TrainingArguments",
     finetuning_args: "FinetuningArguments",
 ) -> Optional["torch.optim.Optimizer"]:
+    if finetuning_args.module_lr_groups is not None:
+        return _create_module_lr_optimizer(model, training_args, finetuning_args)
+
     if finetuning_args.use_galore:
         return _create_galore_optimizer(model, training_args, finetuning_args)
 
@@ -550,7 +662,7 @@ def create_custom_scheduler(
     training_args: "TrainingArguments",
     num_training_steps: int,
     optimizer: Optional["torch.optim.Optimizer"] = None,
-) -> None:
+) -> Optional["torch.optim.lr_scheduler.LRScheduler"]:
     if training_args.lr_scheduler_type == "warmup_stable_decay":
         num_warmup_steps = training_args.get_warmup_steps(num_training_steps)
         remaining_steps = num_training_steps - num_warmup_steps
@@ -585,6 +697,83 @@ def create_custom_scheduler(
 
         for param in optimizer_dict.keys():
             param.register_post_accumulate_grad_hook(scheduler_hook)
+
+    if (
+        optimizer is not None
+        and not isinstance(optimizer, DummyOptimizer)
+        and getattr(optimizer, "_llamafactory_module_lr_schedules", None) is not None
+    ):
+        schedule_cfgs: list[dict[str, Any]] = getattr(optimizer, "_llamafactory_module_lr_schedules")
+        if len(schedule_cfgs) != len(optimizer.param_groups):
+            raise ValueError(
+                "Invalid module LR scheduler state: schedule configs do not match optimizer param group count."
+            )
+
+        def get_warmup_steps(schedule_cfg: dict[str, Any]) -> int:
+            if schedule_cfg.get("warmup_steps") is not None:
+                return int(schedule_cfg["warmup_steps"])
+            if schedule_cfg.get("warmup_ratio") is not None:
+                return int(float(schedule_cfg["warmup_ratio"]) * num_training_steps)
+            return training_args.get_warmup_steps(num_training_steps)
+
+        def get_scheduler_specific_kwargs(
+            scheduler_type: str, warmup_steps: int, schedule_cfg: dict[str, Any]
+        ) -> Optional[dict[str, Any]]:
+            merged_kwargs: dict[str, Any] = {}
+            if training_args.lr_scheduler_kwargs is not None:
+                merged_kwargs.update(training_args.lr_scheduler_kwargs)
+            if schedule_cfg.get("lr_scheduler_kwargs") is not None:
+                merged_kwargs.update(schedule_cfg["lr_scheduler_kwargs"])
+
+            if scheduler_type != "warmup_stable_decay":
+                return merged_kwargs or None
+
+            remaining_steps = num_training_steps - warmup_steps
+            num_stable_steps = remaining_steps // 3
+            num_decay_steps = remaining_steps - num_stable_steps
+            merged_kwargs.setdefault("num_stable_steps", num_stable_steps)
+            merged_kwargs.setdefault("num_decay_steps", num_decay_steps)
+            return merged_kwargs
+
+        lr_lambda_cache: dict[str, Callable[[int], float]] = {}
+        lr_lambdas: list[Callable[[int], float]] = []
+        for schedule_cfg in schedule_cfgs:
+            scheduler_type = schedule_cfg.get("lr_scheduler_type") or training_args.lr_scheduler_type
+            warmup_steps = get_warmup_steps(schedule_cfg)
+            scheduler_specific_kwargs = get_scheduler_specific_kwargs(scheduler_type, warmup_steps, schedule_cfg)
+            cache_key = json.dumps(
+                {
+                    "scheduler_type": scheduler_type,
+                    "warmup_steps": warmup_steps,
+                    "num_training_steps": num_training_steps,
+                    "scheduler_specific_kwargs": scheduler_specific_kwargs,
+                },
+                sort_keys=True,
+                default=str,
+            )
+            if cache_key not in lr_lambda_cache:
+                dummy_param = torch.nn.Parameter(torch.zeros(1))
+                dummy_optimizer = torch.optim.SGD([dummy_param], lr=1.0)
+                tmp_scheduler = get_scheduler(
+                    scheduler_type,
+                    optimizer=dummy_optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=num_training_steps,
+                    scheduler_specific_kwargs=scheduler_specific_kwargs,
+                )
+                if not hasattr(tmp_scheduler, "lr_lambdas"):
+                    raise NotImplementedError(
+                        f"`module_lr_groups` only supports LambdaLR-based schedulers, got {type(tmp_scheduler)} "
+                        f"for lr_scheduler_type={scheduler_type}."
+                    )
+                lr_lambda_cache[cache_key] = tmp_scheduler.lr_lambdas[0]
+
+            lr_lambdas.append(lr_lambda_cache[cache_key])
+
+        logger.info_rank0("Using module_lr_groups scheduler with %d param groups.", len(lr_lambdas))
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambdas)
+
+    return None
 
 
 def get_batch_logps(

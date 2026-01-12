@@ -78,8 +78,12 @@ class CustomTrainer(Trainer):
     def create_scheduler(
         self, num_training_steps: int, optimizer: Optional["torch.optim.Optimizer"] = None
     ) -> "torch.optim.lr_scheduler.LRScheduler":
-        create_custom_scheduler(self.args, num_training_steps, optimizer)
-        return super().create_scheduler(num_training_steps, optimizer)
+        effective_optimizer = optimizer or self.optimizer
+        custom_scheduler = create_custom_scheduler(self.args, num_training_steps, effective_optimizer)
+        if custom_scheduler is not None:
+            self.lr_scheduler = custom_scheduler
+            return custom_scheduler
+        return super().create_scheduler(num_training_steps, effective_optimizer)
 
     @override
     def _get_train_sampler(self, *args, **kwargs) -> Optional["torch.utils.data.Sampler"]:
