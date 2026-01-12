@@ -243,7 +243,9 @@ def _create_module_lr_optimizer(
     schedule_cfgs_per_param_group: list[dict[str, Any]] = []
     param_groups: list[dict[str, Any]] = []
 
-    def add_param_group(params: list[torch.nn.Parameter], lr: float, weight_decay: float, schedule_cfg: dict[str, Any]):
+    def add_param_group(
+        params: list[torch.nn.Parameter], lr: float, weight_decay: float, schedule_cfg: dict[str, Any]
+    ):
         if not params:
             return
         param_groups.append({"params": params, "lr": lr, "weight_decay": weight_decay})
@@ -263,7 +265,10 @@ def _create_module_lr_optimizer(
         schedule_cfg = pack_schedule_cfg(group)
         add_param_group(buckets.get((group_idx, False), []), lr=lr, weight_decay=0.0, schedule_cfg=schedule_cfg)
         add_param_group(
-            buckets.get((group_idx, True), []), lr=lr, weight_decay=training_args.weight_decay, schedule_cfg=schedule_cfg
+            buckets.get((group_idx, True), []),
+            lr=lr,
+            weight_decay=training_args.weight_decay,
+            schedule_cfg=schedule_cfg,
         )
 
     default_schedule_cfg = {
@@ -301,7 +306,9 @@ def _create_module_lr_optimizer(
     default_num_params = len(buckets.get((None, False), [])) + len(buckets.get((None, True), []))
     group_summaries.append(f"default={default_num_params}")
     logger.info_rank0(
-        "Using module_lr_groups optimizer with %d param groups (%s).", len(optimizer.param_groups), ", ".join(group_summaries)
+        "Using module_lr_groups optimizer with %d param groups (%s).",
+        len(optimizer.param_groups),
+        ", ".join(group_summaries),
     )
 
     return optimizer

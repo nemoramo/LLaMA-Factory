@@ -275,7 +275,9 @@ def _load_single_dataset(
 
         # Dynamic prompt packing has its own on-the-fly dataset conversion path via `dataset_converter`,
         # so we can skip the expensive full-dataset alignment (`dataset.map`) for large JSONLs.
-        if (getattr(data_args, "dynamic_prompt_sampling", False) or getattr(data_args, "dynamic_prompt_packing", False)) and data_args.packing:
+        if (
+            getattr(data_args, "dynamic_prompt_sampling", False) or getattr(data_args, "dynamic_prompt_packing", False)
+        ) and data_args.packing:
             logger.info_rank0(
                 f"Dynamic prompt packing enabled: skip alignment for dataset {dataset_attr}; "
                 "conversion will run on-the-fly during training."
@@ -308,7 +310,10 @@ def _get_merged_dataset(
         lazy_align
         and len(dataset_names) > 1
         and not (
-            (getattr(data_args, "dynamic_prompt_sampling", False) or getattr(data_args, "dynamic_prompt_packing", False))
+            (
+                getattr(data_args, "dynamic_prompt_sampling", False)
+                or getattr(data_args, "dynamic_prompt_packing", False)
+            )
             and data_args.packing
             and stage == "sft"
         )
@@ -650,8 +655,7 @@ def get_dataset(
                         carryover_packs=carryover_packs,
                     )
                     logger.info_rank0(
-                        "Wrapped train dataset with buffered knapsack packing "
-                        "(on-the-fly encode + on-the-fly pack)."
+                        "Wrapped train dataset with buffered knapsack packing (on-the-fly encode + on-the-fly pack)."
                     )
 
                     logger.info_rank0(

@@ -626,7 +626,11 @@ class FinetuningArguments(
                     raise ValueError(f"`module_lr_groups[{idx}].patterns` is required.")
                 if isinstance(patterns, str):
                     patterns = [item.strip() for item in patterns.split(",") if item.strip()]
-                if not isinstance(patterns, list) or not patterns or any(not isinstance(p, str) or not p for p in patterns):
+                if (
+                    not isinstance(patterns, list)
+                    or not patterns
+                    or any(not isinstance(p, str) or not p for p in patterns)
+                ):
                     raise ValueError(f"`module_lr_groups[{idx}].patterns` must be a non-empty list of strings.")
 
                 lr = raw_group.get("lr", None)

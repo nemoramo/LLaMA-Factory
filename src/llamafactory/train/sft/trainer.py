@@ -49,9 +49,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
 
     @contextmanager
-    def _temporary_funaudiochat_eval_audio_attn(
-        self, model: torch.nn.Module, implementation: str = "sdpa"
-    ) -> "Any":
+    def _temporary_funaudiochat_eval_audio_attn(self, model: torch.nn.Module, implementation: str = "sdpa") -> "Any":
         r"""Temporarily switch FunAudioChat audio encoder attention for eval/predict.
 
         FunAudioChat's audio encoder may run under fp32 during `generate()` (evaluation), which can
