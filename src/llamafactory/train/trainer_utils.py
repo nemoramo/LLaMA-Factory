@@ -222,7 +222,9 @@ def _create_module_lr_optimizer(
     if finetuning_args.module_lr_groups is None:
         raise ValueError("Unexpected: `module_lr_groups` is None.")
 
-    decay_param_names = set(_get_decay_parameter_names(model))
+    # Keep both raw and normalized decay-name sets to be robust under PEFT prefix changes.
+    raw_decay_param_names = set(_get_decay_parameter_names(model))
+    normalized_decay_param_names = {_normalize_module_lr_param_name(n) for n in raw_decay_param_names}
     module_lr_groups: list[dict[str, Any]] = finetuning_args.module_lr_groups
 
     buckets: dict[tuple[Optional[int], bool], list[torch.nn.Parameter]] = {}
@@ -232,7 +234,8 @@ def _create_module_lr_optimizer(
 
         normalized_name = _normalize_module_lr_param_name(name)
         group_idx = _match_module_lr_group_idx(normalized_name, module_lr_groups)
-        is_decay = name in decay_param_names
+        # Robust decay check: raw/normalized match is considered decay.
+        is_decay = (name in raw_decay_param_names) or (normalized_name in normalized_decay_param_names)
         buckets.setdefault((group_idx, is_decay), []).append(param)
 
     optim_class, optim_kwargs = Trainer.get_optimizer_cls_and_kwargs(training_args)
@@ -852,6 +855,8 @@ def chunked_ce_loss_func(
     r"""Chunked cross entropy loss (torchtune-style).
 
     Computes CE on token chunks to reduce peak memory when upcasting bf16/fp16 logits to fp32.
+    Also keeps any auxiliary losses returned by the model outputs (keys ending with `_loss`,
+    excluding the main `loss` key), e.g. `speech_loss`, `router_loss`, etc.
     """
     logits = None
     if isinstance(outputs, dict):
@@ -866,10 +871,20 @@ def chunked_ce_loss_func(
     if logits is None and isinstance(outputs, (tuple, list)) and len(outputs) > 0:
         logits = outputs[0]
 
+    # If logits are not available, fall back to model-provided loss if present.
     if logits is None:
+        loss = None
         if isinstance(outputs, dict):
-            return outputs.get("loss", torch.tensor(0.0))
-        return getattr(outputs, "loss", torch.tensor(0.0))
+            loss = outputs.get("loss")
+        else:
+            loss = getattr(outputs, "loss", None)
+
+        if loss is not None:
+            return loss
+
+        # Device-safe zero (avoid CPU tensor in GPU training).
+        device = labels.device if torch.is_tensor(labels) else torch.device("cpu")
+        return torch.tensor(0.0, device=device, dtype=torch.float32)
 
     if not torch.is_tensor(logits):
         raise TypeError(f"Expected logits to be a torch.Tensor, got {type(logits)}.")
@@ -887,38 +902,71 @@ def chunked_ce_loss_func(
     valid_tokens = labels.ne(ignore_index)
     total_valid_tokens = valid_tokens.sum()
     if total_valid_tokens.item() == 0:
-        return torch.tensor(0.0, device=logits.device, dtype=torch.float32)
-
-    vocab_size = logits.size(-1)
-    logit_chunks = logits.tensor_split(num_output_chunks, dim=1)
-    label_chunks = labels.tensor_split(num_output_chunks, dim=1)
-
-    total_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
-    for logit_chunk, label_chunk in zip(logit_chunks, label_chunks):
-        flat_logits = logit_chunk.reshape(-1, vocab_size)
-        if upcast_logits:
-            flat_logits = flat_logits.float()
-        flat_labels = label_chunk.reshape(-1).to(flat_logits.device)
-        total_loss = total_loss + torch.nn.functional.cross_entropy(
-            flat_logits, flat_labels, ignore_index=ignore_index, reduction="sum"
-        )
-
-    if num_items_in_batch is not None:
-        if torch.is_tensor(num_items_in_batch):
-            num_items_in_batch = num_items_in_batch.to(total_loss.device)
-        loss = total_loss / num_items_in_batch
+        base_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
     else:
-        loss = total_loss / total_valid_tokens.to(total_loss.device)
+        vocab_size = logits.size(-1)
+        num_output_chunks = max(1, int(num_output_chunks))
 
-    speech_loss = None
+        logit_chunks = logits.tensor_split(num_output_chunks, dim=1)
+        label_chunks = labels.tensor_split(num_output_chunks, dim=1)
+
+        total_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+        for logit_chunk, label_chunk in zip(logit_chunks, label_chunks):
+            # Explicitly skip empty chunks for safety across torch versions.
+            if label_chunk.numel() == 0 or logit_chunk.numel() == 0:
+                continue
+
+            flat_logits = logit_chunk.reshape(-1, vocab_size)
+            if flat_logits.numel() == 0:
+                continue
+            if upcast_logits:
+                flat_logits = flat_logits.float()
+
+            flat_labels = label_chunk.reshape(-1).to(flat_logits.device)
+            if flat_labels.numel() == 0:
+                continue
+
+            total_loss = total_loss + torch.nn.functional.cross_entropy(
+                flat_logits,
+                flat_labels,
+                ignore_index=ignore_index,
+                reduction="sum",
+            )
+
+        if num_items_in_batch is not None:
+            if torch.is_tensor(num_items_in_batch):
+                denom = torch.clamp(num_items_in_batch.to(total_loss.device), min=1)
+                base_loss = total_loss / denom
+            else:
+                denom = max(int(num_items_in_batch), 1)
+                base_loss = total_loss / denom
+        else:
+            base_loss = total_loss / total_valid_tokens.to(total_loss.device)
+
+    # Add any auxiliary losses returned by the model outputs, excluding the main `loss`.
+    aux_loss = None
     if isinstance(outputs, dict):
-        speech_loss = outputs.get("speech_loss")
-    else:
-        speech_loss = getattr(outputs, "speech_loss", None)
-    if speech_loss is not None:
-        loss = loss + speech_loss
+        for k, v in outputs.items():
+            if k == "loss":
+                continue
+            if not k.endswith("_loss"):
+                continue
+            if v is None or not torch.is_tensor(v):
+                continue
 
-    return loss
+            v_t = v.mean() if v.dim() > 0 else v
+            v_t = v_t.to(base_loss.device)
+            aux_loss = v_t if aux_loss is None else (aux_loss + v_t)
+    else:
+        # Best-effort fallback for non-dict outputs
+        v = getattr(outputs, "speech_loss", None)
+        if v is not None and torch.is_tensor(v):
+            aux_loss = v.mean() if v.dim() > 0 else v
+
+    if aux_loss is not None:
+        base_loss = base_loss + aux_loss
+
+    return base_loss
 
 
 def _dft_cross_entropy(

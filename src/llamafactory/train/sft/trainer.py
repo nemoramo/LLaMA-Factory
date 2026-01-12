@@ -303,14 +303,28 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         loss = self.label_smoother({"logits": logits}, labels, shift_labels=shift_labels)
 
-        # FunAudioChat returns `speech_loss` separately; keep it in the total loss when label smoothing is enabled.
-        speech_loss = None
+        # Add any auxiliary losses returned by the model outputs, excluding the main `loss`.
+        aux_loss = None
         if isinstance(outputs, dict):
-            speech_loss = outputs.get("speech_loss")
+            for k, v in outputs.items():
+                if k == "loss":
+                    continue
+                if not k.endswith("_loss"):
+                    continue
+                if v is None or not torch.is_tensor(v):
+                    continue
+
+                v_t = v.mean() if v.dim() > 0 else v
+                v_t = v_t.to(loss.device)
+                aux_loss = v_t if aux_loss is None else (aux_loss + v_t)
         else:
-            speech_loss = getattr(outputs, "speech_loss", None)
-        if speech_loss is not None:
-            loss = loss + speech_loss
+            # Best-effort fallback for non-dict outputs
+            v = getattr(outputs, "speech_loss", None)
+            if v is not None and torch.is_tensor(v):
+                aux_loss = v.mean() if v.dim() > 0 else v
+
+        if aux_loss is not None:
+            loss = loss + aux_loss
 
         if (
             self.args.average_tokens_across_devices
