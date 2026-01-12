@@ -220,7 +220,33 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
+        self._update_effective_tokens_seen(model, inputs)
         return super().compute_loss(model, inputs, *args, **kwargs)
+
+    def _update_effective_tokens_seen(self, model, inputs) -> None:
+        if not getattr(model, "training", False):
+            return
+
+        labels = inputs.get("labels")
+        if not torch.is_tensor(labels):
+            return
+
+        ignore_index = getattr(getattr(model, "config", None), "ignore_index", IGNORE_INDEX)
+        effective_mask = labels.ne(int(ignore_index))
+
+        audio_token_index = getattr(getattr(model, "config", None), "audio_token_index", None)
+        if audio_token_index is not None:
+            try:
+                effective_mask = effective_mask & labels.ne(int(audio_token_index))
+            except Exception:
+                pass
+
+        effective_tokens = effective_mask.sum()
+        effective_tokens = effective_tokens.to(device=self.args.device, dtype=torch.int64).detach()
+        effective_tokens = self.accelerator.gather(effective_tokens).sum()
+
+        prev = int(getattr(self.state, "num_effective_tokens_seen", 0) or 0)
+        setattr(self.state, "num_effective_tokens_seen", prev + int(effective_tokens.item()))
 
     @override
     def prediction_step(
@@ -297,7 +323,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             merged["labels"] = torch.cat([prompt_ignore, tgt_labels], dim=1)
 
             # If a standard 2D position_ids is present, rebuild it for the merged sequence.
-            if "position_ids" in merged and torch.is_tensor(merged["position_ids"]) and merged["position_ids"].dim() == 2:
+            if (
+                "position_ids" in merged
+                and torch.is_tensor(merged["position_ids"])
+                and merged["position_ids"].dim() == 2
+            ):
                 pos = torch.cumsum(merged["attention_mask"].long(), dim=1) - 1
                 merged["position_ids"] = pos.masked_fill(merged["attention_mask"] == 0, 0)
 
@@ -397,7 +427,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             merged = dict(self._default_gen_kwargs)
             merged.update(gen_kwargs)
             gen_kwargs = merged
-
         has_processing_class = hasattr(self, "processing_class")
         original_padding_side = self.processing_class.padding_side if has_processing_class else None
 

@@ -38,8 +38,8 @@ from .model_utils.visual import (
     autocast_projector_dtype,
     cast_gemma3n_audio_outputs,
     configure_visual_model,
-    patch_gemma3n_config_vocab_size,
     patch_gemma3n_audio_token_mask,
+    patch_gemma3n_config_vocab_size,
 )
 
 

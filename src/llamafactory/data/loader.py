@@ -316,7 +316,9 @@ def _get_merged_dataset(
         if (stage == "rm" and dataset_attr.ranking is False) or (stage != "rm" and dataset_attr.ranking is True):
             raise ValueError("The dataset is not applicable in the current training stage.")
 
-        datasets[dataset_name] = _load_single_dataset(dataset_attr, model_args, data_args, training_args, lazy_align=lazy_align)
+        datasets[dataset_name] = _load_single_dataset(
+            dataset_attr, model_args, data_args, training_args, lazy_align=lazy_align
+        )
 
     if return_dict:
         return datasets
@@ -384,11 +386,7 @@ def _get_preprocessed_dataset(
     if dataset is None:
         return None
 
-    if (
-        data_args.dynamic_prompt_sampling
-        and stage == "sft"
-        and not is_eval
-    ):
+    if data_args.dynamic_prompt_sampling and stage == "sft" and not is_eval:
         if data_args.streaming:
             raise ValueError("Dynamic prompt sampling does not support streaming datasets.")
         logger.info_rank0("Dynamic prompt sampling enabled: skip tokenization for training dataset.")
@@ -459,7 +457,9 @@ def get_dataset(
             and (getattr(data_args, "dynamic_prompt_lazy_align", True) or bool(data_args.packing))
             and stage == "sft"
         )
-        dataset = _get_merged_dataset(data_args.dataset, model_args, data_args, training_args, stage, lazy_align=lazy_align_train)
+        dataset = _get_merged_dataset(
+            data_args.dataset, model_args, data_args, training_args, stage, lazy_align=lazy_align_train
+        )
         eval_dataset = _get_merged_dataset(
             data_args.eval_dataset,
             model_args,
@@ -489,11 +489,7 @@ def get_dataset(
         # In dynamic prompt sampling mode, train_dataset stays aligned/raw.
         # If validation split is derived from train_dataset (val_size),
         # it must be tokenized explicitly for evaluation.
-        if (
-            data_args.dynamic_prompt_sampling
-            and stage == "sft"
-            and not data_args.streaming
-        ):
+        if data_args.dynamic_prompt_sampling and stage == "sft" and not data_args.streaming:
             # Be robust to different split names returned by split_dataset().
             val_key = None
             for k in ("validation", "eval", "dev", "test"):
@@ -521,22 +517,22 @@ def get_dataset(
                         processor=processor,
                         is_eval=True,
                     )
-        if data_args.tokenized_path is not None and not data_args.dynamic_prompt_sampling:  # save tokenized dataset to disk
+        if (
+            data_args.tokenized_path is not None and not data_args.dynamic_prompt_sampling
+        ):  # save tokenized dataset to disk
             if training_args.should_save:
                 dataset_dict.save_to_disk(data_args.tokenized_path)
                 logger.info_rank0(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
                 logger.info_rank0(f"Please launch the training with `tokenized_path: {data_args.tokenized_path}`.")
 
         dataset_module = get_dataset_module(dataset_dict)
-        if (
-            data_args.dynamic_prompt_sampling
-            and stage == "sft"
-            and not data_args.streaming
-        ):
+        if data_args.dynamic_prompt_sampling and stage == "sft" and not data_args.streaming:
             train_ds = dataset_module.get("train_dataset")
             if train_ds is not None:
                 if data_args.packing:
-                    max_samples_per_pack = int(getattr(data_args, "dynamic_prompt_packing_max_samples_per_pack", 8) or 8)
+                    max_samples_per_pack = int(
+                        getattr(data_args, "dynamic_prompt_packing_max_samples_per_pack", 8) or 8
+                    )
                     max_steps = int(getattr(training_args, "max_steps", 0) or 0)
                     if max_steps <= 0:
                         raise ValueError(
@@ -608,7 +604,9 @@ def get_dataset(
                     dataset_converter = None
                     id_key = None
                     col_names = getattr(train_ds, "column_names", None)
-                    is_aligned = isinstance(col_names, (list, tuple)) and "_prompt" in col_names and "_response" in col_names
+                    is_aligned = (
+                        isinstance(col_names, (list, tuple)) and "_prompt" in col_names and "_response" in col_names
+                    )
                     if not is_aligned:
                         dataset_names = data_args.dataset or []
                         if len(dataset_names) == 0:
@@ -682,6 +680,8 @@ def get_dataset(
                         data_args=data_args,
                         seed=training_args.seed,
                     )
-                    logger.info_rank0("Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling.")
+                    logger.info_rank0(
+                        "Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling."
+                    )
 
         return dataset_module

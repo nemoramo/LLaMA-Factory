@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import inspect
 import json
 import math
@@ -23,7 +25,7 @@ import re
 from copy import deepcopy
 from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, BinaryIO, Literal, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, BinaryIO, Literal, TypedDict, Union
 from urllib.parse import urlparse
 
 import numpy as np
@@ -85,8 +87,8 @@ if TYPE_CHECKING:
     from transformers.video_processing_utils import BaseVideoProcessor
 
     class EncodedImage(TypedDict):
-        path: Optional[str]
-        bytes: Optional[bytes]
+        path: str | None
+        bytes: bytes | None
 
     ImageInput = Union[str, bytes, EncodedImage, BinaryIO, ImageObject]
     VideoInput = Union[str, BinaryIO, list[list[ImageInput]]]
@@ -114,7 +116,7 @@ if TYPE_CHECKING:
             pass
 
 
-def _get_paligemma_token_type_ids(imglens: list[int], seqlens: list[int], processor: "MMProcessor") -> list[list[int]]:
+def _get_paligemma_token_type_ids(imglens: list[int], seqlens: list[int], processor: MMProcessor) -> list[list[int]]:
     r"""Get paligemma token type ids for computing loss.
 
     It is slightly different with the original token type ids where the prompt part is 0.
@@ -131,7 +133,7 @@ def _get_paligemma_token_type_ids(imglens: list[int], seqlens: list[int], proces
     return batch_token_type_ids
 
 
-def _get_gemma3_token_type_ids(batch_ids: list[list[int]], processor: "MMProcessor"):
+def _get_gemma3_token_type_ids(batch_ids: list[list[int]], processor: MMProcessor):
     r"""Get gemma3 token type ids for computing loss.
 
     Returns:
@@ -149,7 +151,7 @@ def _get_gemma3_token_type_ids(batch_ids: list[list[int]], processor: "MMProcess
     return batch_token_type_ids
 
 
-def _make_batched_images(images: list["ImageObject"], imglens: list[int]) -> list[list["ImageObject"]]:
+def _make_batched_images(images: list[ImageObject], imglens: list[int]) -> list[list[ImageObject]]:
     r"""Make nested list of images."""
     batch_images = []
     for imglen in imglens:
@@ -159,24 +161,24 @@ def _make_batched_images(images: list["ImageObject"], imglens: list[int]) -> lis
     return batch_images
 
 
-def _check_video_is_nested_images(video: "VideoInput") -> bool:
+def _check_video_is_nested_images(video: VideoInput) -> bool:
     r"""Check if the video is nested images."""
     return isinstance(video, list) and all(isinstance(frame, (str, BinaryIO, dict, ImageObject)) for frame in video)
 
 
 @dataclass
 class MMPluginMixin:
-    image_token: Optional[str]
-    video_token: Optional[str]
-    audio_token: Optional[str]
+    image_token: str | None
+    video_token: str | None
+    audio_token: str | None
     expand_mm_tokens: bool = True
 
     def _validate_input(
         self,
-        processor: Optional["MMProcessor"],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        processor: MMProcessor | None,
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
     ) -> None:
         r"""Validate if this model accepts the input modalities."""
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
@@ -223,9 +225,9 @@ class MMPluginMixin:
     def _validate_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
     ):
         r"""Validate if the number of images, videos and audios match the number of placeholders in messages."""
         num_image_tokens, num_video_tokens, num_audio_tokens = 0, 0, 0
@@ -250,8 +252,8 @@ class MMPluginMixin:
             )
 
     def _preprocess_image(
-        self, image: "ImageObject", image_max_pixels: int, image_min_pixels: int, **kwargs
-    ) -> "ImageObject":
+        self, image: ImageObject, image_max_pixels: int, image_min_pixels: int, **kwargs
+    ) -> ImageObject:
         r"""Pre-process a single image."""
         if (image.width * image.height) > image_max_pixels:
             resize_factor = math.sqrt(image_max_pixels / (image.width * image.height))
@@ -269,7 +271,7 @@ class MMPluginMixin:
         return image
 
     def _get_video_sample_indices(
-        self, video_stream: "Stream", video_fps: float, video_maxlen: int, **kwargs
+        self, video_stream: Stream, video_fps: float, video_maxlen: int, **kwargs
     ) -> list[int]:
         r"""Compute video sample indices according to fps."""
         total_frames = video_stream.frames
@@ -280,7 +282,7 @@ class MMPluginMixin:
         sample_frames = min(total_frames, video_maxlen, sample_frames)
         return np.linspace(0, total_frames - 1, sample_frames).astype(np.int32)
 
-    def _regularize_images(self, images: list["ImageInput"], **kwargs) -> "RegularizedImageOutput":
+    def _regularize_images(self, images: list[ImageInput], **kwargs) -> RegularizedImageOutput:
         r"""Regularize images to avoid error. Including reading and pre-processing."""
         results = []
         for image in images:
@@ -301,7 +303,7 @@ class MMPluginMixin:
 
         return {"images": results}
 
-    def _regularize_videos(self, videos: list["VideoInput"], **kwargs) -> "RegularizedVideoOutput":
+    def _regularize_videos(self, videos: list[VideoInput], **kwargs) -> RegularizedVideoOutput:
         r"""Regularizes videos to avoid error. Including reading, resizing and converting."""
         results = []
         durations = []
@@ -334,9 +336,9 @@ class MMPluginMixin:
 
     def _load_audio_with_pydub(
         self,
-        src: Union[str, BinaryIO, BytesIO],
+        src: str | BinaryIO | BytesIO,
         sampling_rate: float,
-    ) -> tuple["NDArray", float]:
+    ) -> tuple[NDArray, float]:
         r"""Load audio with pydub + ffmpeg and return mono float32 waveform."""
         if AudioSegment is None:
             raise ImportError(
@@ -369,9 +371,9 @@ class MMPluginMixin:
 
     def _load_single_audio(
         self,
-        audio: "AudioInput",
+        audio: AudioInput,
         sampling_rate: float,
-    ) -> tuple["NDArray", float]:
+    ) -> tuple[NDArray, float]:
         """Normalize a single audio input to (np.ndarray, sr).
 
         Supports numpy arrays, file-like objects, local paths and s3:// URIs.
@@ -463,10 +465,10 @@ class MMPluginMixin:
 
     def _regularize_audios(
         self,
-        audios: list["AudioInput"],
+        audios: list[AudioInput],
         sampling_rate: float,
         **kwargs,
-    ) -> "RegularizedAudioOutput":
+    ) -> RegularizedAudioOutput:
         r"""Regularizes audios to avoid error.
 
         Including reading and resampling.
@@ -483,12 +485,12 @@ class MMPluginMixin:
 
     def _get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: "MMProcessor",
-        imglens: Optional[list[int]] = None,
-    ) -> dict[str, "torch.Tensor"]:
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor,
+        imglens: list[int] | None = None,
+    ) -> dict[str, torch.Tensor]:
         r"""Process visual inputs.
 
         Returns: (llava and paligemma)
@@ -578,10 +580,10 @@ class BasePlugin(MMPluginMixin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         r"""Pre-process input messages before tokenization for VLMs."""
         self._validate_input(processor, images, videos, audios)
@@ -590,28 +592,28 @@ class BasePlugin(MMPluginMixin):
     def process_token_ids(
         self,
         input_ids: list[int],
-        labels: Optional[list[int]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        tokenizer: "PreTrainedTokenizer",
-        processor: Optional["MMProcessor"],
-    ) -> tuple[list[int], Optional[list[int]]]:
+        labels: list[int] | None,
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        tokenizer: PreTrainedTokenizer,
+        processor: MMProcessor | None,
+    ) -> tuple[list[int], list[int] | None]:
         r"""Pre-process token ids after tokenization for VLMs."""
         self._validate_input(processor, images, videos, audios)
         return input_ids, labels
 
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         r"""Build batched multimodal inputs for VLMs.
 
         Arguments:
@@ -635,10 +637,10 @@ class ErnieVLPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -668,10 +670,10 @@ class Gemma3Plugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_messages(messages, images, videos, audios)
 
@@ -728,15 +730,15 @@ class Gemma3Plugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         # Handle text-only mode: when no multimodal processor exists and no multimodal inputs are provided,
         # return token_type_ids with all zeros for proper loss computation during training.
         # This enables Gemma3 to be used for text-only tasks without requiring a multimodal processor.
@@ -755,10 +757,10 @@ class Gemma3nPlugin(Gemma3Plugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -788,12 +790,12 @@ class InternVLPlugin(BasePlugin):
     @override
     def _get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: "ProcessorMixin",
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: ProcessorMixin,
         **kwargs,
-    ) -> dict[str, "torch.Tensor"]:
+    ) -> dict[str, torch.Tensor]:
         image_processor: BaseImageProcessor = getattr(processor, "image_processor")
         image_processor_kwargs = {}
         if getattr(processor, "crop_to_patches", False):
@@ -873,10 +875,10 @@ class InternVLPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["ProcessorMixin"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: ProcessorMixin | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -917,15 +919,15 @@ class InternVLPlugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["ProcessorMixin"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: ProcessorMixin | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
         mm_inputs.pop("image_num_patches", None)
@@ -971,10 +973,10 @@ class Llama4Plugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -1017,15 +1019,15 @@ class Llama4Plugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
         mm_inputs.pop("aspect_ratios", None)
@@ -1038,10 +1040,10 @@ class LlavaPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -1074,10 +1076,10 @@ class LlavaNextPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -1114,10 +1116,10 @@ class LlavaNextVideoPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -1168,12 +1170,12 @@ class MiniCPMVPlugin(BasePlugin):
     @override
     def _get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: "MMProcessor",
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor,
         **kwargs,
-    ) -> dict[str, "torch.Tensor"]:
+    ) -> dict[str, torch.Tensor]:
         image_processor: BaseImageProcessor = getattr(processor, "image_processor")
         mm_inputs = {}
         if len(images) != 0:
@@ -1239,10 +1241,10 @@ class MiniCPMVPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -1329,15 +1331,15 @@ class MiniCPMVPlugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         # image bound
         image_bounds_list = []
@@ -1401,10 +1403,10 @@ class MllamaPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -1420,15 +1422,15 @@ class MllamaPlugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         mm_inputs = self._get_mm_inputs(images, videos, audios, processor, imglens)
         if mm_inputs:
@@ -1456,10 +1458,10 @@ class PaliGemmaPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -1479,13 +1481,13 @@ class PaliGemmaPlugin(BasePlugin):
     def process_token_ids(
         self,
         input_ids: list[int],
-        labels: Optional[list[int]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        tokenizer: "PreTrainedTokenizer",
-        processor: Optional["MMProcessor"],
-    ) -> tuple[list[int], Optional[list[int]]]:
+        labels: list[int] | None,
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        tokenizer: PreTrainedTokenizer,
+        processor: MMProcessor | None,
+    ) -> tuple[list[int], list[int] | None]:
         self._validate_input(processor, images, videos, audios)
         num_images = len(images)
         image_seqlen = processor.image_seq_length if self.expand_mm_tokens else 0  # skip mm token
@@ -1499,15 +1501,15 @@ class PaliGemmaPlugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         seqlens = [len(input_ids) for input_ids in batch_ids]
         mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
@@ -1521,10 +1523,10 @@ class PixtralPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -1565,15 +1567,15 @@ class PixtralPlugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
         # ref to this commit https://github.com/huggingface/transformers/pull/35122
@@ -1590,10 +1592,10 @@ class Qwen2AudioPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -1626,15 +1628,15 @@ class Qwen2AudioPlugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         return self._get_mm_inputs(images, videos, audios, processor)
 
@@ -1654,10 +1656,10 @@ class VoxtralPlugin(BasePlugin):
 
     def _validate_input(  # type: ignore[override]
         self,
-        processor: Optional["MMProcessor"],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        processor: MMProcessor | None,
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
     ) -> None:
         # Voxtral always supports audio; do not gate on `audio_token` presence.
         if len(images) != 0 and self.image_token is None:
@@ -1678,15 +1680,15 @@ class VoxtralPlugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         if processor is None:
             raise ValueError("Processor was not found, please check and update your model file.")
@@ -1700,7 +1702,7 @@ class VoxtralPlugin(BasePlugin):
         audio_sampling_rate = int(getattr(processor, "audio_sampling_rate", 16000))
         min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
 
-        input_features_list: list["torch.Tensor"] = []
+        input_features_list: list[torch.Tensor] = []
         for audio in audios:
             # Normalize `file://` URIs to local paths.
             if isinstance(audio, str) and audio.startswith("file://"):
@@ -1719,7 +1721,7 @@ class VoxtralPlugin(BasePlugin):
                 return_attention_mask=False,
                 return_tensors="pt",
             )
-            feats: "torch.Tensor" = wav_inputs["input_features"]  # (1, 128, T)
+            feats: torch.Tensor = wav_inputs["input_features"]  # (1, 128, T)
             if feats.ndim != 3:
                 raise ValueError(f"Unexpected Voxtral input_features shape: {tuple(feats.shape)}")
 
@@ -1749,7 +1751,7 @@ class FunAudioChatPlugin(BasePlugin):
     token_fps: int = 25  # FunAudioChat uses 25Hz discrete frames.
     _segment_duration_re = re.compile(r"_seg\d+_(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\.wav$")
 
-    def _parse_audio_json(self, audio: str) -> Optional[dict]:
+    def _parse_audio_json(self, audio: str) -> dict | None:
         audio = audio.strip()
         if not (audio.startswith("{") and audio.endswith("}")):
             return None
@@ -1759,7 +1761,7 @@ class FunAudioChatPlugin(BasePlugin):
         except Exception:  # noqa: BLE001
             return None
 
-    def _extract_audio_fields(self, audio: "AudioInput") -> tuple[Optional[str], Optional[str]]:
+    def _extract_audio_fields(self, audio: AudioInput) -> tuple[str | None, str | None]:
         r"""Return (path, token_str) if available."""
         if not isinstance(audio, str):
             return None, None
@@ -1773,7 +1775,7 @@ class FunAudioChatPlugin(BasePlugin):
         return path or None, token or None
 
     @override
-    def _load_single_audio(self, audio: "AudioInput", sampling_rate: float) -> tuple["NDArray", float]:
+    def _load_single_audio(self, audio: AudioInput, sampling_rate: float) -> tuple[NDArray, float]:
         # Support JSON-encoded audio items (from FunAudioChat dataset format).
         if isinstance(audio, str):
             path, _ = self._extract_audio_fields(audio)
@@ -1783,13 +1785,13 @@ class FunAudioChatPlugin(BasePlugin):
         return super()._load_single_audio(audio, sampling_rate)
 
     def _build_speech_strings(
-        self, audios: list["AudioInput"], processor: "MMProcessor"
-    ) -> tuple[list[str], list["AudioInput"], list[bool]]:
+        self, audios: list[AudioInput], processor: MMProcessor
+    ) -> tuple[list[str], list[AudioInput], list[bool]]:
         audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
         audio_pad_token: str = getattr(processor, "audio_pad_token", "<|audio_pad|>")
 
         speech: list[str] = []
-        feature_audios: list["AudioInput"] = []
+        feature_audios: list[AudioInput] = []
         feature_exist_mask: list[bool] = []
 
         for audio in audios:
@@ -1835,7 +1837,7 @@ class FunAudioChatPlugin(BasePlugin):
 
         return speech, feature_audios, feature_exist_mask
 
-    def _get_speech_lengths(self, speech: list[str], processor: "MMProcessor") -> list[int]:
+    def _get_speech_lengths(self, speech: list[str], processor: MMProcessor) -> list[int]:
         speech_tokenizer = getattr(processor, "speech_tokenizer", None)
         if speech_tokenizer is None:
             # Fallback: treat each speech string as a single token.
@@ -1856,10 +1858,10 @@ class FunAudioChatPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         if processor is None:
@@ -1882,9 +1884,9 @@ class FunAudioChatPlugin(BasePlugin):
         speech, _, _ = self._build_speech_strings(audios, processor)
         speech_lengths = self._get_speech_lengths(speech, processor)
 
-        def _find_next_placeholder(content: str, start: int) -> Optional[tuple[int, str]]:
-            best_ph: Optional[str] = None
-            best_idx: Optional[int] = None
+        def _find_next_placeholder(content: str, start: int) -> tuple[int, str] | None:
+            best_ph: str | None = None
+            best_idx: int | None = None
             for ph in placeholders:
                 idx = content.find(ph, start)
                 if idx == -1:
@@ -1922,20 +1924,20 @@ class FunAudioChatPlugin(BasePlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         if processor is None:
             raise ValueError("Processor was not found, please check and update your model file.")
 
-        mm_inputs: dict[str, Union[list[int], "torch.Tensor"]] = {}
+        mm_inputs: dict[str, list[int] | torch.Tensor] = {}
 
         speech, feature_audios, feature_exist_mask = self._build_speech_strings(audios, processor)
         audio_group_size = getattr(processor, "audio_group_size", 5)
@@ -1994,7 +1996,7 @@ class Qwen2VLPlugin(BasePlugin):
     vision_eos_token: str = "<|vision_end|>"
 
     @override
-    def _preprocess_image(self, image: "ImageObject", **kwargs) -> "ImageObject":
+    def _preprocess_image(self, image: ImageObject, **kwargs) -> ImageObject:
         image = super()._preprocess_image(image, **kwargs)
         if min(image.width, image.height) < 28:
             width, height = max(image.width, 28), max(image.height, 28)
@@ -2011,7 +2013,7 @@ class Qwen2VLPlugin(BasePlugin):
         return image
 
     @override
-    def _regularize_videos(self, videos: list["VideoInput"], **kwargs) -> "RegularizedVideoOutput":
+    def _regularize_videos(self, videos: list[VideoInput], **kwargs) -> RegularizedVideoOutput:
         results, fps_per_video, durations = [], [], []
         for video in videos:
             frames: list[ImageObject] = []
@@ -2050,11 +2052,11 @@ class Qwen2VLPlugin(BasePlugin):
     @override
     def _get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: "MMProcessor",
-    ) -> dict[str, "torch.Tensor"]:
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor,
+    ) -> dict[str, torch.Tensor]:
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
         video_processor: BaseVideoProcessor = getattr(processor, "video_processor", None)
         mm_inputs = {}
@@ -2085,10 +2087,10 @@ class Qwen2VLPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -2135,11 +2137,11 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
     @override
     def _get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: "MMProcessor",
-    ) -> dict[str, "torch.Tensor"]:
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor,
+    ) -> dict[str, torch.Tensor]:
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
         video_processor: BaseImageProcessor = getattr(processor, "video_processor", None)
         mm_inputs = {}
@@ -2176,10 +2178,10 @@ class Qwen3VLPlugin(Qwen2VLPlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -2253,11 +2255,11 @@ class GLM4VPlugin(Qwen2VLPlugin):
     @override
     def _get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: "MMProcessor",
-    ) -> dict[str, "torch.Tensor"]:
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor,
+    ) -> dict[str, torch.Tensor]:
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
         video_processor: BaseImageProcessor = getattr(processor, "video_processor", None)
         mm_inputs = {}
@@ -2290,10 +2292,10 @@ class GLM4VPlugin(Qwen2VLPlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -2364,15 +2366,15 @@ class GLM4VPlugin(Qwen2VLPlugin):
     @override
     def get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
         imglens: list[int],
         vidlens: list[int],
         audlens: list[int],
         batch_ids: list[list[int]],
-        processor: Optional["ProcessorMixin"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
+        processor: ProcessorMixin | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
         self._validate_input(processor, images, videos, audios)
         mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
         mm_inputs.pop("timestamps", None)
@@ -2387,11 +2389,11 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
     @override
     def _get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: "MMProcessor",
-    ) -> dict[str, "torch.Tensor"]:
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor,
+    ) -> dict[str, torch.Tensor]:
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
         video_processor: BaseVideoProcessor = getattr(processor, "video_processor", None)
         feature_extractor: SequenceFeatureExtractor = getattr(processor, "feature_extractor", None)
@@ -2442,10 +2444,10 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -2565,10 +2567,10 @@ class VideoLlavaPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
@@ -2638,7 +2640,7 @@ PLUGINS = {
 }
 
 
-def register_mm_plugin(name: str, plugin_class: type["BasePlugin"]) -> None:
+def register_mm_plugin(name: str, plugin_class: type[BasePlugin]) -> None:
     r"""Register a multimodal plugin."""
     if name in PLUGINS:
         raise ValueError(f"Multimodal plugin {name} already exists.")
@@ -2648,11 +2650,11 @@ def register_mm_plugin(name: str, plugin_class: type["BasePlugin"]) -> None:
 
 def get_mm_plugin(
     name: str,
-    image_token: Optional[str] = None,
-    video_token: Optional[str] = None,
-    audio_token: Optional[str] = None,
+    image_token: str | None = None,
+    video_token: str | None = None,
+    audio_token: str | None = None,
     **kwargs,
-) -> "BasePlugin":
+) -> BasePlugin:
     r"""Get plugin for multimodal inputs."""
     if name not in PLUGINS:
         raise ValueError(f"Multimodal plugin `{name}` not found.")

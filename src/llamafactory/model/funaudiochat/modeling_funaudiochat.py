@@ -1,19 +1,31 @@
-# Copyright (c) 2025, Alibaba Cloud and its affiliates;
+# Copyright 2025 the LlamaFactory team.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""FunAudioChat modeling implementation.
+
+Author: yufeng.ma
+"""
+
 import logging
 import math
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import torch
 from torch import nn
-
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
@@ -21,9 +33,18 @@ from transformers.generation.logits_process import LogitsProcessorList, NoBadWor
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutput, CausalLMOutput, ModelOutput
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.utils import auto_docstring
 from transformers.models.auto import AutoConfig, AutoModel, AutoModelForCausalLM
+from transformers.utils import auto_docstring
+
 from .configuration_funaudiochat import FunAudioChatAudioEncoderConfig, FunAudioChatConfig
+
+
+if TYPE_CHECKING:
+    from transformers.generation.configuration_utils import GenerationConfig
+    from transformers.generation.stopping_criteria import StoppingCriteriaList
+    from transformers.generation.streamers import BaseStreamer
+    from transformers.generation.utils import GenerateNonBeamOutput
+
 
 logger = logging.getLogger(__name__)
 
@@ -36,21 +57,24 @@ class FunAudioChatCausalLMOutputWithPast(ModelOutput):
     speech_loss: Optional[torch.FloatTensor] = None
     text_logits: torch.FloatTensor = None
     speech_logits: torch.FloatTensor = None
-    past_key_values: Optional[List[torch.FloatTensor]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    past_key_values: Optional[list[torch.FloatTensor]] = None
+    hidden_states: Optional[tuple[torch.FloatTensor]] = None
+    attentions: Optional[tuple[torch.FloatTensor]] = None
     attention_mask: Optional[torch.FloatTensor] = None
 
     @property
     def logits(self) -> torch.FloatTensor:
         return self.text_logits
 
+
 @auto_docstring
 class FunAudioChatPreTrainedModel(PreTrainedModel):
     config_class = FunAudioChatConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["FunAudioChatDecoderLayer",]
+    _no_split_modules = [
+        "FunAudioChatDecoderLayer",
+    ]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
@@ -101,7 +125,7 @@ def eager_attention_forward(
 
 
 class FunAudioChatAudioAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed attention from 'Attention Is All You Need' paper."""
 
     def __init__(
         self,
@@ -194,14 +218,14 @@ class FunAudioChatAudioEncoderLayer(GradientCheckpointingLayer):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
+        """Args.
+
+        hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+        attention_mask (`torch.FloatTensor`): attention mask of size
+            `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+        output_attentions (`bool`, *optional*):
+            Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+            returned tensors for more detail.
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -308,15 +332,15 @@ class FunAudioChatAudioEncoder(FunAudioChatPreTrainedModel):
 
     @auto_docstring
     def forward(
-            self,
-            input_features,
-            feature_lens=None,
-            aftercnn_lens=None,
-            speech_maxlen=None,
-            **kwargs,
+        self,
+        input_features,
+        feature_lens=None,
+        aftercnn_lens=None,
+        speech_maxlen=None,
+        **kwargs,
     ):
-        r"""
-        input_features (`torch.float` of shape `(features_dim, N)`): N = sum(feature_lens)
+        r"""input_features (`torch.float` of shape `(features_dim, N)`): N = sum(feature_lens).
+
             Float values of mel features extracted from the raw speech waveform. Raw speech waveform can be
             obtained by loading a `.flac` or `.wav` audio file into an array of type `List[float]` or a
             `numpy.ndarray`, *e.g.* via the soundfile library (`pip install soundfile`). To prepare the array into
@@ -332,7 +356,6 @@ class FunAudioChatAudioEncoder(FunAudioChatPreTrainedModel):
         # 1. 识别有效和无效的样本
         original_batch_size = feature_lens.size(0)
         device = input_features.device
-        dtype = input_features.dtype
 
         valid_mask = feature_lens > 0
         valid_indices = torch.where(valid_mask)[0]
@@ -382,8 +405,8 @@ class FunAudioChatAudioEncoder(FunAudioChatPreTrainedModel):
         padded_embed = nn.functional.gelu(self.conv2(padded_embed)).transpose(1, 2)
 
         padded_embed = padded_embed + self.positional_embedding.positional_embedding[
-                                          : padded_embed.shape[1], :
-                                          ].unsqueeze(0).to(padded_embed.dtype)
+            : padded_embed.shape[1], :
+        ].unsqueeze(0).to(padded_embed.dtype)
 
         hidden_states = padded_embed[padded_mask_after_cnn]
         cu_seqlens = torch.cat(
@@ -417,9 +440,7 @@ class FunAudioChatAudioEncoder(FunAudioChatPreTrainedModel):
             seq_len = each_audio_states.shape[0]
             if seq_len >= 2:
                 pooled = torch.nn.functional.avg_pool1d(
-                    each_audio_states.transpose(0, 1), 
-                    kernel_size=2, 
-                    stride=2
+                    each_audio_states.transpose(0, 1), kernel_size=2, stride=2
                 ).transpose(0, 1)
             else:
                 # For sequences shorter than kernel_size, skip pooling
@@ -455,8 +476,8 @@ class FunAudioChatAudioEncoder(FunAudioChatPreTrainedModel):
         return BaseModelOutput(last_hidden_state=output_hidden_states)
 
     def padded_and_mask_function(self, tensor_list, tensor_len, padding_value=0, padding_side="right"):
-        """
-        Pads a sequence of tensors to their maximum length on indicated `padding_side`.
+        """Pads a sequence of tensors to their maximum length on indicated `padding_side`.
+
         Then prepares a mask so that pad tokens are not attended to.
         """
         max_len = tensor_len.max()
@@ -494,9 +515,7 @@ class FunAudioChatAudioEncoder(FunAudioChatPreTrainedModel):
 
     # Ignore copy
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
-        """
-        Computes the output length of the convolutional layers and the output length of the audio encoder
-        """
+        """Computes the output length of the convolutional layers and the output length of the audio encoder."""
         input_lengths = (input_lengths - 1) // 2 + 1
         output_lengths = (input_lengths - 2) // 2 + 1
         return input_lengths, output_lengths
@@ -555,17 +574,16 @@ class FunAudioChatDiscreteEncoder(FunAudioChatPreTrainedModel):
         )
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
-        """
-        Computes the output length of the convolutional layers and the output length of the audio encoder
-        """
+        """Computes the output length of the convolutional layers and the output length of the audio encoder."""
         input_lengths = input_lengths
         output_lengths = (input_lengths + self.group_size - 1) // self.group_size
         return input_lengths, output_lengths
 
 
 class FunAudioChatDecoder(FunAudioChatPreTrainedModel):
-    """
-    Transformer encoder consisting of *config.encoder_layers* self attention layers. Each layer is a
+    """Transformer encoder consisting of *config.encoder_layers* self attention layers.
+
+    Each layer is a
     [`FunAudioChatDecoderLayer`].
 
     Args:
@@ -603,7 +621,9 @@ class FunAudioChatDecoder(FunAudioChatPreTrainedModel):
         next_token_logits = logits[:, -1, :].to(copy=True, dtype=torch.float32, device=logits.device)
 
         # pre-process distribution
-        next_token_scores = self.crq_logits_processor(torch.cat([self.crq_speech_ids, *self.crq_generate_tokens], dim=-1), next_token_logits)
+        next_token_scores = self.crq_logits_processor(
+            torch.cat([self.crq_speech_ids, *self.crq_generate_tokens], dim=-1), next_token_logits
+        )
 
         # token selection
         if self.crq_do_sample:
@@ -709,7 +729,7 @@ class FunAudioChatDecoder(FunAudioChatPreTrainedModel):
             my_inputs_embeds = hidden_states
 
         my_inputs_embeds = self.input_matching(my_inputs_embeds)
-        
+
         # Expand attention_mask and position_ids for upsampling (group_size expansion)
         crq_attention_mask = None
         crq_position_ids = None
@@ -728,7 +748,7 @@ class FunAudioChatDecoder(FunAudioChatPreTrainedModel):
             offsets = torch.arange(self.group_size, device=position_ids.device, dtype=position_ids.dtype)
             crq_position_ids = crq_position_ids + offsets.view(1, 1, -1)
             crq_position_ids = crq_position_ids.view(bs, -1)
-            
+
             # Determine padding mask from position_ids (rightmost non-zero position)
             # instead of attention_mask (which may be all 1s in non-neat_packing mode)
             nonzero_mask = position_ids != 0  # [bs, slen]
@@ -736,12 +756,14 @@ class FunAudioChatDecoder(FunAudioChatPreTrainedModel):
             first_nonzero_from_end = reversed_nonzero.to(torch.long).argmax(dim=-1)  # [bs]
             has_nonzero = nonzero_mask.any(dim=-1)  # [bs]
             orig_slen = position_ids.shape[1]
-            ending_pos = torch.where(has_nonzero, orig_slen - first_nonzero_from_end, torch.zeros_like(first_nonzero_from_end))
+            ending_pos = torch.where(
+                has_nonzero, orig_slen - first_nonzero_from_end, torch.zeros_like(first_nonzero_from_end)
+            )
             seq_indices = torch.arange(orig_slen, device=position_ids.device).unsqueeze(0)  # [1, slen]
             padding_mask = seq_indices >= ending_pos.unsqueeze(-1)  # [bs, slen]
             crq_padding_mask = padding_mask.repeat_interleave(self.group_size, dim=1)  # [bs, slen * group_size]
             crq_position_ids = crq_position_ids.masked_fill(crq_padding_mask, 0)
-        
+
         outputs = self.crq_transformer(
             inputs_embeds=my_inputs_embeds,
             attention_mask=crq_attention_mask,
@@ -791,10 +813,10 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         )
         self._padding_side = "left"  # set it to left by default, user can use setter to change padding_sides
         self.sp_gen_kwargs = {
-            'text_greedy': False,
-            'only_crq_sampling': True,
-            'disable_speech': False,
-            'force_text_abos': False,
+            "text_greedy": False,
+            "only_crq_sampling": True,
+            "disable_speech": False,
+            "force_text_abos": False,
         }
         self.post_init()
 
@@ -846,8 +868,7 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         audio_feature_lengths: Optional[torch.LongTensor] = None,
         speech_maxlen: Optional[int] = None,
     ):
-        """
-        Encodes audios into continuous embeddings that can be forwarded to the language model.
+        """Encodes audios into continuous embeddings that can be forwarded to the language model.
 
         Args:
             input_features (`torch.FloatTensor`):
@@ -856,6 +877,8 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                 Mask to avoid performing attention on padding feature indices. Mask values selected in `[0, 1]`:
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
                 The length of feature shape of each audio in LLM.
+            speech_maxlen (`int`, *optional*):
+                Maximum length for the output speech embeddings. Used to pad or truncate the output to a fixed size.
         """
         feature_lens = audio_feature_lengths
         if feature_attention_mask is not None:
@@ -876,7 +899,9 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         # When training with LoRA + `modules_to_save`, PEFT may wrap `continuous_audio_tower` with a
         # `ModulesToSaveWrapper` (which doesn't expose tower-specific helper methods).
         continuous_audio_tower = getattr(self.continuous_audio_tower, "original_module", self.continuous_audio_tower)
-        audio_feat_lengths, audio_output_lengths = continuous_audio_tower._get_feat_extract_output_lengths(feature_lens)
+        audio_feat_lengths, audio_output_lengths = continuous_audio_tower._get_feat_extract_output_lengths(
+            feature_lens
+        )
         audio_outputs = self.continuous_audio_tower(
             input_features,
             feature_lens=feature_lens,
@@ -887,7 +912,6 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
 
         return audio_features, audio_output_lengths
 
-    
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -909,9 +933,9 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, FunAudioChatCausalLMOutputWithPast]:
-        r"""
-        Args:
+    ) -> Union[tuple, FunAudioChatCausalLMOutputWithPast]:
+        r"""Args.
+
             input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
                 Indices of input sequence tokens in the vocabulary. These tokens can be text tokens or special tokens
                 like the audio token placeholder.
@@ -1091,7 +1115,9 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                 audio_token_mask = audio_token_mask.to(inputs_embeds.device)
                 special_audio_mask = audio_token_mask.unsqueeze(-1)
                 flat_audio_features = flat_audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask.expand_as(inputs_embeds), flat_audio_features)
+                inputs_embeds = inputs_embeds.masked_scatter(
+                    special_audio_mask.expand_as(inputs_embeds), flat_audio_features
+                )
 
                 # 开始构建labels
                 if labels is not None:
@@ -1140,7 +1166,6 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                         labels[audio_token_mask.to(labels.device)] = flat_mid_text_labels.to(labels.device)
                         labels.masked_fill_(non_labels_mask, self.config.ignore_index)
 
-
         lm_kwargs = {}
         if cache_position is not None:
             lm_kwargs["cache_position"] = cache_position
@@ -1171,7 +1196,7 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
             return_dict=True,
             **lm_kwargs,
         )
-        aux_loss = outputs.aux_loss if hasattr(outputs, 'aux_loss') else None
+        aux_loss = outputs.aux_loss if hasattr(outputs, "aux_loss") else None
         speech_loss = None
         speech_logits = None
         if self.audio_invert_tower is not None:
@@ -1185,12 +1210,14 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
             else:
                 audio_embeds = None
 
-            if not self.sp_gen_kwargs['disable_speech']:
+            if not self.sp_gen_kwargs["disable_speech"]:
                 speech_inputs_embeds = last_hidden_state
                 if text_embeds is None:
                     text_embeds = self.get_input_embeddings()(input_ids)
                     if text_features is not None:
-                        text_embeds = text_embeds.masked_scatter(special_audio_mask.expand_as(text_embeds), text_features[audio_features_mask])
+                        text_embeds = text_embeds.masked_scatter(
+                            special_audio_mask.expand_as(text_embeds), text_features[audio_features_mask]
+                        )
                 speech_inputs_embeds = speech_inputs_embeds + text_embeds.detach()
                 speech_output = self.audio_invert_tower(
                     audio_embeds=audio_embeds,
@@ -1261,7 +1288,7 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         # 9. Deal with speech generation
         self.generate_speech |= input_ids[:, -1] == self.config.text_config.audio_bos_index
         if any(self.generate_speech) and speech_ids is not None and speech_ids.shape[-1] != 0:
-            audio_features = self.audio_tower(speech_ids[:, -self.config.audio_config.group_size:])[0]
+            audio_features = self.audio_tower(speech_ids[:, -self.config.audio_config.group_size :])[0]
             text_features = self.get_input_embeddings()(input_ids[:, -1]).unsqueeze(1)
             # XXX: double generate
             if not single_modal:
@@ -1287,9 +1314,9 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
     ) -> Union["GenerateNonBeamOutput", torch.LongTensor]:
-        r"""
-        Generates sequences of token ids for models with a language modeling head using **multinomial sampling** and
-        can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
+        r"""Generates sequences of token ids for models with a language modeling head using **multinomial sampling**.
+
+        Can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
 
         Parameters:
             input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
@@ -1328,9 +1355,9 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         return_dict_in_generate = generation_config.return_dict_in_generate
         has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
         do_sample = generation_config.do_sample
-        text_greedy = self.sp_gen_kwargs.get('text_greedy', False)
-        only_crq_sampling = self.sp_gen_kwargs.get('only_crq_sampling', False)
-        force_text_abos = self.sp_gen_kwargs.get('force_text_abos', False)
+        text_greedy = self.sp_gen_kwargs.get("text_greedy", False)
+        only_crq_sampling = self.sp_gen_kwargs.get("only_crq_sampling", False)
+        force_text_abos = self.sp_gen_kwargs.get("force_text_abos", False)
 
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
@@ -1341,8 +1368,8 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
 
         # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
         if return_dict_in_generate and self.config.is_encoder_decoder:
-            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
-            encoder_hidden_states = (
+            _encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            _encoder_hidden_states = (
                 model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
             )
 
@@ -1374,7 +1401,9 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
         self.audio_invert_tower.crq_do_sample = do_sample
         self.audio_invert_tower.crq_speech_ids = speech_ids
         # Filter out NoBadWordsLogitsProcessor for crq (audio generation)
-        crq_logits_processor = LogitsProcessorList([p for p in logits_processor if not isinstance(p, NoBadWordsLogitsProcessor)])
+        crq_logits_processor = LogitsProcessorList(
+            [p for p in logits_processor if not isinstance(p, NoBadWordsLogitsProcessor)]
+        )
         self.audio_invert_tower.crq_logits_processor = crq_logits_processor
         self.audio_invert_tower.crq_grobal_step = 0
 
@@ -1516,7 +1545,7 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
 
 
 __all__ = [
+    "FunAudioChatAudioEncoder",
     "FunAudioChatForConditionalGeneration",
     "FunAudioChatPreTrainedModel",
-    "FunAudioChatAudioEncoder",
 ]

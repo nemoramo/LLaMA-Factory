@@ -114,8 +114,7 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
             processor_extra_kwargs["mode"] = ValidationMode.finetuning
         except Exception as e:  # noqa: BLE001
             raise ImportError(
-                "Voxtral requires `mistral-common` to be installed. "
-                "Install it with `pip install mistral-common`."
+                "Voxtral requires `mistral-common` to be installed. Install it with `pip install mistral-common`."
             ) from e
 
     try:

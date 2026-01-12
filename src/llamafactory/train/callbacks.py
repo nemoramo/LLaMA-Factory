@@ -288,6 +288,11 @@ class LogCallback(TrainerCallback):
             logs["throughput"] = round(state.num_input_tokens_seen / (time.time() - self.start_time), 2)
             logs["total_tokens"] = state.num_input_tokens_seen
 
+        effective_tokens_seen = getattr(state, "num_effective_tokens_seen", 0) or 0
+        if effective_tokens_seen:
+            logs["effective_throughput"] = round(effective_tokens_seen / (time.time() - self.start_time), 2)
+            logs["effective_tokens"] = int(effective_tokens_seen)
+
         if is_env_enabled("RECORD_VRAM"):
             vram_allocated, vram_reserved = get_peak_memory()
             logs["vram_allocated"] = round(vram_allocated / (1024**3), 2)
