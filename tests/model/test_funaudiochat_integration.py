@@ -29,7 +29,12 @@ def test_funaudiochat_registration_template_plugin():
     cfg = AutoConfig.for_model("funaudiochat")
     assert getattr(cfg, "model_type", None) == "funaudiochat"
     assert type(cfg) in AutoModelForSeq2SeqLM._model_mapping.keys()
-    assert hasattr(AutoProcessor, "_processor_mapping") and type(cfg) in AutoProcessor._processor_mapping.keys()
+    if hasattr(AutoProcessor, "_processor_mapping"):
+        assert type(cfg) in AutoProcessor._processor_mapping.keys()
+    else:  # transformers>=4.56 moves processor mapping to module-level constant
+        from transformers.models.auto.processing_auto import PROCESSOR_MAPPING
+
+        assert type(cfg) in PROCESSOR_MAPPING.keys()
 
     assert "funaudiochat" in TEMPLATES
 
