@@ -466,6 +466,12 @@ _register_composite_model(
     language_model_keys=["language_model", "lm_head"],
 )
 
+_register_composite_model(
+    model_type="voxtral",
+    vision_model_keys=["audio_tower"],
+    language_model_keys=["language_model", "lm_head"],
+)
+
 
 # copied from qwen2vl
 _register_composite_model(
