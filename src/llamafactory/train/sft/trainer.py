@@ -29,18 +29,17 @@ from typing_extensions import override
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
-from ...extras.packages import is_transformers_version_greater_than
 from ..callbacks import SaveProcessorCallback
-from ..fp8_utils import configure_fp8_environment, verify_fp8_status
+from ..fp8_utils import configure_fp8_environment, patch_accelerator_for_fp8, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 
 
 if TYPE_CHECKING:
     from torch.utils.data import Dataset
-    from transformers import PreTrainedTokenizer, ProcessorMixin
+    from transformers import ProcessorMixin
     from transformers.trainer import PredictionOutput
 
-    from ...hparams import FinetuningArguments, ModelArguments
+    from ...hparams import FinetuningArguments, ModelArguments, TrainingArguments
 
 
 logger = logging.get_logger(__name__)
@@ -148,13 +147,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         gen_kwargs: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> None:
+        kwargs["processing_class"] = kwargs.pop("tokenizer")
         # Configure FP8 environment if enabled
-        if model_args is not None and model_args.fp8:
-            configure_fp8_environment(model_args)
-        if is_transformers_version_greater_than("4.46"):
-            kwargs["processing_class"] = kwargs.pop("tokenizer")
-        else:
-            self.processing_class: PreTrainedTokenizer = kwargs.get("tokenizer")
+        training_args: TrainingArguments = kwargs.get("args")
+        if training_args.fp8:
+            configure_fp8_environment(training_args)
+            if getattr(training_args, "fp8_backend", "auto") == "te":
+                patch_accelerator_for_fp8()
 
         self.eval_data_collator = eval_data_collator
         super().__init__(**kwargs)
@@ -180,13 +179,22 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         if finetuning_args.use_dft_loss and finetuning_args.use_chunked_ce_loss:
             raise ValueError("`use_dft_loss` and `use_chunked_ce_loss` are mutually exclusive.")
+        if finetuning_args.use_dft_loss and getattr(finetuning_args, "use_eaft_loss", False):
+            raise ValueError("`use_dft_loss` and `use_eaft_loss` are mutually exclusive.")
+        if finetuning_args.use_chunked_ce_loss and getattr(finetuning_args, "use_eaft_loss", False):
+            raise ValueError("`use_chunked_ce_loss` and `use_eaft_loss` are mutually exclusive.")
 
         if finetuning_args.use_dft_loss:
             from ..trainer_utils import dft_loss_func
 
             self.compute_loss_func = dft_loss_func
+        elif getattr(finetuning_args, "use_eaft_loss", False):
+            from ..trainer_utils import eaft_loss_func
 
-        if finetuning_args.use_chunked_ce_loss:
+            self.compute_loss_func = lambda outputs, labels, num_items_in_batch=None: eaft_loss_func(
+                outputs, labels, num_items_in_batch, finetuning_args.eaft_alpha
+            )
+        elif finetuning_args.use_chunked_ce_loss:
             from ..trainer_utils import chunked_ce_loss_func
 
             if self.label_smoother is not None:
@@ -201,9 +209,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 shift_labels=shift_labels,
             )
 
-        # Verify FP8 status after trainer initialization (accelerator should be available)
-        if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
-            verify_fp8_status(self.accelerator, model_args)
+        if training_args.fp8 and hasattr(self, "accelerator"):  # verify FP8 status after trainer initialization
+            verify_fp8_status(self.accelerator, training_args)
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -242,7 +249,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.data_collator = original_data_collator
 
     @override
-    def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch: Optional[torch.Tensor] = None):
+    def compute_loss(self, model, inputs, *args, **kwargs):
+        self._update_effective_tokens_seen(model, inputs)
+
+        return_outputs = kwargs.get("return_outputs", False)
+        num_items_in_batch = kwargs.get("num_items_in_batch", None)
+        if "return_outputs" not in kwargs and len(args) > 0:
+            return_outputs = args[0]
+        if "num_items_in_batch" not in kwargs and len(args) > 1:
+            num_items_in_batch = args[1]
+
         # HF Trainer pops labels when label smoothing is enabled, then calls `LabelSmoother(outputs, labels)`.
         # This breaks models that need labels inside `forward()` to build auxiliary targets (e.g. FunAudioChat
         # needs labels to build speech labels / speech_loss), and it also breaks any ModelOutput that doesn't
@@ -250,12 +266,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         #
         # We keep labels in the forward pass and compute label smoothing on the returned logits explicitly.
         if self.label_smoother is None and self.compute_loss_func is None:
-            return super().compute_loss(
-                model,
-                inputs,
-                return_outputs=return_outputs,
-                num_items_in_batch=num_items_in_batch,
-            )
+            return super().compute_loss(model, inputs, *args, **kwargs)
 
         labels = inputs.get("labels") if "labels" in inputs else None
         if self.model_accepts_loss_kwargs and num_items_in_batch is not None:
@@ -276,55 +287,54 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         if self.compute_loss_func is not None:
             loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
-            return (loss, outputs) if return_outputs else loss
-
-        # Label smoothing for decoder-only models: shift labels by 1 token.
-        unwrapped_model = self.accelerator.unwrap_model(model)
-        shift_labels = not bool(getattr(getattr(unwrapped_model, "config", None), "is_encoder_decoder", False))
-
-        # Locate logits for LabelSmoother. Prefer standard `logits`, fall back to `text_logits` (FunAudioChat),
-        # then to attribute `.logits`, and finally to the first tuple element for legacy tuple outputs.
-        logits = None
-        if isinstance(outputs, dict):
-            logits = outputs.get("logits")
-            if logits is None:
-                logits = outputs.get("text_logits")
-        if logits is None and hasattr(outputs, "logits"):
-            logits = getattr(outputs, "logits")
-        if logits is None and hasattr(outputs, "text_logits"):
-            logits = getattr(outputs, "text_logits")
-        if logits is None and isinstance(outputs, (tuple, list)) and len(outputs) > 0:
-            logits = outputs[0]
-
-        if logits is None:
-            raise ValueError(
-                "Cannot locate logits for label smoothing. Expected `logits`/`text_logits` in model outputs."
-            )
-
-        loss = self.label_smoother({"logits": logits}, labels, shift_labels=shift_labels)
-
-        # Add any auxiliary losses returned by the model outputs, excluding the main `loss`.
-        aux_loss = None
-        if isinstance(outputs, dict):
-            for k, v in outputs.items():
-                if k == "loss":
-                    continue
-                if not k.endswith("_loss"):
-                    continue
-                if v is None or not torch.is_tensor(v):
-                    continue
-
-                v_t = v.mean() if v.dim() > 0 else v
-                v_t = v_t.to(loss.device)
-                aux_loss = v_t if aux_loss is None else (aux_loss + v_t)
         else:
-            # Best-effort fallback for non-dict outputs
-            v = getattr(outputs, "speech_loss", None)
-            if v is not None and torch.is_tensor(v):
-                aux_loss = v.mean() if v.dim() > 0 else v
+            # Label smoothing for decoder-only models: shift labels by 1 token.
+            unwrapped_model = self.accelerator.unwrap_model(model)
+            shift_labels = not bool(getattr(getattr(unwrapped_model, "config", None), "is_encoder_decoder", False))
 
-        if aux_loss is not None:
-            loss = loss + aux_loss
+            # Locate logits for LabelSmoother. Prefer standard `logits`, fall back to `text_logits` (FunAudioChat),
+            # then to attribute `.logits`, and finally to the first tuple element for legacy tuple outputs.
+            logits = None
+            if isinstance(outputs, dict):
+                logits = outputs.get("logits")
+                if logits is None:
+                    logits = outputs.get("text_logits")
+            if logits is None and hasattr(outputs, "logits"):
+                logits = getattr(outputs, "logits")
+            if logits is None and hasattr(outputs, "text_logits"):
+                logits = getattr(outputs, "text_logits")
+            if logits is None and isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+                logits = outputs[0]
+
+            if logits is None:
+                raise ValueError(
+                    "Cannot locate logits for label smoothing. Expected `logits`/`text_logits` in model outputs."
+                )
+
+            loss = self.label_smoother({"logits": logits}, labels, shift_labels=shift_labels)
+
+            # Add any auxiliary losses returned by the model outputs, excluding the main `loss`.
+            aux_loss = None
+            if isinstance(outputs, dict):
+                for k, v in outputs.items():
+                    if k == "loss":
+                        continue
+                    if not k.endswith("_loss"):
+                        continue
+                    if v is None or not torch.is_tensor(v):
+                        continue
+
+                    v_t = v.mean() if v.dim() > 0 else v
+                    v_t = v_t.to(loss.device)
+                    aux_loss = v_t if aux_loss is None else (aux_loss + v_t)
+            else:
+                # Best-effort fallback for non-dict outputs
+                v = getattr(outputs, "speech_loss", None)
+                if v is not None and torch.is_tensor(v):
+                    aux_loss = v.mean() if v.dim() > 0 else v
+
+            if aux_loss is not None:
+                loss = loss + aux_loss
 
         if (
             self.args.average_tokens_across_devices
@@ -334,6 +344,31 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss *= self.accelerator.num_processes
 
         return (loss, outputs) if return_outputs else loss
+
+    def _update_effective_tokens_seen(self, model, inputs) -> None:
+        if not getattr(model, "training", False):
+            return
+
+        labels = inputs.get("labels")
+        if not torch.is_tensor(labels):
+            return
+
+        ignore_index = getattr(getattr(model, "config", None), "ignore_index", IGNORE_INDEX)
+        effective_mask = labels.ne(int(ignore_index))
+
+        audio_token_index = getattr(getattr(model, "config", None), "audio_token_index", None)
+        if audio_token_index is not None:
+            try:
+                effective_mask = effective_mask & labels.ne(int(audio_token_index))
+            except Exception:
+                pass
+
+        effective_tokens = effective_mask.sum()
+        effective_tokens = effective_tokens.to(device=self.args.device, dtype=torch.int64).detach()
+        effective_tokens = self.accelerator.gather(effective_tokens).sum()
+
+        prev = int(getattr(self.state, "num_effective_tokens_seen", 0) or 0)
+        setattr(self.state, "num_effective_tokens_seen", prev + int(effective_tokens.item()))
 
     @override
     def prediction_step(
@@ -410,7 +445,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             merged["labels"] = torch.cat([prompt_ignore, tgt_labels], dim=1)
 
             # If a standard 2D position_ids is present, rebuild it for the merged sequence.
-            if "position_ids" in merged and torch.is_tensor(merged["position_ids"]) and merged["position_ids"].dim() == 2:
+            if (
+                "position_ids" in merged
+                and torch.is_tensor(merged["position_ids"])
+                and merged["position_ids"].dim() == 2
+            ):
                 pos = torch.cumsum(merged["attention_mask"].long(), dim=1) - 1
                 merged["position_ids"] = pos.masked_fill(merged["attention_mask"] == 0, 0)
 
@@ -510,7 +549,6 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             merged = dict(self._default_gen_kwargs)
             merged.update(gen_kwargs)
             gen_kwargs = merged
-
         has_processing_class = hasattr(self, "processing_class")
         original_padding_side = self.processing_class.padding_side if has_processing_class else None
 

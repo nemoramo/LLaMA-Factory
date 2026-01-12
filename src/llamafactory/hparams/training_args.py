@@ -14,7 +14,7 @@
 
 import json
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Union
+from typing import Literal
 
 from transformers import Seq2SeqTrainingArguments
 from transformers.training_args import _convert_str_dict
@@ -40,7 +40,7 @@ else:
 class RayArguments:
     r"""Arguments pertaining to the Ray training."""
 
-    ray_run_name: Optional[str] = field(
+    ray_run_name: str | None = field(
         default=None,
         metadata={"help": "The training results will be saved at `<ray_storage_path>/ray_run_name`."},
     )
@@ -48,7 +48,7 @@ class RayArguments:
         default="./saves",
         metadata={"help": "The storage path to save training results to"},
     )
-    ray_storage_filesystem: Optional[Literal["s3", "gs", "gcs"]] = field(
+    ray_storage_filesystem: Literal["s3", "gs", "gcs"] | None = field(
         default=None,
         metadata={"help": "The storage filesystem to use. If None specified, local filesystem will be used."},
     )
@@ -56,7 +56,7 @@ class RayArguments:
         default=1,
         metadata={"help": "The number of workers for Ray training. Default is 1 worker."},
     )
-    resources_per_worker: Union[dict, str] = field(
+    resources_per_worker: dict | str = field(
         default_factory=lambda: {"GPU": 1},
         metadata={"help": "The resources per worker for Ray training. Default is to use 1 GPU per worker."},
     )
@@ -64,7 +64,7 @@ class RayArguments:
         default="PACK",
         metadata={"help": "The placement strategy for Ray training. Default is PACK."},
     )
-    ray_init_kwargs: Optional[Union[dict, str]] = field(
+    ray_init_kwargs: dict | str | None = field(
         default=None,
         metadata={"help": "The arguments to pass to ray.init for Ray training. Default is None."},
     )
@@ -92,7 +92,30 @@ class RayArguments:
 
 
 @dataclass
-class TrainingArguments(RayArguments, BaseTrainingArguments):
+class Fp8Arguments:
+    r"""Arguments pertaining to the FP8 training."""
+
+    fp8: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable FP8 mixed precision training via HuggingFace Accelerate. "
+            "Requires PyTorch 2.7+ and Hopper architecture GPUs."
+        },
+    )
+    fp8_backend: str = field(
+        default="auto",
+        metadata={
+            "help": "FP8 backend to use ('auto', 'torchao', 'te', 'msamp'). 'auto' selects best available backend."
+        },
+    )
+    fp8_enable_fsdp_float8_all_gather: bool = field(
+        default=False,
+        metadata={"help": "Enable FP8 optimizations for FSDP2 all-gather operations."},
+    )
+
+
+@dataclass
+class TrainingArguments(Fp8Arguments, RayArguments, BaseTrainingArguments):
     r"""Arguments pertaining to the trainer."""
 
     overwrite_output_dir: bool = field(

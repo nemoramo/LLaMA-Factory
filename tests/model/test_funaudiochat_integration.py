@@ -35,4 +35,3 @@ def test_funaudiochat_registration_template_plugin():
 
     plugin = get_mm_plugin(name="funaudiochat", audio_token="<|AUDIO|>")
     assert plugin.audio_token == "<|AUDIO|>"
-

@@ -1,28 +1,33 @@
-# Copyright (c) 2025, Alibaba Cloud and its affiliates;
+# Copyright 2025 the LlamaFactory team.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FunAudioChat model configuration"""
+"""FunAudioChat model configuration.
+
+Author: yufeng.ma
+"""
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
 from transformers.models.auto import CONFIG_MAPPING, AutoConfig
+from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)
 
 
 class FunAudioChatAudioEncoderConfig(PretrainedConfig):
-    r"""
-    This is the configuration class to store the configuration of a [`FunAudioChatEncoder`]. It is used to instantiate a
+    r"""This is the configuration class to store the configuration of a [`FunAudioChatEncoder`].
+
+    It is used to instantiate a
     Qwen2-Audio audio encoder according to the specified arguments, defining the model architecture. Instantiating a
     configuration with the defaults will yield a similar configuration to that of the audio encoder of the Qwen2-Audio
     architecture.
@@ -84,7 +89,6 @@ class FunAudioChatAudioEncoderConfig(PretrainedConfig):
             Padding token ID for the audio encoder.
 
     Example:
-
     ```python
     >>> from transformers import FunAudioChatEncoderConfig, FunAudioChatEncoder
 
@@ -96,7 +100,8 @@ class FunAudioChatAudioEncoderConfig(PretrainedConfig):
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
-    ```"""
+    ```
+    """
 
     model_type = "funaudiochat_audio_encoder"
 
@@ -143,7 +148,7 @@ class FunAudioChatAudioEncoderConfig(PretrainedConfig):
         self.max_source_positions = max_source_positions
         self.n_window = n_window
         self.output_dim = output_dim
-        
+
         # Additional audio encoder parameters
         self.bos_token_id = bos_token_id
         self.codebook_size = codebook_size
@@ -154,9 +159,11 @@ class FunAudioChatAudioEncoderConfig(PretrainedConfig):
         self.enable_audio_invert_tower = enable_audio_invert_tower
         self.pad_token_id = pad_token_id
 
+
 class FunAudioChatConfig(PretrainedConfig):
-    r"""
-    This is the configuration class to store the configuration of a [`FunAudioChatForConditionalGeneration`]. It is used to instantiate an
+    r"""This is the configuration class to store the configuration of a [`FunAudioChatForConditionalGeneration`].
+
+    It is used to instantiate an
     Qwen2-Audio model according to the specified arguments, defining the model architecture. Instantiating a configuration
     with the defaults will yield a similar configuration to that of the Qwen2-Audio.
 
@@ -178,7 +185,6 @@ class FunAudioChatConfig(PretrainedConfig):
             Hidden size of the model. If not specified, will use text_config.hidden_size.
 
     Example:
-
     ```python
     >>> from transformers import FunAudioChatForConditionalGeneration, FunAudioChatConfig, FunAudioChatEncoderConfig, Qwen2Config
 
@@ -196,7 +202,8 @@ class FunAudioChatConfig(PretrainedConfig):
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
-    ```"""
+    ```
+    """
 
     model_type = "funaudiochat"
     attribute_map = {
@@ -242,7 +249,7 @@ class FunAudioChatConfig(PretrainedConfig):
             text_config = CONFIG_MAPPING["qwen2"]()
 
         self.text_config = text_config
-        
+
         # Set hidden_size from text_config if not explicitly provided
         if hidden_size is None:
             self.hidden_size = self.text_config.hidden_size
@@ -252,4 +259,4 @@ class FunAudioChatConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-__all__ = ["FunAudioChatConfig", "FunAudioChatAudioEncoderConfig"]
+__all__ = ["FunAudioChatAudioEncoderConfig", "FunAudioChatConfig"]

@@ -1,3 +1,22 @@
+# Copyright 2025 the LlamaFactory team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Voxtral data processor.
+
+Author: yufeng.ma
+"""
+
 from __future__ import annotations
 
 import json
@@ -5,7 +24,7 @@ import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -203,7 +222,7 @@ def _get_voxtral_example_language(examples: dict[str, list[Any]], index: int, da
     )
 
 
-def _maybe_parse_audio_json(audio: str) -> Optional[dict[str, Any]]:
+def _maybe_parse_audio_json(audio: str) -> dict[str, Any] | None:
     audio = audio.strip()
     if not (audio.startswith("{") and audio.endswith("}")):
         return None
@@ -214,7 +233,7 @@ def _maybe_parse_audio_json(audio: str) -> Optional[dict[str, Any]]:
         return None
 
 
-def _normalize_audio_path(audio: "AudioInput") -> str:
+def _normalize_audio_path(audio: AudioInput) -> str:
     if not isinstance(audio, str):
         raise TypeError(f"Voxtral audio input must be a file path string, got {type(audio)}.")
 
@@ -253,8 +272,8 @@ def _content_with_audios(text: str, audio_iter: Any) -> str | list[dict[str, str
 def _build_voxtral_conversation(
     prompt: list[dict[str, str]],
     response: list[dict[str, str]],
-    system: Optional[str],
-    audios: list["AudioInput"],
+    system: str | None,
+    audios: list[AudioInput],
 ) -> list[dict[str, Any]]:
     audio_iter = iter(audios or [])
     conversation: list[dict[str, Any]] = []
@@ -279,7 +298,7 @@ def _build_voxtral_conversation(
 
 
 def _find_assistant_start(
-    tokenizer: "PreTrainedTokenizer",
+    tokenizer: PreTrainedTokenizer,
     input_ids: list[int],
     assistant_text: str,
     eos_suffix_ids: list[int],
@@ -300,13 +319,16 @@ def _find_assistant_start(
     # Fallback: search from the end for a match right before the EOS suffix.
     limit = len(input_ids) - suffix_len
     for i in range(limit - assistant_len, -1, -1):
-        if input_ids[i : i + assistant_len] == assistant_ids and input_ids[i + assistant_len : limit] == eos_suffix_ids:
+        if (
+            input_ids[i : i + assistant_len] == assistant_ids
+            and input_ids[i + assistant_len : limit] == eos_suffix_ids
+        ):
             return i
 
     raise ValueError("Failed to locate assistant content span in Voxtral tokenized sequence.")
 
 
-def _get_default_eos_suffix_ids(tokenizer: "PreTrainedTokenizer") -> list[int]:
+def _get_default_eos_suffix_ids(tokenizer: PreTrainedTokenizer) -> list[int]:
     # Best-effort: infer EOS suffix ids by probing a minimal chat.
     dummy = tokenizer.apply_chat_template(
         [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}],
@@ -338,11 +360,11 @@ class VoxtralSupervisedDatasetProcessor(DatasetProcessor):
         self,
         prompt: list[dict[str, str]],
         response: list[dict[str, str]],
-        system: Optional[str],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        language: Optional[str] = None,
+        system: str | None,
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        language: str | None = None,
     ) -> tuple[list[int], list[int]]:
         if len(response) != 1:
             raise ValueError("Voxtral supervised processor expects exactly one assistant response.")
@@ -421,7 +443,7 @@ class VoxtralSupervisedDatasetProcessor(DatasetProcessor):
                 )
 
             if len(prompt) % 2 != 1 or len(response) != 1:
-                logger.warning_rank0("Dropped invalid example: {}".format(prompt + response))
+                logger.warning_rank0(f"Dropped invalid example: {prompt + response}")
                 continue
 
             language = None
@@ -455,7 +477,7 @@ class VoxtralSupervisedDatasetProcessor(DatasetProcessor):
         print("input_ids:\n{}".format(example["input_ids"]))
         print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
         print("label_ids:\n{}".format(example["labels"]))
-        print("labels:\n{}".format(self.tokenizer.decode(valid_labels, skip_special_tokens=False)))
+        print(f"labels:\n{self.tokenizer.decode(valid_labels, skip_special_tokens=False)}")
 
 
 @dataclass
@@ -479,7 +501,7 @@ class VoxtralPackedSupervisedDatasetProcessor(VoxtralSupervisedDatasetProcessor)
                 )
 
             if len(prompt) % 2 != 1 or len(response) != 1:
-                logger.warning_rank0("Dropped invalid example: {}".format(prompt + response))
+                logger.warning_rank0(f"Dropped invalid example: {prompt + response}")
                 continue
 
             language = None
@@ -564,14 +586,14 @@ class VoxtralPackedSupervisedDatasetProcessor(VoxtralSupervisedDatasetProcessor)
 @dataclass
 class VoxtralUnsupervisedDatasetProcessor(DatasetProcessor):
     _eos_suffix_ids: list[int] = field(default_factory=list, init=False, repr=False)
-    _test_tokenizer: Optional["PreTrainedTokenizer"] = field(default=None, init=False, repr=False)
+    _test_tokenizer: PreTrainedTokenizer | None = field(default=None, init=False, repr=False)
 
     def _get_eos_suffix_ids(self) -> list[int]:
         if not self._eos_suffix_ids:
             self._eos_suffix_ids = _get_default_eos_suffix_ids(self.tokenizer)
         return self._eos_suffix_ids
 
-    def _get_test_tokenizer(self) -> "PreTrainedTokenizer":
+    def _get_test_tokenizer(self) -> PreTrainedTokenizer:
         if self._test_tokenizer is not None:
             return self._test_tokenizer
 
@@ -593,11 +615,11 @@ class VoxtralUnsupervisedDatasetProcessor(DatasetProcessor):
         self,
         prompt: list[dict[str, str]],
         response: list[dict[str, str]],
-        system: Optional[str],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        language: Optional[str] = None,
+        system: str | None,
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        language: str | None = None,
     ) -> tuple[list[int], list[int]]:
         eos_suffix_ids = self._get_eos_suffix_ids()
         use_chat_template = bool(getattr(self.data_args, "voxtral_chat_template", False))
@@ -667,7 +689,7 @@ class VoxtralUnsupervisedDatasetProcessor(DatasetProcessor):
                 )
 
             if len(prompt) % 2 != 1:
-                logger.warning_rank0("Dropped invalid example: {}".format(prompt + response))
+                logger.warning_rank0(f"Dropped invalid example: {prompt + response}")
                 continue
 
             language = None

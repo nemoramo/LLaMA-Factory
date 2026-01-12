@@ -80,6 +80,12 @@ def run_sft(
 
     # Metric utils
     metric_module = {}
+    if model_args.use_kt:
+        if training_args.predict_with_generate:
+            raise NotImplementedError("`predict_with_generate` is not supported in KTransformers SFT yet.")
+        elif finetuning_args.compute_accuracy:
+            raise NotImplementedError("`compute_accuracy` is not supported in KTransformers SFT yet.")
+
     if training_args.predict_with_generate:
         metric_module["compute_metrics"] = ComputeSimilarity(
             tokenizer=tokenizer, compute_wer_cer=finetuning_args.compute_wer_cer
@@ -126,18 +132,38 @@ def run_sft(
     gen_kwargs.setdefault("do_sample", False)
 
     # Initialize our Trainer
-    trainer = CustomSeq2SeqTrainer(
-        model=model,
-        args=training_args,
-        finetuning_args=finetuning_args,
-        data_collator=train_data_collator if training_args.do_train else eval_data_collator,
-        eval_data_collator=eval_data_collator,
-        callbacks=callbacks,
-        gen_kwargs=gen_kwargs,
-        **dataset_module,
-        **tokenizer_module,
-        **metric_module,
-    )
+    if model_args.use_kt:
+        from ktransformers.sft.lora import KTrainer  # type: ignore
+        from ktransformers.util.globals import GLOBAL_CONFIG  # type: ignore
+
+        GLOBAL_CONFIG._config["mod"] = "sft"
+
+        data_collator = train_data_collator if training_args.do_train else eval_data_collator
+        trainer = KTrainer(
+            model=model,
+            args=training_args,
+            tokenizer=tokenizer_module,
+            data_collator=data_collator,
+            callbacks=callbacks,
+            **dataset_module,
+            **metric_module,
+        )
+        trainer.model_accepts_loss_kwargs = False
+        model.config.use_cache = False
+
+    else:
+        trainer = CustomSeq2SeqTrainer(
+            model=model,
+            args=training_args,
+            finetuning_args=finetuning_args,
+            data_collator=train_data_collator if training_args.do_train else eval_data_collator,
+            eval_data_collator=eval_data_collator,
+            callbacks=callbacks,
+            gen_kwargs=gen_kwargs,
+            **dataset_module,
+            **tokenizer_module,
+            **metric_module,
+        )
 
     # Training
     if training_args.do_train:

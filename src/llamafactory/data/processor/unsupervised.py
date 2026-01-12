@@ -70,9 +70,7 @@ class UnsupervisedDatasetProcessor(DatasetProcessor):
                 )
 
             if len(prompt) % 2 != 1:
-                logger.warning_rank0(
-                    "Dropped invalid example: {}".format(prompt + response)
-                )
+                logger.warning_rank0(f"Dropped invalid example: {prompt + response}")
                 continue
 
             input_ids, labels = self._encode_data_example(

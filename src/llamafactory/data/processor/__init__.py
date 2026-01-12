@@ -18,7 +18,11 @@ from .pretrain import PretrainDatasetProcessor
 from .processor_utils import DatasetProcessor
 from .supervised import PackedSupervisedDatasetProcessor, SupervisedDatasetProcessor
 from .unsupervised import UnsupervisedDatasetProcessor
-from .voxtral import VoxtralPackedSupervisedDatasetProcessor, VoxtralSupervisedDatasetProcessor, VoxtralUnsupervisedDatasetProcessor
+from .voxtral import (
+    VoxtralPackedSupervisedDatasetProcessor,
+    VoxtralSupervisedDatasetProcessor,
+    VoxtralUnsupervisedDatasetProcessor,
+)
 
 
 __all__ = [
@@ -29,7 +33,7 @@ __all__ = [
     "PretrainDatasetProcessor",
     "SupervisedDatasetProcessor",
     "UnsupervisedDatasetProcessor",
-    "VoxtralSupervisedDatasetProcessor",
     "VoxtralPackedSupervisedDatasetProcessor",
+    "VoxtralSupervisedDatasetProcessor",
     "VoxtralUnsupervisedDatasetProcessor",
 ]

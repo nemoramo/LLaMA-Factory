@@ -20,9 +20,9 @@ import hashlib
 import math
 import random
 import threading
-from queue import Empty, Full, Queue
 from collections import defaultdict
 from collections.abc import Sequence
+from queue import Empty, Full, Queue
 from typing import Any
 
 import torch
@@ -320,11 +320,7 @@ class DynamicPromptDataset(Dataset):
 
         # If chosen entry provides completion override, apply it.
         if isinstance(chosen, dict):
-            completion = (
-                chosen.get("completion")
-                or chosen.get("response")
-                or chosen.get("output")
-            )
+            completion = chosen.get("completion") or chosen.get("response") or chosen.get("output")
             if completion is not None:
                 completion_str = str(completion)
                 if len(response_messages) > 0:
@@ -855,7 +851,12 @@ class DynamicPromptPackedBatchProcessor:
                 if not isinstance(aligned, dict):
                     dropped_invalid += 1
                     continue
-                if isinstance(self.id_key, str) and self.id_key and self.id_key in row and row[self.id_key] is not None:
+                if (
+                    isinstance(self.id_key, str)
+                    and self.id_key
+                    and self.id_key in row
+                    and row[self.id_key] is not None
+                ):
                     aligned[self.id_key] = row[self.id_key]
                 example = aligned
             else:
@@ -869,7 +870,7 @@ class DynamicPromptPackedBatchProcessor:
             if len(prompt) % 2 != 1 or len(response) != 1:
                 dropped_invalid += 1
                 if warned < warn_limit:
-                    logger.warning_rank0("Dropped invalid example: {}".format(prompt + response))
+                    logger.warning_rank0(f"Dropped invalid example: {prompt + response}")
                     warned += 1
                 continue
 
@@ -951,23 +952,9 @@ class DynamicPromptPackedBatchProcessor:
             worker_id = worker_info.id if worker_info else 0
 
             logger.info_rank0(
-                "Dynamic prompt packing stats (worker={}): total kept={}/{} ({:.2%}), "
-                "dropped_invalid={}, dropped_long={}, dropped_encode={}; window kept={}/{} ({:.2%}), "
-                "dropped_invalid={}, dropped_long={}, dropped_encode={}.".format(
-                    worker_id,
-                    kept_total,
-                    seen_total,
-                    total_keep_ratio,
-                    dropped_invalid_total,
-                    dropped_long_total,
-                    dropped_encode_total,
-                    window_kept,
-                    window_seen,
-                    window_keep_ratio,
-                    window_drop_invalid,
-                    window_drop_long,
-                    window_drop_encode,
-                )
+                f"Dynamic prompt packing stats (worker={worker_id}): total kept={kept_total}/{seen_total} ({total_keep_ratio:.2%}), "
+                f"dropped_invalid={dropped_invalid_total}, dropped_long={dropped_long_total}, dropped_encode={dropped_encode_total}; window kept={window_kept}/{window_seen} ({window_keep_ratio:.2%}), "
+                f"dropped_invalid={window_drop_invalid}, dropped_long={window_drop_long}, dropped_encode={window_drop_encode}."
             )
 
             self._last_log_seen_total = seen_total
@@ -990,7 +977,9 @@ class DynamicPromptPackedBatchProcessor:
             return {}, [], []
 
         if len(items) != len(lengths):
-            raise ValueError(f"Dynamic prompt packing internal error: len(items)={len(items)} != len(lengths)={len(lengths)}")
+            raise ValueError(
+                f"Dynamic prompt packing internal error: len(items)={len(items)} != len(lengths)={len(lengths)}"
+            )
 
         cutoff_len = int(self.data_args.cutoff_len)
         if cutoff_len <= 0:
@@ -1178,16 +1167,16 @@ def build_dynamic_prompt_packed_iterable_dataset(
 
     if carryover_packs > 0:
         logger.info_rank0(
-            "Dynamic prompt packing: enable cross-buffer carryover (carryover_packs={}). "
-            "This may improve packing efficiency but slightly changes sample order.".format(carryover_packs)
+            f"Dynamic prompt packing: enable cross-buffer carryover (carryover_packs={carryover_packs}). "
+            "This may improve packing efficiency but slightly changes sample order."
         )
         if prefetch_buffers <= 0:
             prefetch_buffers = 1
 
     if prefetch_buffers > 0:
         logger.info_rank0(
-            "Dynamic prompt packing: enable packed-buffer prefetch (prefetch_buffers={}). "
-            "This may reduce dataloader stalls but increases CPU/RAM usage.".format(prefetch_buffers)
+            f"Dynamic prompt packing: enable packed-buffer prefetch (prefetch_buffers={prefetch_buffers}). "
+            "This may reduce dataloader stalls but increases CPU/RAM usage."
         )
         return _DynamicPromptPackedPrefetchDataset(
             iterable_ds=iterable_ds,

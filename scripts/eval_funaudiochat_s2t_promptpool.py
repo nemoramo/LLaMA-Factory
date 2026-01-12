@@ -1,6 +1,18 @@
-#!/usr/bin/env python3
-"""
-Batch ASR evaluation for FunAudioChat (S2T) using prompt_pool (language hint + normalized prompt).
+# Copyright 2025 the LlamaFactory team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Batch ASR evaluation for FunAudioChat (S2T) using prompt_pool (language hint + normalized prompt).
 
 What it does:
 1) Runs LLaMA-Factory `do_predict=true predict_with_generate=true` on a fixed suite of Hausa/Swahili testsets.
@@ -10,6 +22,8 @@ Notes:
 - `dynamic_prompt_sampling=true` is required so prompt_pool top1 entry is appended to the system prompt
   during evaluation tokenization (aligned with training promptpool behavior).
 - This script is meant to be run inside the `llamafactory` conda env.
+
+Author: yufeng.ma
 """
 
 from __future__ import annotations
@@ -21,9 +35,9 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 
 @dataclass(frozen=True)

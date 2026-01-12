@@ -1,32 +1,48 @@
-# Copyright (c) 2025, Alibaba Cloud and its affiliates;
+# Copyright 2025 the LlamaFactory team.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Processor class for FunAudioChat.
+"""Processor class for FunAudioChat.
+
+Author: yufeng.ma
 """
 
+import json
+import os
 import warnings
-from typing import List, Union, BinaryIO
+from typing import TYPE_CHECKING, BinaryIO, Union
 
 import numpy as np
-
+import torch
 from transformers.feature_extraction_utils import BatchFeature
-from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack, AudioKwargs, TextKwargs
+from transformers.processing_utils import (
+    PROCESSOR_NAME,
+    AudioKwargs,
+    PreTrainedTokenizerBase,
+    ProcessingKwargs,
+    ProcessorMixin,
+    TextKwargs,
+    Unpack,
+    custom_object_save,
+    logger,
+)
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.processing_utils import logger, PROCESSOR_NAME, PreTrainedTokenizerBase, custom_object_save
-import os
-import json
-import torch
+
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
+
 try:
     import librosa  # type: ignore
 except Exception:  # noqa: BLE001
@@ -37,13 +53,18 @@ from transformers.utils import (
     CHAT_TEMPLATE_DIR,
     CHAT_TEMPLATE_FILE,
     LEGACY_PROCESSOR_CHAT_TEMPLATE_FILE,
-    PROCESSOR_NAME,
 )
+
+
+# Type aliases
+AudioInput = Union[str, BinaryIO, np.ndarray]
+
 
 class FunAudioChatAudioKwargs(AudioKwargs, total=False):
     speech_kwargs: TextKwargs = {
         **TextKwargs.__annotations__,
     }
+
 
 class FunAudioChatProcessorKwargs(ProcessingKwargs, total=False):
     audio_kwargs: FunAudioChatAudioKwargs = {
@@ -53,15 +74,12 @@ class FunAudioChatProcessorKwargs(ProcessingKwargs, total=False):
         "text_kwargs": {
             "padding": False,
         },
-        "audio_kwargs": {
-            "speech_kwargs": {}
-        }
+        "audio_kwargs": {"speech_kwargs": {}},
     }
 
 
 class FunAudioChatProcessor(ProcessorMixin):
-    r"""
-    Constructs a FunAudioChat processor which wraps a FunAudioChat feature extractor and a FunAudioChat tokenizer into a single processor.
+    r"""Constructs a FunAudioChat processor which wraps a FunAudioChat feature extractor and a FunAudioChat tokenizer into a single processor.
 
     [`FunAudioChatProcessor`] offers all the functionalities of [`WhisperFeatureExtractor`] and [`FunAudioChatTokenizerFast`]. See the
     [`~FunAudioChatProcessor.__call__`] and [`~FunAudioChatProcessor.decode`] for more information.
@@ -83,7 +101,14 @@ class FunAudioChatProcessor(ProcessorMixin):
     """
 
     attributes = ["feature_extractor", "speech_tokenizer", "tokenizer"]
-    valid_kwargs = ["chat_template", "audio_token", "audio_bos_token", "audio_eos_token", "audio_pad_token", "audio_group_size"]
+    valid_kwargs = [
+        "chat_template",
+        "audio_token",
+        "audio_bos_token",
+        "audio_eos_token",
+        "audio_pad_token",
+        "audio_group_size",
+    ]
     feature_extractor_class = "WhisperFeatureExtractor"
     speech_tokenizer_class = "AutoTokenizer"
     tokenizer_class = "AutoTokenizer"
@@ -137,14 +162,15 @@ class FunAudioChatProcessor(ProcessorMixin):
     @deprecate_kwarg("audios", version="4.54.0", new_name="audio")
     def __call__(
         self,
-        text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
-        audio: Union[np.ndarray, List[np.ndarray]] = None,
-        speech: Union[PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
+        text: Union[TextInput, PreTokenizedInput, list[TextInput], list[PreTokenizedInput]] = None,
+        audio: Union[np.ndarray, list[np.ndarray]] = None,
+        speech: Union[PreTokenizedInput, list[TextInput], list[PreTokenizedInput]] = None,
         audios=None,  # kept for BC
         **kwargs: Unpack[FunAudioChatProcessorKwargs],
     ) -> BatchFeature:
-        """
-        Main method to prepare for the model one or several sequences(s) and audio(s). This method forwards the `text`
+        """Main method to prepare for the model one or several sequences(s) and audio(s).
+
+        This method forwards the `text`
         and `kwargs` arguments to FunAudioChatTokenizerFast's [`~FunAudioChatTokenizerFast.__call__`] if `text` is not `None` to encode
         the text. To prepare the audio(s), this method forwards the `audios` and `kwrags` arguments to
         WhisperFeatureExtractor's [`~WhisperFeatureExtractor.__call__`] if `audios` is not `None`. Please refer to the docstring
@@ -157,8 +183,13 @@ class FunAudioChatProcessor(ProcessorMixin):
                 `is_split_into_words=True` (to lift the ambiguity with a batch of sequences).
             audio (`np.ndarray`, `List[np.ndarray]`):
                 The audio or batch of audios to be prepared. Each audio can be a NumPy array.
+            speech (`Union[PreTokenizedInput, List[TextInput], List[PreTokenizedInput]]`, *optional*):
+                Speech tokens for the audio inputs.
+            audios (*optional*):
+                Deprecated parameter kept for backward compatibility. Use `audio` instead.
+            **kwargs:
+                Additional keyword arguments passed to the processor.
         """
-
         # Handle BC when user passes deprecated keyword argument
         if audios is not None and audio is None:
             audio = audios
@@ -184,7 +215,7 @@ class FunAudioChatProcessor(ProcessorMixin):
         if audio is not None:
             # Check if audio is a list of numpy arrays (wav_list) or JSON strings
             is_wav_list = isinstance(audio[0], np.ndarray) if isinstance(audio, list) and len(audio) > 0 else False
-            
+
             if is_wav_list:
                 # Handle wav_list input: list of numpy arrays
                 audio_wavs = audio
@@ -196,14 +227,21 @@ class FunAudioChatProcessor(ProcessorMixin):
                             "Please install it, e.g. `pip install librosa`."
                         )
                     # Resample audio to the specified sampling rate
-                    audio_wavs = [librosa.resample(wav, orig_sr=output_kwargs["audio_kwargs"]["sampling_rate"], target_sr=getattr(self, "audio_sampling_rate", 16000)) for wav in audio_wavs]
+                    audio_wavs = [
+                        librosa.resample(
+                            wav,
+                            orig_sr=output_kwargs["audio_kwargs"]["sampling_rate"],
+                            target_sr=getattr(self, "audio_sampling_rate", 16000),
+                        )
+                        for wav in audio_wavs
+                    ]
                     output_kwargs["audio_kwargs"].pop("sampling_rate")
-                
+
                 # Calculate speech tokens based on 25Hz frame rate
                 # Assuming audio_sampling_rate is 16000 Hz
                 sampling_rate = getattr(self, "audio_sampling_rate", 16000)
                 frame_rate = 25  # 25 Hz
-                
+
                 speech = []
                 for wav in audio_wavs:
                     # Calculate number of frames at 25Hz
@@ -212,13 +250,13 @@ class FunAudioChatProcessor(ProcessorMixin):
                     # Construct speech token with audio_pad_token
                     speech_token = self.audio_pad_token * num_frames
                     speech.append(speech_token)
-                
-                parsed_audios = [{'path': '', 'token': token} for token in speech]
+
+                parsed_audios = [{"path": "", "token": token} for token in speech]
             else:
                 # Handle original JSON string format
                 parsed_audios = [json.loads(au) for au in audio]
-                audio_path = [audio_data['path'] for audio_data in parsed_audios if audio_data['path'] != '']
-                speech = [audio_data['token'] for audio_data in parsed_audios]
+                audio_path = [audio_data["path"] for audio_data in parsed_audios if audio_data["path"] != ""]
+                speech = [audio_data["token"] for audio_data in parsed_audios]
                 audio_wavs = None
 
             # ensure we have as much audios as audio tokens
@@ -228,7 +266,7 @@ class FunAudioChatProcessor(ProcessorMixin):
                 raise ValueError(
                     f"Found {num_audio_tokens} {self.audio_token} token{'s' if num_audio_tokens > 1 else ''} in provided text but received {num_audios} audio{'s' if num_audios > 1 else ''}"
                 )
-            
+
             # Some kwargs should not be changed so we can expand text with audio tokens below
             output_kwargs["audio_kwargs"]["speech_kwargs"]["return_attention_mask"] = True
             output_kwargs["audio_kwargs"]["speech_kwargs"]["return_token_type_ids"] = False
@@ -247,7 +285,7 @@ class FunAudioChatProcessor(ProcessorMixin):
                 while self.audio_token in sample:
                     speech_length = speech_lengths.pop(0)
                     num_audio_tokens = (speech_length + (self.audio_group_size - 1)) // self.audio_group_size
-    
+
                     expanded_audio_token = self.audio_token * int(num_audio_tokens)
 
                     audio_token_start_idx = sample.find(self.audio_token)
@@ -287,15 +325,25 @@ class FunAudioChatProcessor(ProcessorMixin):
                 output_kwargs["audio_kwargs"]["return_attention_mask"] = True
                 output_kwargs["audio_kwargs"]["padding"] = "max_length"
                 # output_kwargs["audio_kwargs"]["padding"] = True
-                wav_inputs = self.feature_extractor(audio_wavs, sampling_rate=getattr(self, "audio_sampling_rate", 16000), **output_kwargs["audio_kwargs"])
+                wav_inputs = self.feature_extractor(
+                    audio_wavs,
+                    sampling_rate=getattr(self, "audio_sampling_rate", 16000),
+                    **output_kwargs["audio_kwargs"],
+                )
 
                 # rename attention_mask to prevent conflicts later on
                 wav_inputs["feature_attention_mask"] = wav_inputs.pop("attention_mask")
                 if is_wav_list:
                     # For wav_list, all audios exist
-                    wav_inputs['feature_exist_mask'] = torch.ones(len(audio_wavs), dtype=torch.bool, device=wav_inputs['feature_attention_mask'].device)
+                    wav_inputs["feature_exist_mask"] = torch.ones(
+                        len(audio_wavs), dtype=torch.bool, device=wav_inputs["feature_attention_mask"].device
+                    )
                 else:
-                    wav_inputs['feature_exist_mask'] = torch.tensor([audio_data['path'] != '' for audio_data in parsed_audios], dtype=torch.bool, device=wav_inputs['feature_attention_mask'].device)
+                    wav_inputs["feature_exist_mask"] = torch.tensor(
+                        [audio_data["path"] != "" for audio_data in parsed_audios],
+                        dtype=torch.bool,
+                        device=wav_inputs["feature_attention_mask"].device,
+                    )
                 audio_inputs.update(wav_inputs)
 
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
@@ -308,24 +356,26 @@ class FunAudioChatProcessor(ProcessorMixin):
         return BatchFeature(data={**inputs}, tensor_type=return_tensors)
 
     def batch_decode(self, *args, **kwargs):
-        """
-        This method forwards all its arguments to FunAudioChatTokenizerFast's [`~PreTrainedTokenizer.batch_decode`]. Please
+        """This method forwards all its arguments to FunAudioChatTokenizerFast's [`~PreTrainedTokenizer.batch_decode`].
+
+        Please
         refer to the docstring of this method for more information.
         """
         return self.tokenizer.batch_decode(*args, **kwargs)
 
     def decode(self, *args, **kwargs):
-        """
-        This method forwards all its arguments to FunAudioChatTokenizerFast's [`~PreTrainedTokenizer.decode`]. Please refer to
+        """This method forwards all its arguments to FunAudioChatTokenizerFast's [`~PreTrainedTokenizer.decode`].
+
+        Please refer to
         the docstring of this method for more information.
         """
         return self.tokenizer.decode(*args, **kwargs)
 
     @classmethod
     def _get_arguments_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        """
-        Identify and instantiate the subcomponents of Processor classes, like image processors and
-        tokenizers. This method uses the Processor attributes like `tokenizer_class` to figure out what class those
+        """Identify and instantiate the subcomponents of Processor classes, like image processors and tokenizers.
+
+        This method uses the Processor attributes like `tokenizer_class` to figure out what class those
         subcomponents should be. Note that any subcomponents must either be library classes that are accessible in
         the `transformers` root, or they must be custom code that has been registered with the relevant autoclass,
         via methods like `AutoTokenizer.register()`. If neither of these conditions are fulfilled, this method
@@ -354,7 +404,7 @@ class FunAudioChatProcessor(ProcessorMixin):
             else:
                 attribute_class = cls.get_possibly_dynamic_module(class_name)
             if attribute_name == "speech_tokenizer":
-                extra_kwargs = {'subfolder': attribute_name}
+                extra_kwargs = {"subfolder": attribute_name}
             else:
                 extra_kwargs = {}
             args.append(attribute_class.from_pretrained(pretrained_model_name_or_path, **kwargs, **extra_kwargs))
@@ -367,9 +417,9 @@ class FunAudioChatProcessor(ProcessorMixin):
         return list(dict.fromkeys(tokenizer_input_names + feature_extractor_input_names + ["feature_attention_mask"]))
 
     def save_pretrained(self, save_directory, push_to_hub: bool = False, **kwargs):
-        """
-        Saves the attributes of this processor (feature extractor, tokenizer...) in the specified directory so that it
-        can be reloaded using the [`~ProcessorMixin.from_pretrained`] method.
+        """Saves the attributes of this processor (feature extractor, tokenizer...) in the specified directory.
+
+        It can be reloaded using the [`~ProcessorMixin.from_pretrained`] method.
 
         <Tip>
 
@@ -513,26 +563,38 @@ class FunAudioChatProcessor(ProcessorMixin):
     @property
     # NOTE: we don't have default templates anymore, and the below is kept only because the hub config is not yet updated!
     def default_chat_template(self):
-        """
-        This default vicuna template formats inputs in the form of a chat history. For each message in the chat history:
+        """This default vicuna template formats inputs in the form of a chat history.
+
+        For each message in the chat history:
         * the template will output the role of the speaker followed by the content of the message.
         * content is a list of strings and audios.
-        * If the content element is an audio, the template will output a sequence of <|AUDIO|> tokens
+        * If the content element is an audio, the template will output a sequence of <|AUDIO|> tokens.
 
         Example:
-
         ```python
         messages = [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {"role": "user", "content": [
-                {"type": "audio", "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/glass-breaking-151256.mp3"},
-                {"type": "text", "text": "What's that sound?"},
-            ]},
+            {"role": "system", "content": "You are a helpful assistant."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio",
+                        "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/glass-breaking-151256.mp3",
+                    },
+                    {"type": "text", "text": "What's that sound?"},
+                ],
+            },
             {"role": "assistant", "content": "It is the sound of glass shattering."},
-            {"role": "user", "content": [
-                {"type": "audio", "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/f2641_0_throatclearing.wav"},
-                {"type": "text", "text": "How about this one?"},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio",
+                        "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/f2641_0_throatclearing.wav",
+                    },
+                    {"type": "text", "text": "How about this one?"},
+                ],
+            },
         ]
 
         result = template.render(messages=messages, add_generation_prompt=True)

@@ -16,7 +16,7 @@ import os
 from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 import numpy as np
-from datasets import Dataset, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 
 from ..extras import logging
 from ..extras.constants import FILEEXT2TYPE
@@ -292,14 +292,14 @@ def _load_single_dataset(
 
 
 def _get_merged_dataset(
-    dataset_names: Optional[list[str]],
+    dataset_names: list[str] | None,
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
     stage: Literal["pt", "sft", "rm", "ppo", "kto"],
     lazy_align: bool = False,
     return_dict: bool = False,
-) -> Optional[Union["Dataset", "IterableDataset", dict[str, "Dataset"]]]:
+) -> Union["Dataset", "IterableDataset", dict[str, "Dataset"]] | None:
     r"""Return the merged datasets in the standard format."""
     if dataset_names is None:
         return None
@@ -320,7 +320,9 @@ def _get_merged_dataset(
         if (stage == "rm" and dataset_attr.ranking is False) or (stage != "rm" and dataset_attr.ranking is True):
             raise ValueError("The dataset is not applicable in the current training stage.")
 
-        datasets[dataset_name] = _load_single_dataset(dataset_attr, model_args, data_args, training_args, lazy_align=lazy_align)
+        datasets[dataset_name] = _load_single_dataset(
+            dataset_attr, model_args, data_args, training_args, lazy_align=lazy_align
+        )
 
     if return_dict:
         return datasets
@@ -375,7 +377,7 @@ def _get_dataset_processor(
 
 
 def _get_preprocessed_dataset(
-    dataset: Optional[Union["Dataset", "IterableDataset"]],
+    dataset: Union["Dataset", "IterableDataset"] | None,
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
     stage: Literal["pt", "sft", "rm", "ppo", "kto"],
@@ -383,7 +385,7 @@ def _get_preprocessed_dataset(
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"] = None,
     is_eval: bool = False,
-) -> Optional[Union["Dataset", "IterableDataset"]]:
+) -> Union["Dataset", "IterableDataset"] | None:
     r"""Preprocesses the dataset, including format checking and tokenization."""
     if dataset is None:
         return None
@@ -463,7 +465,9 @@ def get_dataset(
             and (getattr(data_args, "dynamic_prompt_lazy_align", True) or bool(data_args.packing))
             and stage == "sft"
         )
-        dataset = _get_merged_dataset(data_args.dataset, model_args, data_args, training_args, stage, lazy_align=lazy_align_train)
+        dataset = _get_merged_dataset(
+            data_args.dataset, model_args, data_args, training_args, stage, lazy_align=lazy_align_train
+        )
         eval_dataset = _get_merged_dataset(
             data_args.eval_dataset,
             model_args,
@@ -475,56 +479,22 @@ def get_dataset(
         )
 
     with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):
-        dataset = _get_preprocessed_dataset(
-            dataset, data_args, training_args, stage, template, tokenizer, processor, is_eval=False
-        )
-        if isinstance(eval_dataset, dict):
-            for eval_name, eval_data in eval_dataset.items():
-                eval_dataset[eval_name] = _get_preprocessed_dataset(
-                    eval_data, data_args, training_args, stage, template, tokenizer, processor, is_eval=True
-                )
-        else:
-            eval_dataset = _get_preprocessed_dataset(
-                eval_dataset, data_args, training_args, stage, template, tokenizer, processor, is_eval=True
+        # move front to make sure eval_dataset(if contain or split) can preprocessed appropriately
+        train_dict, eval_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
+
+        if "train" in train_dict:
+            train_dict["train"] = _get_preprocessed_dataset(
+                train_dict["train"], data_args, training_args, stage, template, tokenizer, processor, is_eval=False
             )
 
-        dataset_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
+        for key in eval_dict:
+            eval_dict[key] = _get_preprocessed_dataset(
+                eval_dict[key], data_args, training_args, stage, template, tokenizer, processor, is_eval=True
+            )
 
-        # In dynamic prompt sampling mode, train_dataset stays aligned/raw.
-        # If validation split is derived from train_dataset (val_size),
-        # it must be tokenized explicitly for evaluation.
-        if (
-            (data_args.dynamic_prompt_sampling or getattr(data_args, "dynamic_prompt_packing", False))
-            and stage == "sft"
-            and not data_args.streaming
-        ):
-            # Be robust to different split names returned by split_dataset().
-            val_key = None
-            for k in ("validation", "eval", "dev", "test"):
-                if k in dataset_dict:
-                    val_key = k
-                    break
-            if val_key is None:
-                for k in dataset_dict.keys():
-                    if k.startswith("validation_"):
-                        val_key = k
-                        break
+        # Combine train and eval dictionaries
+        dataset_dict = DatasetDict({**train_dict, **eval_dict})
 
-            if val_key is not None:
-                val_ds = dataset_dict[val_key]
-                col_names = getattr(val_ds, "column_names", None)
-                if isinstance(col_names, (list, tuple)) and "input_ids" not in col_names:
-                    logger.info_rank0(f"Dynamic prompt sampling enabled: tokenizing {val_key} split.")
-                    dataset_dict[val_key] = _get_preprocessed_dataset(
-                        val_ds,
-                        data_args=data_args,
-                        training_args=training_args,
-                        stage=stage,
-                        template=template,
-                        tokenizer=tokenizer,
-                        processor=processor,
-                        is_eval=True,
-                    )
         if (
             data_args.tokenized_path is not None
             and not data_args.dynamic_prompt_sampling
@@ -547,7 +517,9 @@ def get_dataset(
                     raise ValueError("`dynamic_prompt_packing` requires `packing=true` (SFT only).")
 
                 if data_args.packing:
-                    max_samples_per_pack = int(getattr(data_args, "dynamic_prompt_packing_max_samples_per_pack", 8) or 8)
+                    max_samples_per_pack = int(
+                        getattr(data_args, "dynamic_prompt_packing_max_samples_per_pack", 8) or 8
+                    )
                     max_steps = int(getattr(training_args, "max_steps", 0) or 0)
                     if max_steps <= 0:
                         raise ValueError(
@@ -619,7 +591,9 @@ def get_dataset(
                     dataset_converter = None
                     id_key = None
                     col_names = getattr(train_ds, "column_names", None)
-                    is_aligned = isinstance(col_names, (list, tuple)) and "_prompt" in col_names and "_response" in col_names
+                    is_aligned = (
+                        isinstance(col_names, (list, tuple)) and "_prompt" in col_names and "_response" in col_names
+                    )
                     if not is_aligned:
                         dataset_names = data_args.dataset or []
                         if len(dataset_names) == 0:
@@ -693,6 +667,8 @@ def get_dataset(
                         data_args=data_args,
                         seed=training_args.seed,
                     )
-                    logger.info_rank0("Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling.")
+                    logger.info_rank0(
+                        "Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling."
+                    )
 
         return dataset_module
