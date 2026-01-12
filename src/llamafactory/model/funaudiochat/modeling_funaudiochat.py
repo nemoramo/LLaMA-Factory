@@ -30,13 +30,34 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.generation.logits_process import LogitsProcessorList, NoBadWordsLogitsProcessor
-from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutput, CausalLMOutput, ModelOutput
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.models.auto import AutoConfig, AutoModel, AutoModelForCausalLM
-from transformers.utils import auto_docstring
+
+
+try:
+    from transformers.utils import auto_docstring
+except Exception:  # noqa: BLE001
+
+    def auto_docstring(*args, **kwargs):
+        def decorator(obj):
+            return obj
+
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+
+        return decorator
+
 
 from .configuration_funaudiochat import FunAudioChatAudioEncoderConfig, FunAudioChatConfig
+
+
+try:
+    from transformers.modeling_layers import GradientCheckpointingLayer
+except Exception:  # noqa: BLE001
+    # Backward compatibility for transformers<4.56 (no `transformers.modeling_layers`).
+    class GradientCheckpointingLayer(nn.Module):
+        pass
 
 
 if TYPE_CHECKING:
