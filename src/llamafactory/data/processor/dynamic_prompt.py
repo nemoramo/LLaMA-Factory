@@ -38,6 +38,26 @@ from .supervised import SupervisedDatasetProcessor
 logger = logging.get_logger(__name__)
 
 
+def _is_voxtral_processor(processor: Any | None) -> bool:
+    return processor is not None and processor.__class__.__name__ == "VoxtralProcessor"
+
+
+def _get_voxtral_language_from_example(example: dict[str, Any], data_args: Any) -> str:
+    for key in ("language", "lang", "_language", "_lang"):
+        value = example.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    fallback = getattr(data_args, "voxtral_transcription_language", None)
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback.strip()
+
+    raise ValueError(
+        "Voxtral transcription template requires a language. "
+        "Set `voxtral_transcription_language` or provide a per-sample `lang`/`language` column."
+    )
+
+
 class DynamicPromptDataset(Dataset):
     """Wraps an aligned HF dataset to sample prompts dynamically at access time.
 
@@ -73,10 +93,18 @@ class DynamicPromptDataset(Dataset):
         self._rng: random.Random | None = None
         self._rng_seeded: bool = False
 
-        # Reuse the supervised processor for encoding logic.
-        self.encoder = SupervisedDatasetProcessor(
-            template=template, tokenizer=tokenizer, processor=processor, data_args=data_args
-        )
+        self._is_voxtral = _is_voxtral_processor(processor)
+        if self._is_voxtral:
+            from .voxtral import VoxtralSupervisedDatasetProcessor
+
+            self.encoder = VoxtralSupervisedDatasetProcessor(
+                template=template, tokenizer=tokenizer, processor=processor, data_args=data_args
+            )
+        else:
+            # Reuse the supervised processor for encoding logic.
+            self.encoder = SupervisedDatasetProcessor(
+                template=template, tokenizer=tokenizer, processor=processor, data_args=data_args
+            )
 
         # Fail-fast schema check (helps catch "loaded tokenized dataset" mistakes).
         column_names = getattr(dataset, "column_names", None)
@@ -226,6 +254,8 @@ class DynamicPromptDataset(Dataset):
         return values[int(h % len(values))]
 
     def _sample_pool_choice(self, example: dict[str, Any]) -> Any | None:
+        if not getattr(self.data_args, "dynamic_prompt_sampling", False):
+            return None
         pool = example.get("_prompt_pool")
         if not (isinstance(pool, list) and len(pool) > 0):
             return None
@@ -300,6 +330,37 @@ class DynamicPromptDataset(Dataset):
 
         return response_messages
 
+    def _encode_example(
+        self,
+        example: dict[str, Any],
+        *,
+        prompt: list[dict[str, Any]],
+        response: list[dict[str, Any]],
+        system: str | None,
+    ) -> tuple[list[int], list[int]]:
+        if self._is_voxtral:
+            use_chat_template = bool(getattr(self.data_args, "voxtral_chat_template", False))
+            language = None if use_chat_template else _get_voxtral_language_from_example(example, self.data_args)
+            return self.encoder._encode_data_example(  # type: ignore[attr-defined]
+                prompt=prompt,
+                response=response,
+                system=system,
+                images=example.get("_images") or [],
+                videos=example.get("_videos") or [],
+                audios=example.get("_audios") or [],
+                language=language,
+            )
+
+        return self.encoder._encode_data_example(  # type: ignore[attr-defined]
+            prompt=prompt,
+            response=response,
+            system=system,
+            tools=example.get("_tools"),
+            images=example.get("_images") or [],
+            videos=example.get("_videos") or [],
+            audios=example.get("_audios") or [],
+        )
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         example = self.dataset[idx]
 
@@ -335,15 +396,7 @@ class DynamicPromptDataset(Dataset):
             response = self._build_response_messages(example, chosen)
 
             try:
-                input_ids, labels = self.encoder._encode_data_example(
-                    prompt=prompt,
-                    response=response,
-                    system=system,
-                    tools=example.get("_tools"),
-                    images=example.get("_images") or [],
-                    videos=example.get("_videos") or [],
-                    audios=example.get("_audios") or [],
-                )
+                input_ids, labels = self._encode_example(example, prompt=prompt, response=response, system=system)
                 last_error = None
                 break
             except ValueError as err:
@@ -410,9 +463,17 @@ class DynamicPromptPackedBatchProcessor:
         self._rng: random.Random | None = None
         self._rng_seeded: bool = False
 
-        self.encoder = SupervisedDatasetProcessor(
-            template=template, tokenizer=tokenizer, processor=processor, data_args=data_args
-        )
+        self._is_voxtral = _is_voxtral_processor(processor)
+        if self._is_voxtral:
+            from .voxtral import VoxtralSupervisedDatasetProcessor
+
+            self.encoder = VoxtralSupervisedDatasetProcessor(
+                template=template, tokenizer=tokenizer, processor=processor, data_args=data_args
+            )
+        else:
+            self.encoder = SupervisedDatasetProcessor(
+                template=template, tokenizer=tokenizer, processor=processor, data_args=data_args
+            )
 
     def _get_rng(self) -> random.Random:
         if self._rng is None:
@@ -520,6 +581,8 @@ class DynamicPromptPackedBatchProcessor:
         return values[int(h % len(values))]
 
     def _sample_pool_choice(self, example: dict[str, Any]) -> Any | None:
+        if not getattr(self.data_args, "dynamic_prompt_sampling", False):
+            return None
         pool = example.get("_prompt_pool")
         if not (isinstance(pool, list) and len(pool) > 0):
             return None
@@ -586,6 +649,37 @@ class DynamicPromptPackedBatchProcessor:
                     response_messages.append({"role": Role.ASSISTANT.value, "content": completion_str})
 
         return response_messages
+
+    def _encode_example(
+        self,
+        example: dict[str, Any],
+        *,
+        prompt: list[dict[str, Any]],
+        response: list[dict[str, Any]],
+        system: str | None,
+    ) -> tuple[list[int], list[int]]:
+        if self._is_voxtral:
+            use_chat_template = bool(getattr(self.data_args, "voxtral_chat_template", False))
+            language = None if use_chat_template else _get_voxtral_language_from_example(example, self.data_args)
+            return self.encoder._encode_data_example(  # type: ignore[attr-defined]
+                prompt=prompt,
+                response=response,
+                system=system,
+                images=example.get("_images") or [],
+                videos=example.get("_videos") or [],
+                audios=example.get("_audios") or [],
+                language=language,
+            )
+
+        return self.encoder._encode_data_example(  # type: ignore[attr-defined]
+            prompt=prompt,
+            response=response,
+            system=system,
+            tools=example.get("_tools"),
+            images=example.get("_images") or [],
+            videos=example.get("_videos") or [],
+            audios=example.get("_audios") or [],
+        )
 
     def _pack_segments(
         self,
@@ -786,14 +880,11 @@ class DynamicPromptPackedBatchProcessor:
             system = self._build_system_message(example, chosen)
 
             try:
-                input_ids, labels = self.encoder._encode_data_example(
+                input_ids, labels = self._encode_example(
+                    example,
                     prompt=prompt_messages,
                     response=response_messages,
                     system=system,
-                    tools=example.get("_tools"),
-                    images=example.get("_images") or [],
-                    videos=example.get("_videos") or [],
-                    audios=example.get("_audios") or [],
                 )
             except Exception as err:
                 dropped_encode += 1

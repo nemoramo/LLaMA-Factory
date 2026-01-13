@@ -338,7 +338,9 @@ class CustomPPOTrainer(PPOTrainer, Trainer):
     def create_scheduler(
         self, training_args: "Seq2SeqTrainingArguments", num_training_steps: int, optimizer: "torch.optim.Optimizer"
     ) -> "torch.optim.lr_scheduler.LRScheduler":
-        create_custom_scheduler(training_args, num_training_steps, optimizer)
+        custom_scheduler = create_custom_scheduler(training_args, num_training_steps, optimizer)
+        if custom_scheduler is not None:
+            return custom_scheduler
         lr_scheduler = get_scheduler(
             training_args.lr_scheduler_type,
             optimizer=optimizer,

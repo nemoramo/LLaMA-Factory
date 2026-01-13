@@ -49,11 +49,13 @@ except Exception:  # noqa: BLE001
     librosa = None
 
 
-from transformers.utils import (
-    CHAT_TEMPLATE_DIR,
-    CHAT_TEMPLATE_FILE,
-    LEGACY_PROCESSOR_CHAT_TEMPLATE_FILE,
-)
+try:
+    from transformers.utils import CHAT_TEMPLATE_DIR, CHAT_TEMPLATE_FILE, LEGACY_PROCESSOR_CHAT_TEMPLATE_FILE
+except Exception:  # noqa: BLE001
+    # Backward compatibility for older transformers versions.
+    CHAT_TEMPLATE_DIR = "additional_chat_templates"
+    CHAT_TEMPLATE_FILE = "chat_template.jinja"
+    LEGACY_PROCESSOR_CHAT_TEMPLATE_FILE = "chat_template.json"
 
 
 # Type aliases

@@ -150,3 +150,29 @@ PY
 - `TIMEOUT_S`（默认 `10`）
 - `READY_TIMEOUT_S`（默认 `120`）
 - `SGLANG_CMD`（默认空；设置后外层服务会在容器内拉起 SGLang）
+
+---
+
+## 常见问题
+
+### 1) `BrokenPipeError: [Errno 32] Broken pipe` / `SGLang not ready ... Connection refused`
+
+这通常表示 **SGLang 进程已崩溃或未成功监听端口**，外层服务在等待 `http://127.0.0.1:30000/v1/models` 就绪时连接被拒绝。
+
+建议按以下顺序排查：
+
+1. 先确认 SGLang 是否还在跑、30000 端口是否在监听（容器内执行）：
+
+   ```bash
+   ps -ef | grep -E "sglang\\.launch_server|launch_server" | grep -v grep
+   ss -lntp | grep 30000 || true
+   curl -sS http://127.0.0.1:30000/v1/models || true
+   ```
+
+2. 若日志显示在 “Capturing cuda graph …” 后崩溃，优先尝试 **关闭 CUDA Graph**（稳定性更好，吞吐可能略降）：
+
+   ```bash
+   -e SGLANG_CMD="python3 -m sglang.launch_server ... --disable-cuda-graph"
+   ```
+
+3. 仍不稳定时，再尝试降低启动负载（例如减小 `--context-length`、`--max-running-requests`），并把 SGLang 单独前台启动以获取更完整的报错日志。

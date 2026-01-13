@@ -30,7 +30,6 @@ from urllib.parse import urlparse
 
 import numpy as np
 import torch
-import torchaudio
 from transformers.image_utils import get_image_size, is_valid_image, to_numpy_array
 from transformers.models.mllama.processing_mllama import (
     convert_sparse_cross_attention_mask_to_dense,
@@ -40,6 +39,7 @@ from typing_extensions import override
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
+
 
 # Optional S3 support. Only used when audio paths start with s3://
 try:
@@ -52,6 +52,12 @@ try:
     from pydub import AudioSegment  # type: ignore[import-untyped]
 except Exception:  # noqa: BLE001
     AudioSegment = None
+
+# Optional librosa support. Fallback backend for audio loading when pydub is unavailable.
+try:
+    import librosa  # type: ignore[import-untyped]
+except Exception:  # noqa: BLE001
+    librosa = None
 
 
 if is_pillow_available():
@@ -390,7 +396,7 @@ class MMPluginMixin:
                     except Exception:  # noqa: BLE001
                         pass
 
-            if "librosa" in globals():
+            if librosa is not None:
                 y, sr = librosa.load(audio, sr=sampling_rate)
                 return y, sr
 
@@ -428,7 +434,7 @@ class MMPluginMixin:
                         except Exception:  # noqa: BLE001
                             pass
 
-                if "librosa" in globals():
+                if librosa is not None:
                     y, sr = librosa.load(bio, sr=sampling_rate)
                     return y, sr
 
@@ -444,7 +450,7 @@ class MMPluginMixin:
                 except Exception:  # noqa: BLE001
                     pass
 
-            if "librosa" in globals():
+            if librosa is not None:
                 y, sr = librosa.load(path, sr=sampling_rate)
                 return y, sr
 
@@ -2641,11 +2647,11 @@ class LFMVLPlugin(BasePlugin):
     @override
     def _get_mm_inputs(
         self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: "MMProcessor",
-    ) -> dict[str, "torch.Tensor"]:
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor,
+    ) -> dict[str, torch.Tensor]:
         image_processor: BaseImageProcessor = getattr(processor, "image_processor", None)
         mm_inputs = {}
         if len(images) != 0:
@@ -2661,10 +2667,10 @@ class LFMVLPlugin(BasePlugin):
     def process_messages(
         self,
         messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: Optional[MMProcessor],
     ) -> list[dict[str, str]]:
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
