@@ -972,6 +972,7 @@ class DynamicPromptPackedBatchProcessor:
 
         Returns (packed, carry_items, carry_lengths). `carryover_packs` holds back a number of lowest-fill packed
         sequences (by sum(lengths)/capacity) and returns their raw segments for cross-buffer mixing.
+        To ensure forward progress, the number of held-back packs is capped to `len(packs) - 1` per buffer.
         """
         if not items:
             return {}, [], []
@@ -1031,7 +1032,8 @@ class DynamicPromptPackedBatchProcessor:
 
         carryover_packs = int(carryover_packs or 0)
         keep_pack_ids: set[int] = set()
-        if carryover_packs > 0 and len(packs) > carryover_packs:
+        if carryover_packs > 0 and len(packs) > 1:
+            carryover_packs = min(carryover_packs, len(packs) - 1)
             fills = [sum(lengths[i] for i in pack) for pack in packs]
             worst = sorted(range(len(packs)), key=lambda j: fills[j])[:carryover_packs]
             keep_pack_ids = set(worst)
