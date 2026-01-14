@@ -54,6 +54,54 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Hugging Face Datasets cache compatibility
+#
+# Older `datasets` versions serialized list features with `_type: "List"` in
+# cached `dataset_info.json` and Arrow schema metadata. Newer versions (e.g.
+# datasets>=3) dropped the `List` feature type in favor of `Sequence`/`LargeList`.
+# When users upgrade `datasets` without rebuilding caches, loading datasets can
+# fail with:
+#   ValueError: Feature type 'List' not found.
+#
+# We patch the Datasets feature deserializer to keep existing caches readable.
+# In legacy caches, list features were serialized as `_type: "List"` (with a
+# nested `feature`), whereas newer versions use either:
+#   - `Sequence(feature=...)` for lists of scalars, or
+#   - Python list shorthand (`[{...}]`) for lists of structs.
+# The compatibility shim below converts legacy `List` to the appropriate modern
+# representation based on the inner `feature` type.
+# ---------------------------------------------------------------------------
+try:
+    from datasets.features import features as _ds_features  # type: ignore
+
+    if hasattr(_ds_features, "generate_from_dict") and hasattr(_ds_features, "_FEATURE_TYPES"):
+        _orig_generate_from_dict = _ds_features.generate_from_dict  # type: ignore[attr-defined]
+
+        def _generate_from_dict_compat(obj: Any):  # type: ignore[no-redef]
+            if isinstance(obj, list):
+                return [_generate_from_dict_compat(v) for v in obj]
+
+            if not isinstance(obj, dict) or "_type" not in obj or isinstance(obj.get("_type"), dict):
+                if isinstance(obj, dict):
+                    return {k: _generate_from_dict_compat(v) for k, v in obj.items()}
+                return obj
+
+            if obj.get("_type") == "List":
+                obj = dict(obj)
+                obj.pop("_type", None)
+                feature = _generate_from_dict_compat(obj.get("feature"))
+                if isinstance(feature, dict):
+                    return [feature]
+
+                return _ds_features.Sequence(feature=feature, length=obj.get("length", -1))  # type: ignore[attr-defined]
+
+            return _orig_generate_from_dict(obj)
+
+        _ds_features.generate_from_dict = _generate_from_dict_compat  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 
 class _LazyAlignTransform:
     """A picklable callable transform for HF `Dataset.with_transform(...)`.

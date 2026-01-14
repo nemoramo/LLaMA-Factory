@@ -25,7 +25,7 @@ import re
 from copy import deepcopy
 from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, BinaryIO, Literal, NotRequired, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, BinaryIO, Literal, Optional, TypedDict, Union
 from urllib.parse import urlparse
 
 import numpy as np
@@ -35,7 +35,7 @@ from transformers.models.mllama.processing_mllama import (
     convert_sparse_cross_attention_mask_to_dense,
     get_cross_attention_token_mask,
 )
-from typing_extensions import override
+from typing_extensions import NotRequired, override
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than

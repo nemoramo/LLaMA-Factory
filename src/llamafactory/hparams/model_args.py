@@ -17,11 +17,12 @@
 
 import json
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Literal, Self
+from typing import Any, Literal
 
 import torch
 from omegaconf import OmegaConf
 from transformers.training_args import _convert_str_dict
+from typing_extensions import Self
 
 from ..extras.constants import AttentionFunction, EngineName, QuantizationMethod, RopeScaling
 from ..extras.logging import get_logger

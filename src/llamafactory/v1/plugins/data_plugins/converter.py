@@ -14,7 +14,9 @@
 
 
 import json
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, TypedDict
+
+from typing_extensions import NotRequired
 
 from ...utils import logging
 from ...utils.plugin import BasePlugin

@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, Union
+
+from typing_extensions import NotRequired
 
 
 if TYPE_CHECKING:

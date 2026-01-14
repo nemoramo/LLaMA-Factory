@@ -91,6 +91,8 @@ def patch_voxtral_inplace_audio_embed() -> None:
             audio_embeds = self.get_audio_embeds(input_features)
             audio_token_mask = input_ids == self.config.audio_token_id
             inputs_embeds = inputs_embeds.clone()
+            if audio_embeds.dtype != inputs_embeds.dtype:
+                audio_embeds = audio_embeds.to(dtype=inputs_embeds.dtype)
             inputs_embeds[audio_token_mask] = audio_embeds
 
         return self.language_model(

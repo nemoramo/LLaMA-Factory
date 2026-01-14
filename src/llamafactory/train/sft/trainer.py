@@ -48,6 +48,20 @@ logger = logging.get_logger(__name__)
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
 
+    @override
+    def _load_rng_state(self, checkpoint: Optional[str]) -> None:
+        """Load RNG states from checkpoint in a torch>=2.6-compatible way."""
+        env_key = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
+        previous = os.environ.get(env_key)
+        os.environ[env_key] = "1"
+        try:
+            super()._load_rng_state(checkpoint)
+        finally:
+            if previous is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = previous
+
     @contextmanager
     def _temporary_funaudiochat_eval_audio_attn(self, model: torch.nn.Module, implementation: str = "sdpa") -> "Any":
         r"""Temporarily switch FunAudioChat audio encoder attention for eval/predict.
