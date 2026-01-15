@@ -32,7 +32,10 @@
 {"path": "/abs/path/to.wav", "token": "<|audio_pad|><|audio_pad|>..."}
 ```
 
-如果省略/留空 `token`，插件会从波形持续时间推断 25Hz 帧数，并构建仅由 pad 组成的 token 序列。
+如果省略/留空 `token`，插件需要得到 25Hz 帧数来构建仅由 pad 组成的 token 序列：
+
+- 推荐（更快，适用于 mp3/m4a/...）：在 JSON 里补充 `duration`（单位：秒）。
+- 兜底：从 `_segXXXX_<start>-<end>.wav` 文件名推断，其次读取音频元信息（ffprobe），最后才会解码波形。
 
 ## 示例配置
 

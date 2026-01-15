@@ -15,7 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import random
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
@@ -26,6 +28,7 @@ from peft import PeftModel
 from torch.utils.data import get_worker_info
 from transformers import DataCollatorForSeq2Seq
 
+from ..extras import logging
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
 
@@ -43,6 +46,9 @@ if TYPE_CHECKING:
     from transformers import ProcessorMixin
 
     from .template import Template
+
+
+logger = logging.get_logger(__name__)
 
 
 def prepare_4d_attention_mask(attention_mask_with_indices: "torch.Tensor", dtype: "torch.dtype") -> "torch.Tensor":
@@ -275,10 +281,57 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 raise ValueError("Template is required for audio SpecAugment.")
 
             audio_sampling_rate = getattr(self.processor, "audio_sampling_rate", 16000)
-            augmented_audios: list[np.ndarray] = []
+            max_retries = int(os.getenv("LLAMAFACTORY_AUDIO_LOAD_RETRIES", "1"))
+            retry_sleep_sec = float(os.getenv("LLAMAFACTORY_AUDIO_LOAD_RETRY_SLEEP", "0.2"))
+            log_limit = int(os.getenv("LLAMAFACTORY_AUDIO_LOAD_ERROR_LOG_LIMIT", "20"))
+            logged = int(getattr(self, "_audio_specaug_error_logged", 0))
+            suppressed = bool(getattr(self, "_audio_specaug_error_suppressed", False))
+
+            augmented_audios: list[Any] = []
             for audio in batch_audios:
-                y, _ = self.template.mm_plugin._load_single_audio(audio, float(audio_sampling_rate))
+                # Best-effort SpecAugment: if waveform loading fails, keep the original audio and let the
+                # model/plugin handle retries + loss masking later.
+                if isinstance(audio, np.ndarray):
+                    augmented_audios.append(self._apply_audio_specaugment(audio))
+                    continue
+
+                last_error: Exception | None = None
+                y: np.ndarray | None = None
+                for attempt in range(max(0, max_retries) + 1):
+                    try:
+                        y, _ = self.template.mm_plugin._load_single_audio(audio, float(audio_sampling_rate))
+                        last_error = None
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        last_error = e
+                        is_not_found = isinstance(e, FileNotFoundError) or (
+                            isinstance(e, OSError) and getattr(e, "errno", None) == 2
+                        )
+                        if is_not_found or attempt >= max(0, max_retries):
+                            break
+                        time.sleep(retry_sleep_sec * float(attempt + 1))
+
+                if last_error is not None or y is None:
+                    augmented_audios.append(audio)
+                    if logged < log_limit:
+                        logger.warning_rank0(
+                            "SpecAugment skipped due to audio load error (audio=%r): %s",
+                            audio,
+                            repr(last_error),
+                        )
+                        logged += 1
+                    elif not suppressed:
+                        logger.warning_rank0(
+                            "Too many SpecAugment audio load errors (%d+); suppressing further logs.",
+                            log_limit,
+                        )
+                        suppressed = True
+                    continue
+
                 augmented_audios.append(self._apply_audio_specaugment(y))
+
+            setattr(self, "_audio_specaug_error_logged", logged)
+            setattr(self, "_audio_specaug_error_suppressed", suppressed)
             batch_audios = augmented_audios
 
         mm_inputs = self.template.mm_plugin.get_mm_inputs(
@@ -291,12 +344,129 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_input_ids,
             self.processor,
         )
+        audio_feature_load_fail = mm_inputs.pop("feature_load_fail_mask", None)
         if "token_type_ids" in mm_inputs:
             token_type_ids = mm_inputs.pop("token_type_ids")
             for i, feature in enumerate(features):
                 feature["token_type_ids"] = token_type_ids[i]
 
         features: dict[str, torch.Tensor] = super().__call__(features)
+
+        if audio_feature_load_fail is not None:
+            try:
+                fail_list = (
+                    audio_feature_load_fail.to(dtype=torch.bool, device="cpu").tolist()
+                    if torch.is_tensor(audio_feature_load_fail)
+                    else list(audio_feature_load_fail)
+                )
+            except Exception:
+                fail_list = None
+
+            if fail_list and any(bool(x) for x in fail_list):
+                # Identify which packed segments to mask. For neat packing, `attention_mask` contains segment ids (1..N).
+                # We mask the entire segment's labels when its audio waveform cannot be loaded after retries.
+                labels = features.get("labels")
+                input_ids = features.get("input_ids")
+                attn = features.get("attention_mask")
+                if torch.is_tensor(labels) and torch.is_tensor(input_ids) and torch.is_tensor(attn) and labels.ndim == 2:
+                    expected_audios = int(sum(int(x) for x in batch_audlens)) if batch_audlens else 0
+                    if expected_audios and len(fail_list) != expected_audios:
+                        logger.warning_rank0(
+                            "Audio load-fail mask length mismatch: got %d, expected %d. "
+                            "Falling back to masking whole samples that contain any failed audio.",
+                            len(fail_list),
+                            expected_audios,
+                        )
+                        fail_list = (fail_list + [False] * expected_audios)[:expected_audios]
+
+                    audio_token_id = None
+                    if self.model is not None and getattr(self.model, "config", None) is not None:
+                        audio_token_id = getattr(self.model.config, "audio_token_index", None)
+                    if audio_token_id is None and self.template.mm_plugin.audio_token is not None:
+                        try:
+                            audio_token_id = int(self.tokenizer.convert_tokens_to_ids(self.template.mm_plugin.audio_token))
+                        except Exception:
+                            audio_token_id = None
+
+                    use_segment_ids = attn.dtype != torch.bool
+                    try:
+                        use_segment_ids = use_segment_ids and int(attn.max().item()) > 1
+                    except Exception:
+                        use_segment_ids = False
+
+                    speech_attn = mm_inputs.get("speech_attention_mask", None)
+                    audio_group_size = 5
+                    if self.processor is not None:
+                        audio_group_size = int(getattr(self.processor, "audio_group_size", 5) or 5)
+
+                    audio_seqlens: list[int] | None = None
+                    if torch.is_tensor(speech_attn) and speech_attn.ndim == 2 and audio_group_size > 0:
+                        lengths = speech_attn.to(dtype=torch.long, device="cpu").sum(-1).tolist()
+                        audio_seqlens = [int((int(l) + audio_group_size - 1) // audio_group_size) for l in lengths]
+                        if expected_audios and len(audio_seqlens) != expected_audios:
+                            logger.warning_rank0(
+                                "Audio seqlen list length mismatch: got %d, expected %d. "
+                                "Falling back to masking whole samples that contain any failed audio.",
+                                len(audio_seqlens),
+                                expected_audios,
+                            )
+                            audio_seqlens = (audio_seqlens + [1] * expected_audios)[:expected_audios]
+
+                    # Walk through each batch item and mask labels for segments whose audio failed.
+                    audio_offset = 0
+                    bsz = int(labels.shape[0])
+                    for b in range(bsz):
+                        audlen = int(batch_audlens[b]) if b < len(batch_audlens) else 0
+                        if audlen <= 0:
+                            continue
+
+                        sub_fail = fail_list[audio_offset : audio_offset + audlen]
+                        if not any(bool(x) for x in sub_fail):
+                            audio_offset += audlen
+                            continue
+
+                        # Fallback: if we can't map to segment ids, ignore the whole packed sample.
+                        if not use_segment_ids or audio_token_id is None or audio_seqlens is None:
+                            labels[b].fill_(IGNORE_INDEX)
+                            audio_offset += audlen
+                            continue
+
+                        seqlens_slice = audio_seqlens[audio_offset : audio_offset + audlen]
+                        audio_offset += audlen
+
+                        audio_pos = (input_ids[b] == int(audio_token_id)).nonzero(as_tuple=False).flatten().tolist()
+                        pos_cursor = 0
+                        seg_ids: set[int] = set()
+                        mapping_failed = False
+                        for j in range(audlen):
+                            n = int(seqlens_slice[j]) if j < len(seqlens_slice) else 0
+                            if n < 0:
+                                n = 0
+                            positions = audio_pos[pos_cursor : pos_cursor + n]
+                            pos_cursor += n
+
+                            if not bool(sub_fail[j]):
+                                continue
+
+                            seg_id = None
+                            for p in positions:
+                                v = int(attn[b, p].item())
+                                if v != 0:
+                                    seg_id = v
+                                    break
+                            if seg_id is None:
+                                mapping_failed = True
+                                break
+                            seg_ids.add(int(seg_id))
+
+                        if mapping_failed or len(seg_ids) == 0:
+                            labels[b].fill_(IGNORE_INDEX)
+                            continue
+
+                        for seg_id in seg_ids:
+                            labels[b].masked_fill_(attn[b] == int(seg_id), IGNORE_INDEX)
+
+                    features["labels"] = labels
 
         if self.get_rope_func is not None:
             rope_index_kwargs = {

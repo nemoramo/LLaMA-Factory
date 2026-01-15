@@ -51,6 +51,7 @@ Notes:
 
 import argparse
 import json
+import math
 import os
 import re
 import wave
@@ -157,6 +158,16 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:  # noqa: BLE001
         return default
+
+
+def _safe_duration_sec(value: Any) -> Optional[float]:
+    try:
+        d = float(value)
+    except Exception:  # noqa: BLE001
+        return None
+    if not math.isfinite(d) or d < 0:
+        return None
+    return d
 
 
 def _pick_from_prompt_pool(prompt_pool: Any, keywords: tuple[str, ...]) -> Optional[str]:
@@ -288,6 +299,12 @@ def convert_file(
                 raise ValueError(f"Expect 1 audio per sample, but got {len(audios)} at line {n_in}.")
 
             audio_path = audios[0]
+            duration_value = obj.get("audio_duration")
+            if duration_value is None:
+                duration_value = obj.get("duration")
+            duration_sec = _safe_duration_sec(duration_value)
+            if duration_sec is None and isinstance(obj.get("durations"), list) and len(obj.get("durations")) == 1:
+                duration_sec = _safe_duration_sec(obj["durations"][0])
             prompt_pool = obj.get("prompt_pool")
 
             normalized_text = _pick_from_prompt_pool(prompt_pool, keywords=("normalized", "lowercased"))
@@ -311,6 +328,8 @@ def convert_file(
                 "text": normalized_text,
                 "ref_text": original_text,
             }
+            if duration_sec is not None:
+                audio_item["duration"] = duration_sec
             if not no_token:
                 token_str = _build_pad_token_str(
                     audio_path,

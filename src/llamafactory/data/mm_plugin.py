@@ -22,6 +22,8 @@ import json
 import math
 import os
 import re
+import threading
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from io import BytesIO
@@ -38,6 +40,7 @@ from transformers.models.mllama.processing_mllama import (
 from typing_extensions import NotRequired, override
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
+from ..extras import logging
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
 
 
@@ -53,11 +56,23 @@ try:
 except Exception:  # noqa: BLE001
     AudioSegment = None
 
+# Optional pydub mediainfo support. Uses ffprobe to fetch metadata without decoding.
+try:
+    from pydub.utils import mediainfo as pydub_mediainfo  # type: ignore[import-untyped]
+except Exception:  # noqa: BLE001
+    pydub_mediainfo = None
+
 # Optional librosa support. Fallback backend for audio loading when pydub is unavailable.
 try:
     import librosa  # type: ignore[import-untyped]
 except Exception:  # noqa: BLE001
     librosa = None
+
+# Optional soundfile support. Fast path for wav/flac/ogg-style local audio.
+try:
+    import soundfile as soundfile  # type: ignore[import-untyped]
+except Exception:  # noqa: BLE001
+    soundfile = None
 
 
 if is_pillow_available():
@@ -112,6 +127,9 @@ if TYPE_CHECKING:
 
         def _get_number_of_features(self, orig_height: int, orig_width: int, height: int, width: int) -> int:
             pass
+
+
+logger = logging.get_logger(__name__)
 
 
 def _get_paligemma_token_type_ids(imglens: list[int], seqlens: list[int], processor: MMProcessor) -> list[list[int]]:
@@ -443,7 +461,25 @@ class MMPluginMixin:
                     "Please install at least one of them, e.g. `pip install pydub`."
                 )
 
-            # Local path – prefer pydub, fall back to librosa
+            # Local path – prefer soundfile (fast for wav/flac/ogg), then pydub, then librosa.
+            if soundfile is not None:
+                try:
+                    data, sr = soundfile.read(path, dtype="float32", always_2d=True)
+                    if not isinstance(sr, (int, float)) or sr <= 0:
+                        raise ValueError(f"Invalid sampling rate from soundfile: {sr!r}")
+                    waveform = data.mean(axis=1).astype(np.float32) if data.shape[1] > 1 else data[:, 0].astype(np.float32)
+                    target_sr = int(sampling_rate) if sampling_rate is not None else int(sr)
+                    if int(sr) != int(target_sr):
+                        if librosa is None:
+                            raise ImportError("Resampling requires `librosa`.")
+                        waveform = librosa.resample(waveform, orig_sr=int(sr), target_sr=int(target_sr)).astype(
+                            np.float32
+                        )
+                        sr = target_sr
+                    return waveform, float(sr)
+                except Exception:  # noqa: BLE001
+                    pass
+
             if AudioSegment is not None:
                 try:
                     return self._load_audio_with_pydub(path, sampling_rate)
@@ -1767,6 +1803,77 @@ class FunAudioChatPlugin(BasePlugin):
     token_fps: int = 25  # FunAudioChat uses 25Hz discrete frames.
     _segment_duration_re = re.compile(r"_seg\d+_(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\.wav$")
 
+    _duration_cache_max_size: int = 20000
+
+    def _get_duration_cache(self) -> tuple[dict[str, float], threading.Lock]:
+        cache = getattr(self, "_audio_duration_sec_cache", None)
+        lock = getattr(self, "_audio_duration_sec_cache_lock", None)
+        if cache is None or lock is None:
+            cache = {}
+            lock = threading.Lock()
+            setattr(self, "_audio_duration_sec_cache", cache)
+            setattr(self, "_audio_duration_sec_cache_lock", lock)
+        return cache, lock
+
+    def _cache_get_duration_sec(self, path: str) -> float | None:
+        cache, lock = self._get_duration_cache()
+        with lock:
+            return cache.get(path)
+
+    def _cache_set_duration_sec(self, path: str, duration_sec: float) -> None:
+        if not (isinstance(duration_sec, (int, float)) and math.isfinite(duration_sec) and duration_sec >= 0):
+            return
+        cache, lock = self._get_duration_cache()
+        with lock:
+            if len(cache) >= int(self._duration_cache_max_size):
+                cache.clear()
+            cache[path] = float(duration_sec)
+
+    def _probe_duration_sec(self, path: str) -> float | None:
+        if not isinstance(path, str) or path == "":
+            return None
+        if path.startswith("file://"):
+            path = path[7:]
+
+        # Avoid probing non-local URIs here.
+        if path.startswith("s3://"):
+            return None
+
+        # Fast path: soundfile header (wav/flac/ogg/etc).
+        if soundfile is not None:
+            try:
+                info = soundfile.info(path)
+                frames = getattr(info, "frames", None)
+                sr = getattr(info, "samplerate", None)
+                if isinstance(frames, int) and isinstance(sr, int) and frames >= 0 and sr > 0:
+                    return float(frames) / float(sr)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Fallback: ffprobe via pydub.utils.mediainfo (works for mp3/m4a/...)
+        if pydub_mediainfo is not None:
+            try:
+                meta = pydub_mediainfo(path)
+                if isinstance(meta, dict):
+                    dur = meta.get("duration")
+                    if dur is not None:
+                        d = float(dur)
+                        if math.isfinite(d) and d >= 0:
+                            return d
+            except Exception:  # noqa: BLE001
+                pass
+
+        return None
+
+    def _get_audio_duration_sec(self, path: str) -> float | None:
+        cached = self._cache_get_duration_sec(path)
+        if cached is not None:
+            return cached
+        dur = self._probe_duration_sec(path)
+        if dur is not None:
+            self._cache_set_duration_sec(path, dur)
+        return dur
+
     def _parse_audio_json(self, audio: str) -> dict | None:
         audio = audio.strip()
         if not (audio.startswith("{") and audio.endswith("}")):
@@ -1777,24 +1884,65 @@ class FunAudioChatPlugin(BasePlugin):
         except Exception:  # noqa: BLE001
             return None
 
-    def _extract_audio_fields(self, audio: AudioInput) -> tuple[str | None, str | None]:
-        r"""Return (path, token_str) if available."""
+    def _extract_audio_fields(self, audio: AudioInput) -> tuple[str | None, str | None, float | None, int | None]:
+        r"""Return (path, token_str, duration_sec, num_frames) if available."""
         if not isinstance(audio, str):
-            return None, None
+            return None, None, None, None
 
         obj = self._parse_audio_json(audio)
         if obj is None:
-            return audio, None  # treat as plain path
+            return audio, None, None, None  # treat as plain path
 
         path = obj.get("path") or obj.get("wav_path") or obj.get("audio_path")
         token = obj.get("token")
-        return path or None, token or None
+
+        duration_sec = None
+        for k in ("duration_sec", "duration_secs", "duration_seconds", "duration"):
+            if k not in obj:
+                continue
+            try:
+                d = float(obj.get(k))
+                if math.isfinite(d) and d >= 0:
+                    duration_sec = d
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        if duration_sec is None:
+            for k in ("duration_ms", "duration_msec"):
+                if k not in obj:
+                    continue
+                try:
+                    d_ms = float(obj.get(k))
+                    d = d_ms / 1000.0
+                    if math.isfinite(d) and d >= 0:
+                        duration_sec = d
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+        num_frames = None
+        for k in ("num_frames", "num_frames_25hz"):
+            if k not in obj:
+                continue
+            try:
+                nf = int(obj.get(k))
+                if nf >= 0:
+                    num_frames = nf
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        if duration_sec is not None and path:
+            self._cache_set_duration_sec(str(path), duration_sec)
+
+        return path or None, token or None, duration_sec, num_frames
 
     @override
     def _load_single_audio(self, audio: AudioInput, sampling_rate: float) -> tuple[NDArray, float]:
         # Support JSON-encoded audio items (from FunAudioChat dataset format).
         if isinstance(audio, str):
-            path, _ = self._extract_audio_fields(audio)
+            path, _, _, _ = self._extract_audio_fields(audio)
             if path is None or path == "":
                 return np.zeros(0, dtype=np.float32), float(sampling_rate)
             audio = path
@@ -1812,13 +1960,15 @@ class FunAudioChatPlugin(BasePlugin):
 
         for audio in audios:
             if isinstance(audio, str):
-                path, token = self._extract_audio_fields(audio)
+                path, token, duration_sec, num_frames = self._extract_audio_fields(audio)
                 if token is not None and token != "":
                     speech_str = token
                 else:
                     # Prefer inferring duration from file name to avoid extra audio I/O.
-                    num_frames = None
-                    if path:
+                    if num_frames is None and duration_sec is not None:
+                        num_frames = int(float(duration_sec) * float(self.token_fps))
+
+                    if num_frames is None and path:
                         m = self._segment_duration_re.search(path)
                         if m is not None:
                             try:
@@ -1830,9 +1980,16 @@ class FunAudioChatPlugin(BasePlugin):
                                 num_frames = None
 
                     if num_frames is None:
-                        # Fallback: infer duration from waveform (no CosyVoice required).
-                        wav, _ = self._load_single_audio(path or audio, float(audio_sampling_rate))
-                        num_frames = int((float(wav.shape[0]) / float(audio_sampling_rate)) * float(self.token_fps))
+                        # Fallback: infer duration from metadata (no waveform decode) when possible.
+                        duration = None
+                        if path:
+                            duration = self._get_audio_duration_sec(path)
+                        if duration is not None:
+                            num_frames = int(float(duration) * float(self.token_fps))
+                        else:
+                            # Last resort: decode waveform to infer duration.
+                            wav, _ = self._load_single_audio(path or audio, float(audio_sampling_rate))
+                            num_frames = int((float(wav.shape[0]) / float(audio_sampling_rate)) * float(self.token_fps))
 
                     speech_str = audio_pad_token * max(1, int(num_frames))
 
@@ -1956,6 +2113,9 @@ class FunAudioChatPlugin(BasePlugin):
         mm_inputs: dict[str, list[int] | torch.Tensor] = {}
 
         speech, feature_audios, feature_exist_mask = self._build_speech_strings(audios, processor)
+        # We may downgrade some items to "no continuous features" if waveform loading fails.
+        feature_exist_mask = list(feature_exist_mask)
+        feature_load_fail_mask: list[bool] = [False] * len(feature_exist_mask)
         audio_group_size = getattr(processor, "audio_group_size", 5)
         speech_tokenizer = getattr(processor, "speech_tokenizer", None)
         if speech_tokenizer is None:
@@ -1980,19 +2140,68 @@ class FunAudioChatPlugin(BasePlugin):
 
             audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
             audio_padding = getattr(processor, "audio_padding", "max_length")
-            wavs = self._regularize_audios(feature_audios, sampling_rate=audio_sampling_rate)["audios"]
+
+            max_retries = int(os.getenv("LLAMAFACTORY_AUDIO_LOAD_RETRIES", "1"))
+            retry_sleep_sec = float(os.getenv("LLAMAFACTORY_AUDIO_LOAD_RETRY_SLEEP", "0.2"))
+            log_limit = int(os.getenv("LLAMAFACTORY_AUDIO_LOAD_ERROR_LOG_LIMIT", "20"))
+            logged = int(getattr(self, "_audio_load_error_logged", 0))
+            suppressed = bool(getattr(self, "_audio_load_error_suppressed", False))
+
+            wavs: list[NDArray] = []
+            # Map `feature_audios` back to their sample indices.
+            true_indices = [i for i, m in enumerate(feature_exist_mask) if m]
+            for idx, audio in zip(true_indices, feature_audios):
+                last_error: Exception | None = None
+                for attempt in range(max(0, max_retries) + 1):
+                    try:
+                        wav, _ = self._load_single_audio(audio, float(audio_sampling_rate))
+                        wavs.append(wav)
+                        last_error = None
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        last_error = e
+                        is_not_found = isinstance(e, FileNotFoundError) or (
+                            isinstance(e, OSError) and getattr(e, "errno", None) == 2
+                        )
+                        if is_not_found or attempt >= max(0, max_retries):
+                            break
+                        time.sleep(retry_sleep_sec * float(attempt + 1))
+
+                if last_error is not None:
+                    feature_exist_mask[idx] = False
+                    feature_load_fail_mask[idx] = True
+                    if logged < log_limit:
+                        logger.warning_rank0(
+                            "Skip continuous audio features due to load error (idx=%d, audio=%r): %s",
+                            idx,
+                            audio,
+                            repr(last_error),
+                        )
+                        logged += 1
+                    elif not suppressed:
+                        logger.warning_rank0(
+                            "Too many audio load errors (%d+); suppressing further logs.",
+                            log_limit,
+                        )
+                        suppressed = True
+
+            setattr(self, "_audio_load_error_logged", logged)
+            setattr(self, "_audio_load_error_suppressed", suppressed)
+
+            # Only run the feature extractor when at least one waveform is available.
             min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
-            if min_samples > 0:
-                wavs = [np.pad(w, (0, max(0, min_samples - w.shape[0])), mode="constant") for w in wavs]
-            wav_inputs = feature_extractor(
-                wavs,
-                sampling_rate=audio_sampling_rate,
-                return_attention_mask=True,
-                padding=audio_padding,
-                return_tensors="pt",
-            )
-            mm_inputs.update(wav_inputs)
-            mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask", None)
+            if len(wavs) != 0:
+                if min_samples > 0:
+                    wavs = [np.pad(w, (0, max(0, min_samples - w.shape[0])), mode="constant") for w in wavs]
+                wav_inputs = feature_extractor(
+                    wavs,
+                    sampling_rate=audio_sampling_rate,
+                    return_attention_mask=True,
+                    padding=audio_padding,
+                    return_tensors="pt",
+                )
+                mm_inputs.update(wav_inputs)
+                mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask", None)
 
             # Align `feature_exist_mask` device with feature tensors.
             device = None
@@ -2000,8 +2209,10 @@ class FunAudioChatPlugin(BasePlugin):
             if torch.is_tensor(fam):
                 device = fam.device
             mm_inputs["feature_exist_mask"] = torch.tensor(feature_exist_mask, dtype=torch.bool, device=device)
+            mm_inputs["feature_load_fail_mask"] = torch.tensor(feature_load_fail_mask, dtype=torch.bool, device=device)
         else:
             mm_inputs["feature_exist_mask"] = torch.tensor(feature_exist_mask, dtype=torch.bool)
+            mm_inputs["feature_load_fail_mask"] = torch.tensor(feature_load_fail_mask, dtype=torch.bool)
 
         return mm_inputs
 

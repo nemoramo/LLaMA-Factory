@@ -50,5 +50,9 @@ message EndpointingResponse {
   double confidence = 3;
   string model = 4;
   int32 latency_ms = 5;
+  // Normalized probabilities within {<EOU>, <CONT_USER>, <UNADDRESSED>}
+  double p_eou = 6;
+  double p_cont_user = 7;
+  double p_unaddressed = 8;
 }
 

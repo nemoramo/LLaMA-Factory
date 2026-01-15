@@ -32,7 +32,10 @@ Each audio item can be either:
 {"path": "/abs/path/to.wav", "token": "<|audio_pad|><|audio_pad|>..."}
 ```
 
-If `token` is omitted/empty, the plugin will infer the 25Hz frame count from the waveform duration and build a pad-only token sequence.
+If `token` is omitted/empty, the plugin needs a 25Hz frame count to build a pad-only token sequence.
+
+- Recommended (fast, for mp3/m4a/...): include `duration` (seconds) in the JSON item.
+- Fallback: infer duration from `_segXXXX_<start>-<end>.wav` filename, then audio metadata (ffprobe), and finally waveform decode.
 
 ## Example config
 

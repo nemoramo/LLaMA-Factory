@@ -47,6 +47,7 @@
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -94,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="original_text",
         help="NeMo manifest 中表示原始/未规范化文本的字段名（可缺省）",
+    )
+    p.add_argument(
+        "--duration-key",
+        type=str,
+        default="duration",
+        help="NeMo manifest 中表示音频时长(秒)的字段名（可缺省）。",
     )
     p.add_argument(
         "--lang-key",
@@ -230,6 +237,7 @@ def convert_manifest(
     audio_key: str = "audio_filepath",
     text_key: str = "text",
     original_text_key: str = "original_text",
+    duration_key: str = "duration",
     lang_key: str = "lang",
     default_lang: Optional[str] = None,
     force_lang: Optional[str] = None,
@@ -286,6 +294,17 @@ def convert_manifest(
 
             normalized_text = normalized_text or original_text or ""
             original_text = original_text or normalized_text or ""
+
+            duration_sec = None
+            if duration_key:
+                raw_duration = obj.get(duration_key)
+                if raw_duration is not None:
+                    try:
+                        d = float(raw_duration)
+                        if math.isfinite(d) and d >= 0:
+                            duration_sec = d
+                    except Exception:  # noqa: BLE001
+                        duration_sec = None
 
             lang = obj.get(lang_key) or obj.get("language") or None
             if isinstance(lang, str):
@@ -442,6 +461,8 @@ def convert_manifest(
                 ],
                 "audios": [audio_path],
             }
+            if duration_sec is not None:
+                sample["audio_duration"] = duration_sec
             if lang:
                 sample["lang"] = lang
             if pool:
@@ -478,6 +499,7 @@ def main() -> None:
         audio_key=args.audio_key,
         text_key=args.text_key,
         original_text_key=args.original_text_key,
+        duration_key=args.duration_key,
         lang_key=args.lang_key,
         default_lang=args.default_lang,
         force_lang=args.force_lang,

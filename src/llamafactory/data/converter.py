@@ -120,11 +120,11 @@ class AlpacaDatasetConverter(DatasetConverter):
         output = {
             "_prompt": prompt,
             "_response": response,
-            "_system": example[self.dataset_attr.system] if self.dataset_attr.system else "",
-            "_tools": example[self.dataset_attr.tools] if self.dataset_attr.tools else "",
-            "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
-            "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
-            "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_system": example.get(self.dataset_attr.system, "") if self.dataset_attr.system else "",
+            "_tools": example.get(self.dataset_attr.tools, "") if self.dataset_attr.tools else "",
+            "_images": self._find_medias(example.get(self.dataset_attr.images)) if self.dataset_attr.images else None,
+            "_videos": self._find_medias(example.get(self.dataset_attr.videos)) if self.dataset_attr.videos else None,
+            "_audios": self._find_medias(example.get(self.dataset_attr.audios)) if self.dataset_attr.audios else None,
         }
         lang = example.get("lang") or example.get("language")
         if isinstance(lang, str) and lang.strip():
@@ -156,7 +156,7 @@ class SharegptDatasetConverter(DatasetConverter):
             system = messages[0][self.dataset_attr.content_tag]
             messages = messages[1:]
         else:
-            system = example[self.dataset_attr.system] if self.dataset_attr.system else ""
+            system = example.get(self.dataset_attr.system, "") if self.dataset_attr.system else ""
 
         aligned_messages = []
         broken_data = False
@@ -222,10 +222,10 @@ class SharegptDatasetConverter(DatasetConverter):
             "_prompt": prompt,
             "_response": response,
             "_system": system,
-            "_tools": example[self.dataset_attr.tools] if self.dataset_attr.tools else "",
-            "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
-            "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
-            "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_tools": example.get(self.dataset_attr.tools, "") if self.dataset_attr.tools else "",
+            "_images": self._find_medias(example.get(self.dataset_attr.images)) if self.dataset_attr.images else None,
+            "_videos": self._find_medias(example.get(self.dataset_attr.videos)) if self.dataset_attr.videos else None,
+            "_audios": self._find_medias(example.get(self.dataset_attr.audios)) if self.dataset_attr.audios else None,
         }
         lang = example.get("lang") or example.get("language")
         if isinstance(lang, str) and lang.strip():
@@ -368,9 +368,9 @@ class OpenAIDatasetConverter(DatasetConverter):
             "_response": response,
             "_system": system,
             "_tools": tools,
-            "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
-            "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
-            "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
+            "_images": self._find_medias(example.get(self.dataset_attr.images)) if self.dataset_attr.images else None,
+            "_videos": self._find_medias(example.get(self.dataset_attr.videos)) if self.dataset_attr.videos else None,
+            "_audios": self._find_medias(example.get(self.dataset_attr.audios)) if self.dataset_attr.audios else None,
         }
         lang = example.get("lang") or example.get("language")
         if isinstance(lang, str) and lang.strip():

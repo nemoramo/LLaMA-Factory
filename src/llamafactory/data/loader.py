@@ -531,6 +531,7 @@ def get_dataset(
             return_dict=data_args.eval_on_each_dataset,
         )
 
+    dataset_module = None
     with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):
         # move front to make sure eval_dataset(if contain or split) can preprocessed appropriately
         train_dict, eval_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
@@ -653,7 +654,29 @@ def get_dataset(
                             raise ValueError("Dynamic prompt packing: `dataset` is empty.")
 
                         dataset_attrs = get_dataset_list(dataset_names, data_args.dataset_dir)
+                        # Pick a "base" conversion schema for on-the-fly alignment.
+                        #
+                        # NOTE: On-the-fly alignment only supports a single `dataset_converter`, so all mixed datasets
+                        # must be compatible with that schema. We allow some datasets to *omit* optional modality
+                        # columns (e.g. text-only dataset mixed with audio dataset) as long as they otherwise share the
+                        # same formatting + message/tag mapping, and they do not use a different column name for the
+                        # same modality (which would silently drop data).
                         dataset_attr = dataset_attrs[0]
+                        best_score = 0
+                        for cand in dataset_attrs:
+                            score = 0
+                            for field in ("tools", "images", "videos", "audios"):
+                                if getattr(cand, field, None):
+                                    score += 1
+                            if score > best_score:
+                                dataset_attr = cand
+                                best_score = score
+
+                        def _modality_compatible(base_val: Any, other_val: Any) -> bool:
+                            if base_val is None:
+                                return other_val is None
+                            return other_val is None or other_val == base_val
+
                         # When mixing multiple datasets, dynamic prompt packing can still run alignment on-the-fly
                         # as long as their conversion schema is identical (same formatting + column/tag mapping).
                         for other in dataset_attrs[1:]:
@@ -661,10 +684,10 @@ def get_dataset(
                                 other.formatting != dataset_attr.formatting
                                 or other.messages != dataset_attr.messages
                                 or other.system != dataset_attr.system
-                                or other.tools != dataset_attr.tools
-                                or other.images != dataset_attr.images
-                                or other.videos != dataset_attr.videos
-                                or other.audios != dataset_attr.audios
+                                or not _modality_compatible(dataset_attr.tools, other.tools)
+                                or not _modality_compatible(dataset_attr.images, other.images)
+                                or not _modality_compatible(dataset_attr.videos, other.videos)
+                                or not _modality_compatible(dataset_attr.audios, other.audios)
                                 or other.role_tag != dataset_attr.role_tag
                                 or other.content_tag != dataset_attr.content_tag
                                 or other.user_tag != dataset_attr.user_tag
@@ -723,4 +746,22 @@ def get_dataset(
                         "Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling."
                     )
 
-        return dataset_module
+    # NOTE:
+    # `training_args.main_process_first` ensures non-rank0 processes wait until rank0 reaches the end of the context,
+    # but rank0 does not necessarily wait for other ranks to finish the body before proceeding. This can lead to
+    # collective ops timeouts when rank0 starts model init/training while other ranks are still preparing datasets.
+    #
+    # Synchronize here so all ranks finish dataset loading/preprocessing/wrapping before leaving `get_dataset()`.
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+            if dist.get_backend() == "nccl":
+                dist.barrier(device_ids=[local_rank])
+            else:
+                dist.barrier()
+    except Exception as err:
+        logger.warning_rank0(f"Failed to synchronize after dataset preprocessing: {err}")
+
+    return dataset_module

@@ -68,3 +68,4 @@ class EndpointingService(object):
             endpointing__pb2.EndpointingResponse.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
