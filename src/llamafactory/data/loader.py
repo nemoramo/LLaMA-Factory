@@ -628,7 +628,7 @@ def get_dataset(
                         # when `dispatch_batches=False` (avoids cross-rank duplication).
                         num_workers = int(getattr(training_args, "dataloader_num_workers", 0) or 0)
                         base = max(1, world_size * max(1, num_workers))
-                        num_shards = base * 128
+                        num_shards = base * 8
                         if world_size > 1:
                             num_shards = ((num_shards + world_size - 1) // world_size) * world_size
                         # Cap num_shards by dataset size when possible to avoid excessive empty shards on small datasets.
@@ -640,6 +640,12 @@ def get_dataset(
                                     num_shards = max(world_size, (num_shards // world_size) * world_size)
                         except Exception:
                             pass
+                        # HuggingFace `Dataset.to_iterable_dataset(num_shards=...)` can be extremely slow when
+                        # `num_shards` is very large on huge concatenated datasets. Cap it to a reasonable default.
+                        if num_shards > 2048:
+                            num_shards = 2048
+                            if world_size > 1:
+                                num_shards = max(world_size, (num_shards // world_size) * world_size)
 
                     global_shuffle = bool(getattr(data_args, "dynamic_prompt_packing_global_shuffle", True))
                     dataset_converter = None

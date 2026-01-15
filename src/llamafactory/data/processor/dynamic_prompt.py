@@ -20,6 +20,7 @@ import hashlib
 import math
 import random
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Sequence
 from queue import Empty, Full, Queue
@@ -1115,13 +1116,33 @@ def build_dynamic_prompt_packed_iterable_dataset(
             pass
 
     if global_shuffle:
+        t0 = time.monotonic()
+        try:
+            n = len(dataset)
+        except Exception:
+            n = None
+
+        logger.info_rank0(
+            f"Dynamic prompt packing: start global shuffle (seed={seed}, num_shards={num_shards}, n={n})."
+        )
         try:
             dataset = dataset.shuffle(seed=int(seed or 0))
         except Exception as err:
             logger.warning_rank0(f"Failed to shuffle dataset for dynamic prompt packing: {err}")
+        else:
+            logger.info_rank0(
+                f"Dynamic prompt packing: finished global shuffle in {time.monotonic() - t0:.2f}s."
+            )
 
     try:
+        t0 = time.monotonic()
+        logger.info_rank0(
+            f"Dynamic prompt packing: start to_iterable_dataset(num_shards={int(num_shards)})."
+        )
         iterable_ds = dataset.to_iterable_dataset(num_shards=int(num_shards))
+        logger.info_rank0(
+            f"Dynamic prompt packing: finished to_iterable_dataset in {time.monotonic() - t0:.2f}s."
+        )
     except Exception as err:
         # HF `datasets` does not always support converting a formatted map-style dataset (e.g. `with_transform`,
         # `with_format`, or selected columns/format kwargs) into an iterable dataset. Clear formatting/transform
@@ -1139,8 +1160,15 @@ def build_dynamic_prompt_packed_iterable_dataset(
                 except Exception:
                     pass
 
+            t0 = time.monotonic()
+            logger.info_rank0(
+                f"Dynamic prompt packing: retry to_iterable_dataset(num_shards={int(num_shards)}) after reset_format."
+            )
             iterable_ds = unformatted.to_iterable_dataset(num_shards=int(num_shards))
             dataset = unformatted
+            logger.info_rank0(
+                f"Dynamic prompt packing: finished to_iterable_dataset(retry) in {time.monotonic() - t0:.2f}s."
+            )
         except Exception:
             raise ValueError("Dynamic prompt packing requires `dataset.to_iterable_dataset(num_shards=...)`.") from err
 
