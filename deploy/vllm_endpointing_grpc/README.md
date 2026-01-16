@@ -141,6 +141,12 @@ PY
 
 ---
 
+## 指标（KPI）计算
+
+`treat_unaddressed_as_eou=true` 场景下的 **延迟率/打断率** 计算公式见：`metrics.md`。
+
+---
+
 ## 配置项（环境变量）
 
 - `PORT`（默认 `50051`）
