@@ -187,3 +187,7 @@ unsloth_compiled_cache/
 # local experiments / notes (keep workspace clean)
 unsloth-companion/
 instruct.md
+
+node_modules/
+oh-my-opencode/
+package*.json
