@@ -1,0 +1,184 @@
+# vLLM Speech Endpointing gRPC 服务（推荐，单卡）
+
+该目录是一个**可独立拷贝**的部署示例：基于 `vllm/vllm-openai` 镜像，在 vLLM OpenAI 兼容接口（`/v1/chat/completions`）外封装一层 **gRPC 服务**，对外提供标准 RPC：
+
+- `endpointing.v1.EndpointingService/Predict`
+
+协议由 `endpointing.proto` 维护。
+
+相对 SGLang，该实现默认更适合我们当前的 **speech endpointing** 业务：单轮、`max_tokens=1`、并对三个 special token 使用 `logit_bias` 强约束输出。
+
+---
+
+## 目录结构
+
+- `Dockerfile`：镜像构建（base = `vllm/vllm-openai`，已清空 ENTRYPOINT）
+- `vllm_endpointing_grpc_service.py`：gRPC 服务（可选同容器拉起 vLLM）
+- `endpointing.proto`：gRPC 协议
+- `endpointing_pb2.py`、`endpointing_pb2_grpc.py`：Python stubs（已生成）
+
+---
+
+## 构建镜像
+
+在本目录执行：
+
+```bash
+docker build -t vllm-endpointing-grpc:latest .
+```
+
+指定 vLLM base 镜像 tag（可选）：
+
+```bash
+docker build --build-arg VLLM_IMAGE=vllm/vllm-openai:<TAG> -t vllm-endpointing-grpc:<TAG> .
+```
+
+---
+
+## 运行（推荐：单容器模式，同容器拉起 vLLM）
+
+默认单卡：容器只暴露一张 GPU（通过 `docker run --gpus '"device=0"'` 控制），因此不需要 TP/PP 等配置（README 不包含 TP）。
+
+```bash
+MODEL_DIR=/abs/path/to/model
+
+docker run --rm -it --ipc=host --gpus '"device=0"' \
+  -p 50051:50051 \
+  -p 30000:30000 \
+  -v ${MODEL_DIR}:/models/model:ro \
+  -e PORT=50051 \
+  -e VLLM_CMD="vllm serve /models/model --host 0.0.0.0 --port 30000 --gpu-memory-utilization 0.52" \
+  -e VLLM_BASE_URL="http://127.0.0.1:30000/v1" \
+  -e LOGIT_BIAS_VALUE=100 \
+  vllm-endpointing-grpc:latest
+```
+
+说明：
+
+- gRPC 监听端口：`50051`
+- vLLM 监听端口：`30000`
+- `LOGIT_BIAS_VALUE` 默认 100：会自动从 `/models/model` 的 tokenizer 计算 `<EOU>/<CONT_USER>/<UNADDRESSED>` 三个 token id 并构造 `logit_bias`
+
+---
+
+## 运行（分离模式：连接已有 vLLM）
+
+如果 vLLM 已经在 `http://<HOST>:30000/v1` 提供服务：
+
+```bash
+docker run --rm -it \
+  -p 50051:50051 \
+  -e PORT=50051 \
+  -e VLLM_BASE_URL="http://<HOST>:30000/v1" \
+  -e VLLM_API_KEY="EMPTY" \
+  -e LOGIT_BIAS_JSON='{"151665":100,"151666":100,"151667":100}' \
+  vllm-endpointing-grpc:latest
+```
+
+> 分离模式下容器里可能没有模型文件，无法自动加载 tokenizer，所以需要显式提供 `LOGIT_BIAS_JSON`（token id -> bias）。
+
+---
+
+## 调用示例
+
+### 1) grpcurl（推荐）
+
+本机安装 `grpcurl` 后：
+
+```bash
+grpcurl -plaintext \
+  -proto endpointing.proto \
+  -d '{"request_id":"test-1","lang":"en-US","asr":{"text":"hello"},"options":{"treat_unaddressed_as_eou":true,"eou_threshold":0.6}}' \
+  127.0.0.1:50051 endpointing.v1.EndpointingService/Predict
+```
+
+### 2) 没有 grpcurl：用 Python 调用（宿主机）
+
+```bash
+python3 - <<'PY'
+import grpc
+import endpointing_pb2, endpointing_pb2_grpc
+
+channel = grpc.insecure_channel("127.0.0.1:50051")
+stub = endpointing_pb2_grpc.EndpointingServiceStub(channel)
+
+req = endpointing_pb2.EndpointingRequest(
+    request_id="test-1",
+    lang="en-US",
+    asr=endpointing_pb2.Asr(text="hello"),
+    options=endpointing_pb2.Options(treat_unaddressed_as_eou=True, eou_threshold=0.6),
+)
+resp = stub.Predict(req, timeout=30)
+print(resp)
+PY
+```
+
+---
+
+## 返回值与判决规则（重要）
+
+响应结构见 `endpointing.proto` 的 `EndpointingResponse`：
+
+- `label`：`"<EOU>" | "<CONT_USER>" | "<UNADDRESSED>"`
+- `confidence`：只在三个标签内归一化后的概率
+- `latency_ms`：外层服务耗时（ms）
+- `p_eou / p_cont_user / p_unaddressed`：三类标签内归一化后的概率（和为 1）
+
+判决规则：
+
+1) 外层服务向 vLLM 请求 `logprobs/top_logprobs`，仅在 `{<EOU>, <CONT_USER>, <UNADDRESSED>}` 三个标签内做归一化（保证三者概率和为 1）。
+2) 若 `treat_unaddressed_as_eou=true`：
+   - `P(<EOU>) += P(<UNADDRESSED>)`
+   - `P(<UNADDRESSED>) = 0`
+   - 再在 3 个标签内重新归一化。
+3) 若 `P(<EOU>) < eou_threshold`，即使 `<EOU>` 概率最大，也会返回 `<CONT_USER>`（降低误判为结束的概率）。
+
+输出约束（关键）：
+
+- 每次请求都会携带 `logit_bias`，对 `<EOU>/<CONT_USER>/<UNADDRESSED>` 三个 token 施加 `+100` 的强偏置，尽可能保证输出只在三者内。
+
+`meta` 字段会被接收但不会参与推理，也不会转发给模型。
+
+---
+
+## 配置项（环境变量）
+
+- `PORT`（默认 `50051`）
+- `HOST`（默认 `0.0.0.0`）
+- `VLLM_BASE_URL`（默认 `http://127.0.0.1:30000/v1`）
+- `VLLM_API_KEY`（默认 `EMPTY`）
+- `VLLM_MODEL`（默认：自动从 `/v1/models` 取第一个）
+- `MODEL_ALIAS`（默认 `endpointing-judge-v1`）
+- `EOU_THRESHOLD`（默认 `0.6`）
+- `TOP_LOGPROBS`（默认 `20`）
+- `TIMEOUT_S`（默认 `30`）
+- `READY_TIMEOUT_S`（默认 `120`）
+- `VLLM_CMD`（默认空；设置后外层服务会在容器内拉起 vLLM）
+- `TOKENIZER_DIR`（默认空；若挂载了 `/models/model` 则会自动使用它）
+- `LOGIT_BIAS_VALUE`（默认 `100`）
+- `LOGIT_BIAS_JSON`（默认空；提供后优先使用）
+
+---
+
+## 常见问题
+
+### 1) 为什么要 `logit_bias`？
+
+endpointing 是一个 **三分类**任务，我们希望模型输出**严格为** `<EOU>/<CONT_USER>/<UNADDRESSED>` 之一。
+`logit_bias=+100` 能大幅降低输出其它 token 的概率，并且便于从 `top_logprobs` 里稳定抽取三类概率。
+
+### 2) 分离模式怎么拿到 token id？
+
+在能访问模型 tokenizer 的环境执行：
+
+```bash
+python3 - <<'PY'
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("/abs/path/to/model", trust_remote_code=True)
+for t in ["<EOU>", "<CONT_USER>", "<UNADDRESSED>"]:
+    ids = tok.encode(t, add_special_tokens=False)
+    print(t, ids)
+PY
+```
+
+将输出填入 `LOGIT_BIAS_JSON`（key 必须是字符串）。

@@ -20,7 +20,7 @@ DESCRIPTOR = _descriptor.FileDescriptor(
   syntax='proto3',
   serialized_options=None,
   create_key=_descriptor._internal_create_key,
-  serialized_pb=b'\n\x11\x65ndpointing.proto\x12\x0e\x65ndpointing.v1\"\xe8\x01\n\x12\x45ndpointingRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x0c\n\x04lang\x18\x03 \x01(\t\x12 \n\x03\x61sr\x18\x04 \x01(\x0b\x32\x13.endpointing.v1.Asr\x12,\n\x07history\x18\x05 \x03(\x0b\x32\x1b.endpointing.v1.HistoryTurn\x12(\n\x07options\x18\x06 \x01(\x0b\x32\x17.endpointing.v1.Options\x12\"\n\x04meta\x18\x07 \x01(\x0b\x32\x14.endpointing.v1.Meta\"\x13\n\x03\x41sr\x12\x0c\n\x04text\x18\x01 \x01(\t\"?\n\x0bHistoryTurn\x12\"\n\x04role\x18\x01 \x01(\x0e\x32\x14.endpointing.v1.Role\x12\x0c\n\x04text\x18\x02 \x01(\t\"Y\n\x07Options\x12 \n\x18treat_unaddressed_as_eou\x18\x01 \x01(\x08\x12\x1a\n\reou_threshold\x18\x02 \x01(\x01H\x00\x88\x01\x01\x42\x10\n\x0e_eou_threshold\"\x8f\x01\n\x04Meta\x12\x14\n\x0c\x64\x65vice_model\x18\x01 \x01(\t\x12\x13\n\x0b\x61pp_version\x18\x02 \x01(\t\x12.\n\x05\x65xtra\x18\x64 \x03(\x0b\x32\x1f.endpointing.v1.Meta.ExtraEntry\x1a,\n\nExtraEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"o\n\x13\x45ndpointingResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\r\n\x05label\x18\x02 \x01(\t\x12\x12\n\nconfidence\x18\x03 \x01(\x01\x12\r\n\x05model\x18\x04 \x01(\t\x12\x12\n\nlatency_ms\x18\x05 \x01(\x05*5\n\x04Role\x12\x14\n\x10ROLE_UNSPECIFIED\x10\x00\x12\x08\n\x04USER\x10\x01\x12\r\n\tASSISTANT\x10\x02\x32j\n\x12\x45ndpointingService\x12T\n\x07Predict\x12\".endpointing.v1.EndpointingRequest\x1a#.endpointing.v1.EndpointingResponse\"\x00\x62\x06proto3'
+  serialized_pb=b'\n\x11\x65ndpointing.proto\x12\x0e\x65ndpointing.v1\"\xe8\x01\n\x12\x45ndpointingRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x0c\n\x04lang\x18\x03 \x01(\t\x12 \n\x03\x61sr\x18\x04 \x01(\x0b\x32\x13.endpointing.v1.Asr\x12,\n\x07history\x18\x05 \x03(\x0b\x32\x1b.endpointing.v1.HistoryTurn\x12(\n\x07options\x18\x06 \x01(\x0b\x32\x17.endpointing.v1.Options\x12\"\n\x04meta\x18\x07 \x01(\x0b\x32\x14.endpointing.v1.Meta\"\x13\n\x03\x41sr\x12\x0c\n\x04text\x18\x01 \x01(\t\"?\n\x0bHistoryTurn\x12\"\n\x04role\x18\x01 \x01(\x0e\x32\x14.endpointing.v1.Role\x12\x0c\n\x04text\x18\x02 \x01(\t\"Y\n\x07Options\x12 \n\x18treat_unaddressed_as_eou\x18\x01 \x01(\x08\x12\x1a\n\reou_threshold\x18\x02 \x01(\x01H\x00\x88\x01\x01\x42\x10\n\x0e_eou_threshold\"\x8f\x01\n\x04Meta\x12\x14\n\x0c\x64\x65vice_model\x18\x01 \x01(\t\x12\x13\n\x0b\x61pp_version\x18\x02 \x01(\t\x12.\n\x05\x65xtra\x18\x64 \x03(\x0b\x32\x1f.endpointing.v1.Meta.ExtraEntry\x1a,\n\nExtraEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xaa\x01\n\x13\x45ndpointingResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\r\n\x05label\x18\x02 \x01(\t\x12\x12\n\nconfidence\x18\x03 \x01(\x01\x12\r\n\x05model\x18\x04 \x01(\t\x12\x12\n\nlatency_ms\x18\x05 \x01(\x05\x12\r\n\x05p_eou\x18\x06 \x01(\x01\x12\x13\n\x0bp_cont_user\x18\x07 \x01(\x01\x12\x15\n\rp_unaddressed\x18\x08 \x01(\x01*5\n\x04Role\x12\x14\n\x10ROLE_UNSPECIFIED\x10\x00\x12\x08\n\x04USER\x10\x01\x12\r\n\tASSISTANT\x10\x02\x32j\n\x12\x45ndpointingService\x12T\n\x07Predict\x12\".endpointing.v1.EndpointingRequest\x1a#.endpointing.v1.EndpointingResponse\"\x00\x62\x06proto3'
 )
 
 _ROLE = _descriptor.EnumDescriptor(
@@ -48,8 +48,8 @@ _ROLE = _descriptor.EnumDescriptor(
   ],
   containing_type=None,
   serialized_options=None,
-  serialized_start=708,
-  serialized_end=761,
+  serialized_start=439,
+  serialized_end=492,
 )
 _sym_db.RegisterEnumDescriptor(_ROLE)
 
@@ -129,8 +129,8 @@ _ENDPOINTINGREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=38,
-  serialized_end=270,
+  serialized_start=35,
+  serialized_end=267,
 )
 
 
@@ -161,8 +161,8 @@ _ASR = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=272,
-  serialized_end=291,
+  serialized_start=269,
+  serialized_end=288,
 )
 
 
@@ -200,8 +200,8 @@ _HISTORYTURN = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=293,
-  serialized_end=356,
+  serialized_start=290,
+  serialized_end=353,
 )
 
 
@@ -223,7 +223,7 @@ _OPTIONS = _descriptor.Descriptor(
     _descriptor.FieldDescriptor(
       name='eou_threshold', full_name='endpointing.v1.Options.eou_threshold', index=1,
       number=2, type=1, cpp_type=5, label=1,
-      has_default_value=False, default_value=float(0),
+      has_default_value=False, default_value=0,
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
@@ -242,10 +242,10 @@ _OPTIONS = _descriptor.Descriptor(
       name='_eou_threshold', full_name='endpointing.v1.Options._eou_threshold',
       index=0, containing_type=None,
       create_key=_descriptor._internal_create_key,
-    fields=[]),
+      fields=[]),
   ],
-  serialized_start=358,
-  serialized_end=447,
+  serialized_start=355,
+  serialized_end=444,
 )
 
 
@@ -283,8 +283,8 @@ _META_EXTRAENTRY = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=549,
-  serialized_end=593,
+  serialized_start=401,
+  serialized_end=445,
 )
 
 _META = _descriptor.Descriptor(
@@ -328,8 +328,8 @@ _META = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=450,
-  serialized_end=593,
+  serialized_start=447,
+  serialized_end=590,
 )
 
 
@@ -376,6 +376,27 @@ _ENDPOINTINGRESPONSE = _descriptor.Descriptor(
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='p_eou', full_name='endpointing.v1.EndpointingResponse.p_eou', index=5,
+      number=6, type=1, cpp_type=5, label=1,
+      has_default_value=False, default_value=float(0),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='p_cont_user', full_name='endpointing.v1.EndpointingResponse.p_cont_user', index=6,
+      number=7, type=1, cpp_type=5, label=1,
+      has_default_value=False, default_value=float(0),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='p_unaddressed', full_name='endpointing.v1.EndpointingResponse.p_unaddressed', index=7,
+      number=8, type=1, cpp_type=5, label=1,
+      has_default_value=False, default_value=float(0),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
   ],
   extensions=[
   ],
@@ -388,8 +409,8 @@ _ENDPOINTINGRESPONSE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=595,
-  serialized_end=706,
+  serialized_start=593,
+  serialized_end=763,
 )
 
 _ENDPOINTINGREQUEST.fields_by_name['asr'].message_type = _ASR
@@ -462,31 +483,5 @@ EndpointingResponse = _reflection.GeneratedProtocolMessageType('EndpointingRespo
 _sym_db.RegisterMessage(EndpointingResponse)
 
 
-_META_EXTRAENTRY._options = None
-
-_ENDPOINTINGSERVICE = _descriptor.ServiceDescriptor(
-  name='EndpointingService',
-  full_name='endpointing.v1.EndpointingService',
-  file=DESCRIPTOR,
-  index=0,
-  serialized_options=None,
-  create_key=_descriptor._internal_create_key,
-  serialized_start=763,
-  serialized_end=869,
-  methods=[
-  _descriptor.MethodDescriptor(
-    name='Predict',
-    full_name='endpointing.v1.EndpointingService.Predict',
-    index=0,
-    containing_service=None,
-    input_type=_ENDPOINTINGREQUEST,
-    output_type=_ENDPOINTINGRESPONSE,
-    serialized_options=None,
-    create_key=_descriptor._internal_create_key,
-  ),
-])
-_sym_db.RegisterServiceDescriptor(_ENDPOINTINGSERVICE)
-
-DESCRIPTOR.services_by_name['EndpointingService'] = _ENDPOINTINGSERVICE
-
 # @@protoc_insertion_point(module_scope)
+

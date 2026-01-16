@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import json
 import os
 import shlex
 import signal
@@ -9,6 +10,7 @@ import subprocess
 import time
 from concurrent import futures
 from math import exp, isfinite, log
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import grpc
@@ -138,6 +140,26 @@ def _build_messages(req: endpointing_pb2.EndpointingRequest) -> List[Dict[str, s
     return msgs
 
 
+def _parse_logit_bias_json(s: str) -> Dict[str, int]:
+    obj = json.loads(s)
+    if not isinstance(obj, dict):
+        raise ValueError("LOGIT_BIAS_JSON must be a JSON object like {\"123\": 100}")
+    return {str(k): int(v) for k, v in obj.items()}
+
+
+def _compute_logit_bias_from_tokenizer(tokenizer_dir: str, bias_value: int) -> Dict[str, int]:
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
+    mapping: Dict[str, int] = {}
+    for t in LABELS:
+        ids = tok.encode(t, add_special_tokens=False)
+        if len(ids) != 1:
+            raise ValueError(f"Token {t!r} is not a single token in tokenizer_dir={tokenizer_dir!r}: ids={ids}")
+        mapping[str(ids[0])] = int(bias_value)
+    return mapping
+
+
 class ServiceConfig:
     def __init__(
         self,
@@ -147,9 +169,8 @@ class ServiceConfig:
         model_alias: str,
         timeout_s: float,
         top_logprobs: int,
-        keep_special: bool,
-        reasoning_mode: bool,
         default_eou_threshold: float,
+        logit_bias: Optional[Dict[str, int]],
     ) -> None:
         self.base_url = base_url
         self.api_key = api_key
@@ -157,9 +178,8 @@ class ServiceConfig:
         self.model_alias = model_alias
         self.timeout_s = timeout_s
         self.top_logprobs = top_logprobs
-        self.keep_special = keep_special
-        self.reasoning_mode = reasoning_mode
         self.default_eou_threshold = default_eou_threshold
+        self.logit_bias = logit_bias
 
 
 def _resolve_first_model_id(http: httpx.Client, base_url: str, api_key: str) -> str:
@@ -174,7 +194,7 @@ def _resolve_first_model_id(http: httpx.Client, base_url: str, api_key: str) -> 
     return models[0].get("id") or ""
 
 
-def _wait_sglang_ready(http: httpx.Client, base_url: str, api_key: str, max_wait_s: float) -> None:
+def _wait_vllm_ready(http: httpx.Client, base_url: str, api_key: str, max_wait_s: float) -> None:
     t0 = time.perf_counter()
     last_err: Optional[str] = None
     while True:
@@ -184,14 +204,14 @@ def _wait_sglang_ready(http: httpx.Client, base_url: str, api_key: str, max_wait
         except Exception as e:
             last_err = str(e)
         if time.perf_counter() - t0 >= max_wait_s:
-            raise RuntimeError(f"SGLang not ready after {max_wait_s:.1f}s: {last_err}")
+            raise RuntimeError(f"vLLM not ready after {max_wait_s:.1f}s: {last_err}")
         time.sleep(0.5)
 
 
-def _start_sglang(cmd: str) -> subprocess.Popen:
+def _start_vllm(cmd: str) -> subprocess.Popen:
     argv = shlex.split(cmd)
     if not argv:
-        raise ValueError("Empty --sglang-cmd.")
+        raise ValueError("Empty --vllm-cmd.")
     return subprocess.Popen(argv, preexec_fn=os.setsid)
 
 
@@ -211,21 +231,16 @@ class EndpointingServicer(endpointing_pb2_grpc.EndpointingServiceServicer):
 
             treat_unaddressed = bool(request.options.treat_unaddressed_as_eou)
 
-            extra: Dict[str, Any] = {}
-            if self.cfg.keep_special:
-                extra.update({"skip_special_tokens": False, "include_stop_str_in_output": True})
-            if self.cfg.reasoning_mode:
-                extra.update({"chat_template_kwargs": {"thinking": True}, "separate_reasoning": True})
-
-            payload = {
+            payload: Dict[str, Any] = {
                 "model": self.cfg.model,
                 "messages": _build_messages(request),
                 "temperature": 0.0,
                 "max_tokens": 1,
                 "logprobs": True,
                 "top_logprobs": self.cfg.top_logprobs,
-                **extra,
             }
+            if self.cfg.logit_bias:
+                payload["logit_bias"] = self.cfg.logit_bias
 
             url = self.cfg.base_url.rstrip("/") + "/chat/completions"
             headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
@@ -235,7 +250,7 @@ class EndpointingServicer(endpointing_pb2_grpc.EndpointingServiceServicer):
 
             choices = data.get("choices") or []
             if not choices:
-                context.abort(grpc.StatusCode.UNAVAILABLE, "Empty choices from SGLang.")
+                context.abort(grpc.StatusCode.UNAVAILABLE, "Empty choices from vLLM.")
             choice0 = choices[0]
 
             msg = (choice0.get("message") or {}) if isinstance(choice0, dict) else {}
@@ -264,6 +279,9 @@ class EndpointingServicer(endpointing_pb2_grpc.EndpointingServiceServicer):
                 confidence=float(conf),
                 model=self.cfg.model_alias,
                 latency_ms=int(round((t1 - t0) * 1000)),
+                p_eou=float(probs.get("<EOU>", 0.0)),
+                p_cont_user=float(probs.get("<CONT_USER>", 0.0)),
+                p_unaddressed=float(probs.get("<UNADDRESSED>", 0.0)),
             )
 
         except grpc.RpcError:
@@ -271,7 +289,7 @@ class EndpointingServicer(endpointing_pb2_grpc.EndpointingServiceServicer):
         except httpx.HTTPStatusError as e:
             context.abort(
                 grpc.StatusCode.UNAVAILABLE,
-                f"SGLang HTTP {e.response.status_code}: {e.response.text[:2000]}",
+                f"vLLM HTTP {e.response.status_code}: {e.response.text[:2000]}",
             )
         except Exception as e:
             context.abort(grpc.StatusCode.INTERNAL, str(e))
@@ -282,41 +300,65 @@ def main():
     ap.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(os.getenv("PORT", "50051")))
 
-    ap.add_argument("--base-url", default=os.getenv("SGLANG_BASE_URL", "http://127.0.0.1:30000/v1"))
-    ap.add_argument("--api-key", default=os.getenv("SGLANG_API_KEY", "EMPTY"))
-    ap.add_argument("--model", default=os.getenv("SGLANG_MODEL", ""))
+    ap.add_argument("--base-url", default=os.getenv("VLLM_BASE_URL", "http://127.0.0.1:30000/v1"))
+    ap.add_argument("--api-key", default=os.getenv("VLLM_API_KEY", "EMPTY"))
+    ap.add_argument("--model", default=os.getenv("VLLM_MODEL", ""))
     ap.add_argument("--model-alias", default=os.getenv("MODEL_ALIAS", "endpointing-judge-v1"))
 
-    ap.add_argument("--timeout", type=float, default=float(os.getenv("TIMEOUT_S", "10")))
+    ap.add_argument("--timeout", type=float, default=float(os.getenv("TIMEOUT_S", "30")))
     ap.add_argument("--top-logprobs", type=int, default=int(os.getenv("TOP_LOGPROBS", "20")))
     ap.add_argument("--default-eou-threshold", type=float, default=float(os.getenv("EOU_THRESHOLD", "0.6")))
-    ap.add_argument("--keep-special", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--reasoning-mode", action=argparse.BooleanOptionalAction, default=False)
 
     ap.add_argument("--max-workers", type=int, default=int(os.getenv("MAX_WORKERS", "64")))
 
     ap.add_argument(
-        "--sglang-cmd",
-        default=os.getenv("SGLANG_CMD", ""),
-        help='Optional: command to launch sglang (e.g. "python -m sglang.launch_server ...").',
+        "--vllm-cmd",
+        default=os.getenv("VLLM_CMD", ""),
+        help='Optional: command to launch vLLM server (e.g. "vllm serve /models/model --host 0.0.0.0 --port 30000 ...").',
     )
     ap.add_argument("--wait-ready", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--ready-timeout", type=float, default=float(os.getenv("READY_TIMEOUT_S", "120")))
 
+    # logit_bias to strongly restrict output to LABELS only.
+    ap.add_argument("--logit-bias-json", default=os.getenv("LOGIT_BIAS_JSON", ""))
+    ap.add_argument("--logit-bias-value", type=int, default=int(os.getenv("LOGIT_BIAS_VALUE", "100")))
+    ap.add_argument(
+        "--tokenizer-dir",
+        default=os.getenv("TOKENIZER_DIR", ""),
+        help="Tokenizer/model dir used to compute <EOU>/<CONT_USER>/<UNADDRESSED> token ids for logit_bias.",
+    )
+    ap.add_argument("--require-logit-bias", action=argparse.BooleanOptionalAction, default=True)
+
     args = ap.parse_args()
 
-    sglang_proc: Optional[subprocess.Popen] = None
-    if args.sglang_cmd:
-        sglang_proc = _start_sglang(args.sglang_cmd)
+    vllm_proc: Optional[subprocess.Popen] = None
+    if args.vllm_cmd:
+        vllm_proc = _start_vllm(args.vllm_cmd)
 
     http = httpx.Client(timeout=args.timeout)
     try:
         if args.wait_ready:
-            _wait_sglang_ready(http, args.base_url, args.api_key, max_wait_s=args.ready_timeout)
+            _wait_vllm_ready(http, args.base_url, args.api_key, max_wait_s=args.ready_timeout)
 
         model_id = args.model
         if not model_id:
             model_id = _resolve_first_model_id(http, args.base_url, args.api_key)
+
+        logit_bias: Optional[Dict[str, int]] = None
+        if args.logit_bias_json:
+            logit_bias = _parse_logit_bias_json(args.logit_bias_json)
+        else:
+            tokenizer_dir = args.tokenizer_dir
+            if not tokenizer_dir:
+                default_dir = "/models/model"
+                if Path(default_dir).exists():
+                    tokenizer_dir = default_dir
+            if tokenizer_dir:
+                logit_bias = _compute_logit_bias_from_tokenizer(tokenizer_dir, args.logit_bias_value)
+            elif args.require_logit_bias:
+                raise RuntimeError(
+                    "logit_bias is required but cannot be constructed: provide LOGIT_BIAS_JSON or mount TOKENIZER_DIR."
+                )
 
         cfg = ServiceConfig(
             base_url=args.base_url,
@@ -325,9 +367,8 @@ def main():
             model_alias=args.model_alias,
             timeout_s=float(args.timeout),
             top_logprobs=int(args.top_logprobs),
-            keep_special=bool(args.keep_special),
-            reasoning_mode=bool(args.reasoning_mode),
             default_eou_threshold=float(args.default_eou_threshold),
+            logit_bias=logit_bias,
         )
 
         server = grpc.server(futures.ThreadPoolExecutor(max_workers=args.max_workers))
@@ -335,19 +376,20 @@ def main():
         server.add_insecure_port(f"{args.host}:{args.port}")
 
         print(f"[grpc] listening on {args.host}:{args.port}")
-        print(f"[sglang] base_url={args.base_url} model={cfg.model} alias={cfg.model_alias}")
+        print(f"[vllm] base_url={args.base_url} model={cfg.model} alias={cfg.model_alias}")
+        if cfg.logit_bias:
+            print(f"[vllm] logit_bias={cfg.logit_bias}")
         server.start()
         server.wait_for_termination()
 
     finally:
         http.close()
-        if sglang_proc is not None:
+        if vllm_proc is not None:
             try:
-                os.killpg(os.getpgid(sglang_proc.pid), signal.SIGTERM)
+                os.killpg(os.getpgid(vllm_proc.pid), signal.SIGTERM)
             except Exception:
                 pass
 
 
 if __name__ == "__main__":
     main()
-
