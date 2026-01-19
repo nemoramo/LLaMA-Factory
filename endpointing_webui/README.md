@@ -46,7 +46,19 @@
 - Python 3.10+
 - 运行中的 gRPC 服务端 `endpointing.v1.EndpointingService/Predict`
 
-### 安装步骤
+### 🪟 Windows 一键安装（推荐小白用户）
+
+**只需双击一个文件，自动完成所有安装！**
+
+1. 下载整个 `endpointing_webui` 文件夹到电脑
+2. 双击 **`一键启动.bat`**
+3. 等待自动安装完成，浏览器会自动打开
+
+> 💡 首次运行会自动创建虚拟环境并安装依赖，请耐心等待几分钟。
+> 
+> ⚠️ 如果提示"未检测到 Python"，请先安装 [Python 3.10+](https://www.python.org/downloads/)，安装时**务必勾选 "Add Python to PATH"**。
+
+### Linux / macOS 安装
 
 ```bash
 cd endpointing_webui
@@ -55,14 +67,6 @@ python app.py
 ```
 
 启动后访问 `http://127.0.0.1:7860`
-
-### Windows 安装
-
-```batch
-cd endpointing_webui
-install.bat
-run.bat
-```
 
 ---
 
@@ -271,8 +275,9 @@ endpointing_webui/
 ├── docs/
 │   └── screenshots/        # 界面截图
 ├── requirements.txt
-├── install.bat             # Windows 安装脚本
-├── run.bat                 # Windows 启动脚本
+├── 一键启动.bat             # ⭐ Windows 一键启动（推荐）
+├── install.bat             # Windows 安装脚本（备用）
+├── run.bat                 # Windows 启动脚本（备用）
 └── README.md
 ```
 
