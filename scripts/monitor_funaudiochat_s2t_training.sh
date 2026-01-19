@@ -52,6 +52,17 @@ LEARNING_RATE="${LEARNING_RATE:-1.0e-5}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.02}"
 LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-cosine}"
 
+# LoRA knobs (keep defaults aligned with prior behavior).
+LORA_TARGET="${LORA_TARGET:-}"
+LORA_RANK="${LORA_RANK:-8}"
+LORA_ALPHA="${LORA_ALPHA:-16}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+
+# Regularization knobs (optional; omitted when empty).
+WEIGHT_DECAY="${WEIGHT_DECAY:-}"
+LABEL_SMOOTHING_FACTOR="${LABEL_SMOOTHING_FACTOR:-}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-}"
+
 CUTOFF_LEN="${CUTOFF_LEN:-2048}"
 PACKING="${PACKING:-false}"
 NEAT_PACKING="${NEAT_PACKING:-false}"
@@ -146,6 +157,22 @@ run_once() {
     greater_is_better_arg=(greater_is_better="${GREATER_IS_BETTER}")
   fi
 
+  local lora_target_arg=()
+  if [[ -n "${LORA_TARGET}" ]]; then
+    lora_target_arg=(lora_target="${LORA_TARGET}")
+  fi
+
+  local reg_args=()
+  if [[ -n "${WEIGHT_DECAY}" ]]; then
+    reg_args+=(weight_decay="${WEIGHT_DECAY}")
+  fi
+  if [[ -n "${LABEL_SMOOTHING_FACTOR}" ]]; then
+    reg_args+=(label_smoothing_factor="${LABEL_SMOOTHING_FACTOR}")
+  fi
+  if [[ -n "${MAX_GRAD_NORM}" ]]; then
+    reg_args+=(max_grad_norm="${MAX_GRAD_NORM}")
+  fi
+
   log "INFO" "Launching training (run_id=${run_id})"
   log "INFO" "GPUS=${GPUS} NPROC_PER_NODE=${NPROC_PER_NODE} OUTPUT_DIR=${OUTPUT_DIR}"
   log "INFO" "DATASET=${DATASET}"
@@ -189,7 +216,7 @@ Command:
         do_sample=false temperature=0.0 top_p=1.0 num_beams=1 max_new_tokens=${EVAL_MAX_NEW_TOKENS} \\
         overwrite_cache=false preprocessing_num_workers=${PREPROCESSING_NUM_WORKERS} \\
         dataloader_num_workers=${DATALOADER_NUM_WORKERS} dataloader_prefetch_factor=${DATALOADER_PREFETCH_FACTOR} \\
-        finetuning_type=lora lora_rank=8 lora_alpha=16 lora_dropout=0.05 ${adapter_arg[*]} \\
+        finetuning_type=lora ${lora_target_arg[*]} lora_rank=${LORA_RANK} lora_alpha=${LORA_ALPHA} lora_dropout=${LORA_DROPOUT} ${reg_args[*]} ${adapter_arg[*]} \\
         output_dir=${OUTPUT_DIR} overwrite_output_dir=false \\
         learning_rate=${LEARNING_RATE} lr_scheduler_type=${LR_SCHEDULER_TYPE} warmup_ratio=${WARMUP_RATIO} \\
         ${max_steps_arg[*]} \\
@@ -244,9 +271,11 @@ EOF
     dataloader_num_workers="${DATALOADER_NUM_WORKERS}" \
     dataloader_prefetch_factor="${DATALOADER_PREFETCH_FACTOR}" \
     finetuning_type=lora \
-    lora_rank=8 \
-    lora_alpha=16 \
-    lora_dropout=0.05 \
+    "${lora_target_arg[@]}" \
+    lora_rank="${LORA_RANK}" \
+    lora_alpha="${LORA_ALPHA}" \
+    lora_dropout="${LORA_DROPOUT}" \
+    "${reg_args[@]}" \
     "${adapter_arg[@]}" \
     output_dir="${OUTPUT_DIR}" \
     overwrite_output_dir=false \
