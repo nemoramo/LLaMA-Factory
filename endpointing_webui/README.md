@@ -27,19 +27,6 @@
 
 ---
 
-## 📸 界面截图
-
-### 连接成功状态
-![已连接](docs/screenshots/02_connected.png)
-
-### 单条查询与预测结果
-![单条查询预测](docs/screenshots/03_single_query_prediction.png)
-
-### 批量处理界面
-![批量处理](docs/screenshots/04_batch_processing.png)
-
----
-
 ## 🚀 快速开始
 
 ### 环境要求
@@ -53,6 +40,29 @@
 1. 下载整个 `endpointing_webui` 文件夹到电脑
 2. 双击 **`一键启动.bat`**
 3. 等待自动安装完成，浏览器会自动打开
+
+**一键启动运行效果：**
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║        语音端点检测标注工具 - Endpointing WebUI              ║
+║                     一键启动程序                             ║
+╚══════════════════════════════════════════════════════════════╝
+
+[1/4] 检查 Python 环境...
+    Python 版本: 3.11.5
+
+[2/4] 配置虚拟环境...
+    首次运行，正在创建虚拟环境...
+    虚拟环境创建成功！
+
+[3/4] 检查并安装依赖...
+    正在安装依赖包，请稍候...
+    依赖安装完成！
+
+[4/4] 启动 WebUI...
+    程序启动中，浏览器将自动打开...
+```
 
 > 💡 首次运行会自动创建虚拟环境并安装依赖，请耐心等待几分钟。
 > 
@@ -72,19 +82,33 @@ python app.py
 
 ## 📖 使用指南
 
-### 1. 连接 gRPC 服务
+### 步骤 1：连接 gRPC 服务
+
+启动后，首先需要连接到 gRPC 服务端：
 
 1. 输入 **Host**（默认：`127.0.0.1`）和 **Port**（默认：`50051`）
 2. 点击 **🔗 Connect**
 3. 状态栏显示：`✅ Connected successfully. Model: <模型名称>`
 
-### 2. 单条查询模式
+![初始界面 - 输入服务器地址并点击 Connect](docs/screenshots/01_initial_state.png)
+
+连接成功后，界面显示如下：
+
+![连接成功状态](docs/screenshots/02_connected.png)
+
+---
+
+### 步骤 2：单条查询模式
+
+连接成功后，可以进行单条 ASR 文本的端点检测：
 
 1. 输入 **ASR Text**（待评估的语句）
 2. 可选：添加 **Conversation History**（多轮对话场景）
 3. 选择 **Language**（默认：`en-US`）
 4. 调整 **EOU Threshold**（默认：`0.6`）
 5. 点击 **🚀 Predict**
+
+![单条查询预测结果](docs/screenshots/03_single_query_prediction.png)
 
 #### 累积结果与选择性导出
 
@@ -95,7 +119,11 @@ python app.py
 - 点击 **📥 Export Selected** 仅导出选中的行
 - 导出文件中**不包含** `selected` 列
 
-### 3. 批量处理模式
+---
+
+### 步骤 3：批量处理模式
+
+如需批量处理多条数据，切换到批量处理标签页：
 
 1. 点击 **📊 Batch Processing** 标签页
 2. **上传** Excel 或 CSV 文件
@@ -106,6 +134,8 @@ python app.py
 4. 配置 **Inference Settings**
 5. 点击 **🚀 Run Inference**
 6. 点击 **📥 Export Results** 下载结果
+
+![批量处理界面](docs/screenshots/04_batch_processing.png)
 
 ---
 
