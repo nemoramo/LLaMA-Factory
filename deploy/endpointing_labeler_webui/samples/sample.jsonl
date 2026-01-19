@@ -1,0 +1,2 @@
+{"request_id":"test-1","session_id":"sess-001","lang":"en-US","asr":{"text":"hello"},"history":[{"role":"user","text":"turn on do not disturb mode"},{"role":"assistant","text":"okay do not disturb mode is now on"}],"options":{"treat_unaddressed_as_eou":true,"eou_threshold":0.6}}
+{"request_id":"test-2","session_id":"sess-001","lang":"en-US","asr":{"text":"uh wait"},"history":[{"role":"user","text":"set an alarm"}],"options":{"treat_unaddressed_as_eou":true,"eou_threshold":0.6},"human_label":"<CONT_USER>","note":"ASR 还在续说"}

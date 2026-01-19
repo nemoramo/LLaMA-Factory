@@ -1,0 +1,8 @@
+{
+  "grpc_target": "127.0.0.1:50051",
+  "timeout_s": 15,
+  "lang": "en-US",
+  "treat_unaddressed_as_eou": true,
+  "eou_threshold": 0.6,
+  "concurrency": 8
+}
