@@ -5,11 +5,58 @@ Excel import/export handler for Endpointing WebUI.
 """
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+
+
+def parse_simple_history_format(text: str) -> Optional[str]:
+    """
+    Parse simple text format history to JSON.
+
+    Supported formats:
+    - "A: Hello | U: Hi there" (pipe separated)
+    - "A: Hello\\nU: Hi there" (newline separated)
+    - "assistant: Hello | user: Hi" (full role names)
+
+    Returns JSON string or None if parsing fails.
+    """
+    if not text or not text.strip():
+        return None
+
+    text = text.strip()
+
+    if text.startswith("["):
+        return text
+
+    if "|" in text:
+        parts = [p.strip() for p in text.split("|")]
+    else:
+        parts = [p.strip() for p in text.split("\n") if p.strip()]
+
+    if not parts:
+        return None
+
+    result = []
+    role_pattern = re.compile(r"^(A|U|assistant|user)\s*:\s*(.+)$", re.IGNORECASE)
+
+    for part in parts:
+        match = role_pattern.match(part.strip())
+        if match:
+            role_char = match.group(1).lower()
+            content = match.group(2).strip()
+
+            if role_char in ("a", "assistant"):
+                role = "assistant"
+            else:
+                role = "user"
+
+            result.append({"role": role, "text": content})
+
+    return json.dumps(result) if result else None
 
 
 class ExcelHandler:
@@ -143,11 +190,13 @@ class ExcelHandler:
         asr_col = self.column_mapping.get("asr_text")
         asr_text = str(row[asr_col]) if asr_col and pd.notna(row.get(asr_col)) else ""
 
-        # Get history JSON
+        # Get history (supports both JSON and simple text format)
         history_col = self.column_mapping.get("history")
         history = None
         if history_col and pd.notna(row.get(history_col)):
-            history = str(row[history_col])
+            raw_history = str(row[history_col]).strip()
+            if raw_history:
+                history = parse_simple_history_format(raw_history)
 
         # Get language
         lang_col = self.column_mapping.get("lang")
