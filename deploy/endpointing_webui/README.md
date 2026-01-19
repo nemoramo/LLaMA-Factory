@@ -336,7 +336,7 @@ endpointing_webui/
 
 ## 🔗 相关项目
 
-- [vLLM Endpointing gRPC 服务](../../deploy/vllm_endpointing_grpc/)：本 WebUI 连接的 gRPC 服务端
+- [vLLM Endpointing gRPC 服务](../vllm_endpointing_grpc/)：本 WebUI 连接的 gRPC 服务端
 - [LLaMA Factory](https://github.com/hiyouga/LLaMA-Factory)：模型训练的父项目
 
 ---
