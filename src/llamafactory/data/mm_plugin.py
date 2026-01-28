@@ -68,6 +68,13 @@ try:
 except Exception:  # noqa: BLE001
     librosa = None
 
+# Optional audioread support. Helps load non-soundfile formats (e.g. mp3) without
+# relying on librosa's deprecated internal audioread loader.
+try:
+    import audioread  # type: ignore[import-untyped]
+except Exception:  # noqa: BLE001
+    audioread = None
+
 # Optional soundfile support. Fast path for wav/flac/ogg-style local audio.
 try:
     import soundfile as soundfile  # type: ignore[import-untyped]
@@ -385,6 +392,51 @@ class MMPluginMixin:
         waveform = (samples.astype(np.float32) / max_val).astype(np.float32)
         return waveform, float(segment.frame_rate)
 
+    def _load_audio_with_audioread(
+        self,
+        path: str,
+        sampling_rate: float,
+    ) -> tuple[NDArray, float]:
+        r"""Load audio with audioread and return mono float32 waveform."""
+        if audioread is None:
+            raise ImportError(
+                "Loading audio requires `audioread`. Please install it in your environment, e.g. `pip install audioread`."
+            )
+
+        with audioread.audio_open(path) as f:
+            sr = int(getattr(f, "samplerate", 0) or 0)
+            channels = int(getattr(f, "channels", 0) or 0)
+            if sr <= 0 or channels <= 0:
+                raise ValueError(f"Invalid audio metadata from audioread: sr={sr} channels={channels}")
+
+            raw = bytearray()
+            for buf in f:
+                raw.extend(buf)
+
+        if len(raw) == 0:
+            raise ValueError("Empty audio data from audioread.")
+
+        samples = np.frombuffer(raw, dtype=np.dtype("<i2"))
+        if samples.size == 0:
+            raise ValueError("Empty decoded samples from audioread.")
+
+        if channels > 1:
+            usable = samples.size - (samples.size % channels)
+            if usable <= 0:
+                raise ValueError(f"Invalid decoded audio length: n={samples.size} channels={channels}")
+            samples = samples[:usable].reshape(-1, channels).mean(axis=1)
+
+        waveform = (samples.astype(np.float32) / 32768.0).astype(np.float32)
+
+        target_sr = int(sampling_rate) if sampling_rate is not None else sr
+        if sr != target_sr:
+            if librosa is None:
+                raise ImportError("Resampling requires `librosa`.")
+            waveform = librosa.resample(waveform, orig_sr=sr, target_sr=target_sr).astype(np.float32)
+            sr = target_sr
+
+        return waveform, float(sr)
+
     def _load_single_audio(
         self,
         audio: AudioInput,
@@ -461,7 +513,7 @@ class MMPluginMixin:
                     "Please install at least one of them, e.g. `pip install pydub`."
                 )
 
-            # Local path – prefer soundfile (fast for wav/flac/ogg), then pydub, then librosa.
+            # Local path – prefer soundfile (fast for wav/flac/ogg), then pydub, then audioread, then librosa.
             if soundfile is not None:
                 try:
                     data, sr = soundfile.read(path, dtype="float32", always_2d=True)
@@ -483,6 +535,12 @@ class MMPluginMixin:
             if AudioSegment is not None:
                 try:
                     return self._load_audio_with_pydub(path, sampling_rate)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if audioread is not None:
+                try:
+                    return self._load_audio_with_audioread(path, sampling_rate)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1885,7 +1943,11 @@ class FunAudioChatPlugin(BasePlugin):
             return None
 
     def _extract_audio_fields(self, audio: AudioInput) -> tuple[str | None, str | None, float | None, int | None]:
-        r"""Return (path, token_str, duration_sec, num_frames) if available."""
+        r"""Return (path, token_str, duration_sec, num_frames) if available.
+
+        Note: Some datasets store per-utterance `offset`+`duration` for long audio files (e.g., MGB2).
+        In that case, `duration_sec` is segment-level, so we must avoid caching it for the full path.
+        """
         if not isinstance(audio, str):
             return None, None, None, None
 
@@ -1895,6 +1957,28 @@ class FunAudioChatPlugin(BasePlugin):
 
         path = obj.get("path") or obj.get("wav_path") or obj.get("audio_path")
         token = obj.get("token")
+
+        offset_sec = None
+        for k in (
+            "offset_sec",
+            "offset_secs",
+            "offset_seconds",
+            "offset",
+            "start_sec",
+            "start_secs",
+            "start_seconds",
+            "start_time",
+            "start",
+        ):
+            if k not in obj:
+                continue
+            try:
+                o = float(obj.get(k))
+                if math.isfinite(o) and o >= 0:
+                    offset_sec = o
+                    break
+            except Exception:  # noqa: BLE001
+                continue
 
         duration_sec = None
         for k in ("duration_sec", "duration_secs", "duration_seconds", "duration"):
@@ -1933,7 +2017,8 @@ class FunAudioChatPlugin(BasePlugin):
             except Exception:  # noqa: BLE001
                 continue
 
-        if duration_sec is not None and path:
+        # Only cache full-file durations. For segment-based audio items, caching would be incorrect.
+        if duration_sec is not None and path and offset_sec is None:
             self._cache_set_duration_sec(str(path), duration_sec)
 
         return path or None, token or None, duration_sec, num_frames
@@ -1942,9 +2027,114 @@ class FunAudioChatPlugin(BasePlugin):
     def _load_single_audio(self, audio: AudioInput, sampling_rate: float) -> tuple[NDArray, float]:
         # Support JSON-encoded audio items (from FunAudioChat dataset format).
         if isinstance(audio, str):
-            path, _, _, _ = self._extract_audio_fields(audio)
-            if path is None or path == "":
+            obj = self._parse_audio_json(audio)
+            if obj is None:
+                path = audio
+                offset_sec = None
+                duration_sec = None
+            else:
+                path = obj.get("path") or obj.get("wav_path") or obj.get("audio_path") or ""
+                if path.startswith("file://"):
+                    path = path[7:]
+
+                offset_sec = None
+                for k in (
+                    "offset_sec",
+                    "offset_secs",
+                    "offset_seconds",
+                    "offset",
+                    "start_sec",
+                    "start_secs",
+                    "start_seconds",
+                    "start_time",
+                    "start",
+                ):
+                    if k not in obj:
+                        continue
+                    try:
+                        o = float(obj.get(k))
+                        if math.isfinite(o) and o >= 0:
+                            offset_sec = o
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+
+                duration_sec = None
+                for k in ("duration_sec", "duration_secs", "duration_seconds", "duration"):
+                    if k not in obj:
+                        continue
+                    try:
+                        d = float(obj.get(k))
+                        if math.isfinite(d) and d >= 0:
+                            duration_sec = d
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+
+            if not isinstance(path, str) or path == "":
                 return np.zeros(0, dtype=np.float32), float(sampling_rate)
+
+            # Segment-based loading (offset + duration) for local WAV files.
+            if offset_sec is not None and duration_sec is not None and path.lower().endswith(".wav") and path.startswith("s3://") is False:
+                import wave
+
+                try:
+                    with wave.open(path, "rb") as wf:
+                        sr = int(wf.getframerate())
+                        nch = int(wf.getnchannels())
+                        sampwidth = int(wf.getsampwidth())
+                        total_frames = int(wf.getnframes())
+
+                        start_frame = max(0, int(float(offset_sec) * float(sr)))
+                        num_frames = max(0, int(float(duration_sec) * float(sr)))
+                        if start_frame >= total_frames or num_frames <= 0:
+                            return np.zeros(0, dtype=np.float32), float(sampling_rate)
+
+                        wf.setpos(min(start_frame, total_frames))
+                        raw = wf.readframes(min(num_frames, max(0, total_frames - start_frame)))
+
+                    if sampwidth == 1:
+                        samples = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+                        samples = (samples - 128.0) / 128.0
+                    elif sampwidth == 2:
+                        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                        samples = samples / float(1 << 15)
+                    elif sampwidth == 3:
+                        u8 = np.frombuffer(raw, dtype=np.uint8)
+                        if len(u8) % 3 != 0:
+                            u8 = u8[: len(u8) - (len(u8) % 3)]
+                        u8 = u8.reshape(-1, 3)
+                        vals = (
+                            (u8[:, 0].astype(np.int32))
+                            | (u8[:, 1].astype(np.int32) << 8)
+                            | (u8[:, 2].astype(np.int32) << 16)
+                        )
+                        sign = vals & 0x800000
+                        vals = vals - (sign << 1)
+                        samples = vals.astype(np.float32) / float(1 << 23)
+                    elif sampwidth == 4:
+                        samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32)
+                        samples = samples / float(1 << 31)
+                    else:
+                        raise ValueError(f"Unsupported WAV sample width: {sampwidth}")
+
+                    if nch > 1:
+                        samples = samples.reshape(-1, nch).mean(axis=1).astype(np.float32)
+                    else:
+                        samples = samples.astype(np.float32)
+
+                    target_sr = int(sampling_rate) if sampling_rate is not None else sr
+                    if int(sr) != int(target_sr):
+                        if librosa is None:
+                            raise ImportError("Resampling requires `librosa`.")
+                        samples = librosa.resample(samples, orig_sr=int(sr), target_sr=int(target_sr)).astype(np.float32)
+                        sr = target_sr
+
+                    return samples, float(sr)
+                except Exception:  # noqa: BLE001
+                    # Fall back to the default loader on failure.
+                    pass
+
             audio = path
         return super()._load_single_audio(audio, sampling_rate)
 
@@ -1995,7 +2185,8 @@ class FunAudioChatPlugin(BasePlugin):
 
                 speech.append(speech_str)
                 if path is not None and path != "":
-                    feature_audios.append(path)
+                    # Keep the original string so JSON-encoded audio metadata (e.g., offset) is preserved.
+                    feature_audios.append(audio)
                     feature_exist_mask.append(True)
                 else:
                     feature_exist_mask.append(False)

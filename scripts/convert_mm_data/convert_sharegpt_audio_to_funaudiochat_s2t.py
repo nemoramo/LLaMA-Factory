@@ -170,6 +170,11 @@ def _safe_duration_sec(value: Any) -> Optional[float]:
     return d
 
 
+def _safe_offset_sec(value: Any) -> Optional[float]:
+    # Offset shares the same validation as duration (finite, >= 0).
+    return _safe_duration_sec(value)
+
+
 def _pick_from_prompt_pool(prompt_pool: Any, keywords: tuple[str, ...]) -> Optional[str]:
     if not isinstance(prompt_pool, list):
         return None
@@ -303,6 +308,14 @@ def convert_file(
             if duration_value is None:
                 duration_value = obj.get("duration")
             duration_sec = _safe_duration_sec(duration_value)
+            offset_value = obj.get("audio_offset")
+            if offset_value is None:
+                offset_value = obj.get("offset")
+            if offset_value is None:
+                offset_value = obj.get("start_time")
+            if offset_value is None:
+                offset_value = obj.get("start")
+            offset_sec = _safe_offset_sec(offset_value)
             if duration_sec is None and isinstance(obj.get("durations"), list) and len(obj.get("durations")) == 1:
                 duration_sec = _safe_duration_sec(obj["durations"][0])
             prompt_pool = obj.get("prompt_pool")
@@ -330,6 +343,8 @@ def convert_file(
             }
             if duration_sec is not None:
                 audio_item["duration"] = duration_sec
+            if offset_sec is not None:
+                audio_item["offset"] = offset_sec
             if not no_token:
                 token_str = _build_pad_token_str(
                     audio_path,
