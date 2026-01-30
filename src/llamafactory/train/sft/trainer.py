@@ -17,6 +17,7 @@
 
 import json
 import os
+import time
 from contextlib import contextmanager
 from functools import partial
 from types import MethodType
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import numpy as np
 import torch
 from transformers import Seq2SeqTrainer
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 from typing_extensions import override
 
 from ...extras import logging
@@ -47,6 +49,8 @@ logger = logging.get_logger(__name__)
 
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
+
+    _AUDIO_PROGRESS_FILENAME = "audio_progress.json"
 
     @override
     def _load_rng_state(self, checkpoint: Optional[str]) -> None:
@@ -157,12 +161,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         model_args: Optional["ModelArguments"] = None,
         eval_data_collator: Optional[Any] = None,
         gen_kwargs: Optional[dict[str, Any]] = None,
+        audio_total_duration_sec: float | None = None,
+        audio_progress_enabled: bool = False,
+        audio_total_duration_ready: bool | None = None,
+        audio_duration_cache_path: str | None = None,
+        audio_duration_expected_files: dict[str, tuple[int, int]] | None = None,
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
         # Configure FP8 environment if enabled
         training_args: TrainingArguments = kwargs.get("args")
-        if training_args.fp8:
+        if bool(getattr(training_args, "fp8", False)):
             configure_fp8_environment(training_args)
             if getattr(training_args, "fp8_backend", "auto") == "te":
                 patch_accelerator_for_fp8()
@@ -180,6 +189,21 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs
 
+        self._audio_total_duration_sec = float(audio_total_duration_sec or 0.0)
+        self._audio_consumed_duration_sec = 0.0
+        self._audio_duration_cache_path = str(audio_duration_cache_path) if audio_duration_cache_path else None
+        self._audio_duration_expected_files = audio_duration_expected_files or {}
+        self._audio_total_duration_ready = (
+            bool(audio_total_duration_ready)
+            if audio_total_duration_ready is not None
+            else bool(self._audio_total_duration_sec > 0)
+        )
+        self._audio_progress_enabled = bool(audio_progress_enabled) or bool(self._audio_total_duration_sec > 0)
+        self._audio_cache_last_mtime = 0.0
+        self._audio_cache_last_check_time = 0.0
+        if self._audio_progress_enabled:
+            self._audio_consumed_duration_sec = float(self._try_load_audio_progress_sec() or 0.0)
+
         if processor is not None:
             self.add_callback(SaveProcessorCallback(processor))
 
@@ -189,24 +213,28 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.accelerator.clip_grad_norm_ = MethodType(clip_grad_norm_old_version, self.accelerator)
             self.add_callback(BAdamCallback)
 
-        if finetuning_args.use_dft_loss and finetuning_args.use_chunked_ce_loss:
+        use_dft_loss = bool(getattr(finetuning_args, "use_dft_loss", False))
+        use_chunked_ce_loss = bool(getattr(finetuning_args, "use_chunked_ce_loss", False))
+        use_eaft_loss = bool(getattr(finetuning_args, "use_eaft_loss", False))
+
+        if use_dft_loss and use_chunked_ce_loss:
             raise ValueError("`use_dft_loss` and `use_chunked_ce_loss` are mutually exclusive.")
-        if finetuning_args.use_dft_loss and getattr(finetuning_args, "use_eaft_loss", False):
+        if use_dft_loss and use_eaft_loss:
             raise ValueError("`use_dft_loss` and `use_eaft_loss` are mutually exclusive.")
-        if finetuning_args.use_chunked_ce_loss and getattr(finetuning_args, "use_eaft_loss", False):
+        if use_chunked_ce_loss and use_eaft_loss:
             raise ValueError("`use_chunked_ce_loss` and `use_eaft_loss` are mutually exclusive.")
 
-        if finetuning_args.use_dft_loss:
+        if use_dft_loss:
             from ..trainer_utils import dft_loss_func
 
             self.compute_loss_func = dft_loss_func
-        elif getattr(finetuning_args, "use_eaft_loss", False):
+        elif use_eaft_loss:
             from ..trainer_utils import eaft_loss_func
 
             self.compute_loss_func = lambda outputs, labels, num_items_in_batch=None: eaft_loss_func(
-                outputs, labels, num_items_in_batch, finetuning_args.eaft_alpha
+                outputs, labels, num_items_in_batch, float(getattr(finetuning_args, "eaft_alpha", 1.0))
             )
-        elif finetuning_args.use_chunked_ce_loss:
+        elif use_chunked_ce_loss:
             from ..trainer_utils import chunked_ce_loss_func
 
             if self.label_smoother is not None:
@@ -216,13 +244,178 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             shift_labels = not bool(getattr(getattr(unwrapped_model, "config", None), "is_encoder_decoder", False))
             self.compute_loss_func = partial(
                 chunked_ce_loss_func,
-                num_output_chunks=finetuning_args.chunked_ce_num_chunks,
-                upcast_logits=finetuning_args.chunked_ce_upcast_logits,
+                num_output_chunks=int(getattr(finetuning_args, "chunked_ce_num_chunks", 8)),
+                upcast_logits=bool(getattr(finetuning_args, "chunked_ce_upcast_logits", True)),
                 shift_labels=shift_labels,
             )
 
-        if training_args.fp8 and hasattr(self, "accelerator"):  # verify FP8 status after trainer initialization
+        if bool(getattr(training_args, "fp8", False)) and hasattr(self, "accelerator"):  # verify FP8 status
             verify_fp8_status(self.accelerator, training_args)
+
+    def _get_resume_checkpoint_path(self) -> str | None:
+        resume = getattr(self.args, "resume_from_checkpoint", None)
+        if isinstance(resume, str) and resume and os.path.isdir(resume):
+            return resume
+        try:
+            last = get_last_checkpoint(self.args.output_dir)
+        except Exception:
+            last = None
+        if isinstance(last, str) and last and os.path.isdir(last):
+            return last
+        return None
+
+    def _try_load_audio_progress_sec(self) -> float | None:
+        ckpt = self._get_resume_checkpoint_path()
+        if ckpt is None:
+            return None
+        path = os.path.join(ckpt, self._AUDIO_PROGRESS_FILENAME)
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                obj = json.load(f)
+        except Exception:
+            return None
+        v = obj.get("consumed_audio_duration_sec")
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    @override
+    def training_step(
+        self, model: torch.nn.Module, inputs: dict[str, Any], num_items_in_batch: Optional[int] = None
+    ) -> torch.Tensor:
+        audio_dur = inputs.pop("audio_duration_sec", None)
+        if self._audio_progress_enabled and audio_dur is not None:
+            try:
+                if torch.is_tensor(audio_dur):
+                    batch_sec = float(audio_dur.detach().sum().item())
+                elif isinstance(audio_dur, (list, tuple)):
+                    batch_sec = float(sum(float(x) for x in audio_dur if x is not None))
+                else:
+                    batch_sec = float(audio_dur)
+            except Exception:
+                batch_sec = 0.0
+
+            if batch_sec > 0:
+                t = torch.tensor(batch_sec, device=self.args.device, dtype=torch.float32)
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                self._audio_consumed_duration_sec += float(t.item())
+
+        return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+    def _maybe_refresh_audio_total_duration_sec(self) -> None:
+        if not self._audio_progress_enabled or self._audio_total_duration_ready:
+            return
+        if not self._audio_duration_cache_path or not self._audio_duration_expected_files:
+            return
+        now = time.time()
+        if now - float(self._audio_cache_last_check_time or 0.0) < 60.0:
+            return
+        self._audio_cache_last_check_time = now
+
+        try:
+            st = os.stat(self._audio_duration_cache_path)
+            cache_mtime = float(st.st_mtime)
+        except OSError:
+            return
+        if cache_mtime <= float(self._audio_cache_last_mtime or 0.0):
+            return
+
+        try:
+            with open(self._audio_duration_cache_path, encoding="utf-8") as f:
+                obj = json.load(f)
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(obj, dict):
+            return
+
+        total = obj.get("total_duration_sec")
+        try:
+            total_sec = float(total) if total is not None else 0.0
+        except Exception:
+            total_sec = 0.0
+        if not (total_sec > 0):
+            return
+
+        files = obj.get("files")
+        if not isinstance(files, dict):
+            return
+        for path, (size, mtime) in self._audio_duration_expected_files.items():
+            entry = files.get(path)
+            if not isinstance(entry, dict):
+                return
+            try:
+                if int(entry.get("size", -1)) != int(size) or int(entry.get("mtime", -1)) != int(mtime):
+                    return
+            except Exception:
+                return
+            try:
+                if float(entry.get("duration_sec") or 0.0) <= 0:
+                    return
+            except Exception:
+                return
+
+        self._audio_total_duration_sec = float(total_sec)
+        self._audio_total_duration_ready = True
+        self._audio_cache_last_mtime = cache_mtime
+        logger.info_rank0("Audio duration cache ready: total_hours=%.2f", float(total_sec) / 3600.0)
+
+    @override
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        if self._audio_progress_enabled:
+            self._maybe_refresh_audio_total_duration_sec()
+            logs = dict(logs)
+            logs["audio_hours"] = float(self._audio_consumed_duration_sec / 3600.0)
+            if self._audio_total_duration_sec > 0:
+                logs["audio_total_hours"] = float(self._audio_total_duration_sec / 3600.0)
+            logs["audio_total_ready"] = bool(self._audio_total_duration_ready)
+            if self._audio_total_duration_ready and self._audio_total_duration_sec > 0:
+                logs["audio_epoch"] = float(self._audio_consumed_duration_sec / self._audio_total_duration_sec)
+        return super().log(logs, start_time=start_time)
+
+    def _write_audio_progress(self, checkpoint_dir: str | None = None) -> None:
+        if not self._audio_progress_enabled:
+            return
+
+        payload = {
+            "global_step": int(getattr(self.state, "global_step", 0) or 0),
+            "consumed_audio_duration_sec": float(self._audio_consumed_duration_sec),
+            "total_audio_duration_sec": float(self._audio_total_duration_sec),
+            "audio_total_ready": bool(self._audio_total_duration_ready),
+            "audio_epoch": float(self._audio_consumed_duration_sec / self._audio_total_duration_sec)
+            if self._audio_total_duration_sec > 0
+            else 0.0,
+            "audio_hours": float(self._audio_consumed_duration_sec / 3600.0),
+            "audio_total_hours": float(self._audio_total_duration_sec / 3600.0),
+        }
+
+        def _dump(path: str) -> None:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+                    f.write("\n")
+            except Exception as err:  # noqa: BLE001
+                logger.warning_rank0("Failed to write audio progress to %s: %s", path, err)
+
+        if checkpoint_dir is not None:
+            _dump(os.path.join(checkpoint_dir, self._AUDIO_PROGRESS_FILENAME))
+        _dump(os.path.join(self.args.output_dir, "audio_progress_latest.json"))
+
+    @override
+    def _save_checkpoint(self, model, trial, metrics=None) -> None:
+        try:
+            if metrics is None:
+                super()._save_checkpoint(model, trial)
+            else:
+                super()._save_checkpoint(model, trial, metrics)
+        except TypeError:
+            super()._save_checkpoint(model, trial)
+        if self.args.should_save:
+            checkpoint_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
+            self._write_audio_progress(checkpoint_dir=checkpoint_dir)
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -263,6 +456,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
         self._update_effective_tokens_seen(model, inputs)
+
+        # Remove auxiliary metadata keys that are not accepted by `model.forward()`.
+        # For FunAudioChat, `audio_duration_sec` is used for progress logging but should never be passed to the model.
+        if isinstance(inputs, dict) and "audio_duration_sec" in inputs:
+            inputs = dict(inputs)
+            inputs.pop("audio_duration_sec", None)
 
         return_outputs = kwargs.get("return_outputs", False)
         num_items_in_batch = kwargs.get("num_items_in_batch", None)
@@ -400,6 +599,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         #   but still keep `eval_loss` for best-checkpoint selection.
         # - Passing `labels` into `model.generate()` is wasteful and can break some models.
         #   Therefore we compute loss in a separate loss-only forward pass.
+
+        # Strip auxiliary metadata that should not be fed into forward/generate.
+        if "audio_duration_sec" in inputs:
+            inputs = dict(inputs)
+            inputs.pop("audio_duration_sec", None)
 
         labels = inputs.get("labels")
 
