@@ -647,6 +647,10 @@ pip install .
   - `dynamic_prompt_packing: true`
   - `dynamic_prompt_sampling: true`
   - 根据 CPU/RAM 调整缓冲参数（例如 `dynamic_prompt_packing_buffer_size`、`dynamic_prompt_packing_prefetch_buffers`）。
+  - 推荐起始参数：
+    - `dynamic_prompt_packing_buffer_size`：`2048`（保守）、`4096~8192`（推荐）、`20000`（打包效率最高但更吃 CPU/RAM）。
+    - `dynamic_prompt_packing_prefetch_buffers`：`2`（推荐）、`4`（如果 buffer 边界 GPU 会空转）、`0`（CPU/RAM 紧张则关闭）。
+    - `dynamic_prompt_packing_carryover_packs`：`2`（推荐“跨 buffer 打包”/cross-pack）、`0`（buffer 足够大或希望顺序更严格时关闭）。
 - 常用性能开关：
   - `flash_attn: fa2`（需要安装 FlashAttention-2）
   - `bf16: true`（Ampere+ GPU 推荐）

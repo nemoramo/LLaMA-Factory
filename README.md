@@ -646,6 +646,10 @@ If you are doing supervised fine-tuning (SFT), packed training is usually the be
   - `dynamic_prompt_packing: true`
   - `dynamic_prompt_sampling: true`
   - Tune buffers for your host CPU/RAM (e.g., `dynamic_prompt_packing_buffer_size`, `dynamic_prompt_packing_prefetch_buffers`).
+  - Suggested starting points:
+    - `dynamic_prompt_packing_buffer_size`: `2048` (safe), `4096~8192` (recommended), `20000` (max packing efficiency, CPU/RAM heavy).
+    - `dynamic_prompt_packing_prefetch_buffers`: `2` (recommended), `4` (if you see GPU idle at buffer boundaries), `0` (disable if CPU/RAM tight).
+    - `dynamic_prompt_packing_carryover_packs`: `2` (recommended cross-buffer packing when buffer is small), `0` (disable when buffer is large or you want stricter order).
 - Common performance toggles:
   - `flash_attn: fa2` (requires FlashAttention-2)
   - `bf16: true` (recommended on Ampere+ GPUs)
