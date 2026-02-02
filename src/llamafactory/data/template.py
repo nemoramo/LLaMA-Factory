@@ -1872,6 +1872,19 @@ register_template(
 )
 
 
+# Qwen3-ASR: ChatML-style formatting with Qwen3-ASR audio placeholder expansion.
+register_template(
+    name="qwen3_asr",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    default_system="You are a helpful assistant.",
+    stop_words=["<|im_end|>"],
+    replace_eos=True,
+    mm_plugin=get_mm_plugin(name="qwen3_asr", audio_token="<|audio_pad|>"),
+)
+
+
 # copied from chatml template
 register_template(
     name="qwen2_audio",

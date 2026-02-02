@@ -1750,6 +1750,79 @@ class Qwen2AudioPlugin(BasePlugin):
         self._validate_input(processor, images, videos, audios)
         return self._get_mm_inputs(images, videos, audios, processor)
 
+@dataclass
+class Qwen3ASRPlugin(BasePlugin):
+    """Multimodal plugin for Qwen3-ASR.
+
+    Qwen3-ASR expands each `<audio>` placeholder into:
+      <audio_bos_token> + <audio_token> * N + <audio_eos_token>
+
+    where `N` is computed from `feature_attention_mask` via the same length rule used by
+    `qwen_asr.core.transformers_backend.processing_qwen3_asr._get_feat_extract_output_lengths`.
+    """
+
+    @staticmethod
+    def _get_audio_token_length(feature_length: int) -> int:
+        # Mirrors Qwen3ASRProcessor's `_get_feat_extract_output_lengths`.
+        input_lengths_leave = feature_length % 100
+        feat_lengths = (input_lengths_leave - 1) // 2 + 1
+        output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_length // 100) * 13
+        return int(output_lengths)
+
+    @override
+    def process_messages(
+        self,
+        messages: list[dict[str, str]],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
+    ) -> list[dict[str, str]]:
+        self._validate_input(processor, images, videos, audios)
+        self._validate_messages(messages, images, videos, audios)
+        bos_token: str = getattr(processor, "audio_bos_token")
+        eos_token: str = getattr(processor, "audio_eos_token")
+        messages = deepcopy(messages)
+        audio_lengths: list[int] = []
+        if self.expand_mm_tokens:
+            mm_inputs = self._get_mm_inputs([], [], audios, processor)
+            if "feature_attention_mask" in mm_inputs:
+                audio_lengths = mm_inputs["feature_attention_mask"].sum(-1).tolist()
+
+        for message in messages:
+            content = message["content"]
+            while AUDIO_PLACEHOLDER in content:
+                if self.expand_mm_tokens and audio_lengths:
+                    feature_length = int(audio_lengths.pop(0))
+                    audio_seqlen = max(1, self._get_audio_token_length(feature_length))
+                else:
+                    audio_seqlen = 1
+
+                content = content.replace(
+                    AUDIO_PLACEHOLDER,
+                    f"{bos_token}{self.audio_token * audio_seqlen}{eos_token}",
+                    1,
+                )
+
+            message["content"] = content
+
+        return messages
+
+    @override
+    def get_mm_inputs(
+        self,
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        imglens: list[int],
+        vidlens: list[int],
+        audlens: list[int],
+        batch_ids: list[list[int]],
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
+        self._validate_input(processor, images, videos, audios)
+        return self._get_mm_inputs(images, videos, audios, processor)
+
 
 @dataclass
 class VoxtralPlugin(BasePlugin):
@@ -3123,6 +3196,7 @@ PLUGINS = {
     "pixtral": PixtralPlugin,
     "funaudiochat": FunAudioChatPlugin,
     "qwen2_audio": Qwen2AudioPlugin,
+    "qwen3_asr": Qwen3ASRPlugin,
     "voxtral": VoxtralPlugin,
     "qwen2_omni": Qwen2OmniPlugin,
     "qwen2_vl": Qwen2VLPlugin,

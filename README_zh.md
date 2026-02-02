@@ -636,6 +636,45 @@ pip install .
 
 您也可以使用 **[Easy Dataset](https://github.com/ConardLi/easy-dataset)**、**[DataFlow](https://github.com/OpenDCAI/DataFlow)** 和 **[GraphGen](https://github.com/open-sciencelab/GraphGen)** 构建用于微调的合成数据。
 
+#### SFT 推荐参数（强烈建议：dynamic packing + neat packing）
+
+如果是监督微调（SFT），通常建议默认开启打包训练以提升吞吐与上下文利用率。
+
+- 开启打包训练：
+  - `packing: true`
+  - `neat_packing: true`（无污染打包，推荐）
+- 如果你的数据是 **prompt pool / 动态采样** 风格，建议开启 on-the-fly 动态打包：
+  - `dynamic_prompt_packing: true`
+  - `dynamic_prompt_sampling: true`
+  - 根据 CPU/RAM 调整缓冲参数（例如 `dynamic_prompt_packing_buffer_size`、`dynamic_prompt_packing_prefetch_buffers`）。
+- 常用性能开关：
+  - `flash_attn: fa2`（需要安装 FlashAttention-2）
+  - `bf16: true`（Ampere+ GPU 推荐）
+  - `gradient_checkpointing: true`（显存紧张时开启）
+- 常用起始超参建议：
+  - **LoRA**：`finetuning_type: lora`、`learning_rate: 1e-4`、`lora_rank: 8`（rank/alpha 随模型与数据调优）。
+  - **全参**：`finetuning_type: full`、`learning_rate: 1e-5`（常见范围：`5e-6` ~ `2e-5`）、`lr_scheduler_type: cosine`、`warmup_ratio: 0.02`。
+- 评测建议：
+  - 快速迭代可设置 `eval_num_samples: 16`（或类似）避免评测过久。
+  - 最终汇报请在完整验证/测试集上评测。
+
+#### 数据制作流程（SFT）
+
+1. 将原始数据转换为支持的格式（推荐：`sharegpt`）。
+2. 在 `data/dataset_info.json`（或 `dataset_dir` 下的本地 `dataset_info.json`）中注册数据集。
+3. 使用 `llamafactory-cli train <your_config>.yaml` 开始训练。
+
+示例：将 FunAudioChat 风格的 S2T jsonl 转换为 ShareGPT-audio（用于 ASR/S2T 模板）：
+
+```bash
+python scripts/convert_mm_data/convert_funaudiochat_s2t_to_qwen3_asr_sharegpt_audio.py \
+  --input <input.jsonl> \
+  --output <output.jsonl> \
+  --keep-system --keep-prompt-pool --keep-duration
+```
+
+然后在 `data/dataset_info.json` 中添加对应的注册项（ShareGPT-audio 通常是 `messages` + `audios`；可参考 `data/dataset_info.json` 里的现有示例）。
+
 ### 快速开始
 
 下面三行命令分别对 Qwen3-4B-Instruct 模型进行 LoRA **微调**、**推理**和**合并**。

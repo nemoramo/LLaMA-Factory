@@ -123,6 +123,49 @@ def patch_qwen3_omni_moe_thinker_text_sparse_moe_block():
         modeling_qwen3_omni_moe.Qwen3OmniMoeThinkerTextSparseMoeBlock = Qwen3OmniMoeThinkerTextSparseMoeBlock
 
 
+def patch_qwen3_asr_forward(model: "PreTrainedModel") -> None:
+    """Patch Qwen3-ASR outer model to be trainable with Transformers Trainer.
+
+    Qwen3-ASR's outer class (`Qwen3ASRForConditionalGeneration`) implements `generate()` but not `forward()`.
+    For training, we delegate `forward()` to `model.thinker.forward(...)`, matching upstream finetuning script
+    behavior (see QwenLM/Qwen3-ASR `finetuning/qwen3_asr_sft.py`).
+    """
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if not (isinstance(model_type, str) and model_type.startswith("qwen3_asr")):
+        return
+
+    cls = model.__class__
+    if getattr(cls, "_llamafactory_qwen3_asr_forward_patched", False):
+        return
+
+    thinker = getattr(model, "thinker", None)
+    if thinker is None or not hasattr(thinker, "forward"):
+        logger.debug("Skip Qwen3-ASR forward patch: missing `model.thinker.forward`.")
+        return
+
+    def _patched_forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        input_features=None,
+        feature_attention_mask=None,
+        labels=None,
+        **kwargs,
+    ):
+        return self.thinker.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            labels=labels,
+            **kwargs,
+        )
+
+    cls.forward = _patched_forward  # type: ignore[assignment]
+    setattr(cls, "_llamafactory_qwen3_asr_forward_patched", True)
+    logger.info_rank0("Patched Qwen3-ASR to delegate forward() to `thinker.forward` for training.")
+
+
 def patch_tokenizer(tokenizer: "PreTrainedTokenizer", model_args: "ModelArguments") -> None:
     if "PreTrainedTokenizerBase" not in str(tokenizer._pad.__func__):
         tokenizer._pad = MethodType(PreTrainedTokenizerBase._pad, tokenizer)
@@ -257,8 +300,11 @@ def patch_model(
     ):
         gen_config.do_sample = True
 
-    if getattr(model.config, "model_type", None) not in ["minicpmv", "minicpmo"] and "GenerationMixin" not in str(
-        model.generate.__func__
+    model_type = getattr(model.config, "model_type", None)
+    if (
+        model_type not in ["minicpmv", "minicpmo"]
+        and not (isinstance(model_type, str) and model_type.startswith("qwen3_asr"))
+        and "GenerationMixin" not in str(model.generate.__func__)
     ):
         model.generate = MethodType(GenerationMixin.generate, model)
 
@@ -271,6 +317,8 @@ def patch_model(
 
     if getattr(model.config, "model_type", None) == "voxtral":
         patch_voxtral_inplace_audio_embed()
+
+    patch_qwen3_asr_forward(model)
 
     if getattr(model.config, "model_type", None) == "funaudiochat":
         sp_gen_kwargs = getattr(model, "sp_gen_kwargs", None)

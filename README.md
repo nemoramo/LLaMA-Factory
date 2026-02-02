@@ -635,6 +635,45 @@ Please refer to [data/README.md](data/README.md) for checking the details about 
 
 You can also use **[Easy Dataset](https://github.com/ConardLi/easy-dataset)**, **[DataFlow](https://github.com/OpenDCAI/DataFlow)** and **[GraphGen](https://github.com/open-sciencelab/GraphGen)** to create synthetic data for fine-tuning.
 
+#### Recommended SFT settings (strongly recommended: dynamic packing + neat packing)
+
+If you are doing supervised fine-tuning (SFT), packed training is usually the best default for throughput and context utilization.
+
+- Enable packed training:
+  - `packing: true`
+  - `neat_packing: true` (contamination-free packing, recommended)
+- If your dataset uses **prompt pools / dynamic sampling**, enable on-the-fly packing:
+  - `dynamic_prompt_packing: true`
+  - `dynamic_prompt_sampling: true`
+  - Tune buffers for your host CPU/RAM (e.g., `dynamic_prompt_packing_buffer_size`, `dynamic_prompt_packing_prefetch_buffers`).
+- Common performance toggles:
+  - `flash_attn: fa2` (requires FlashAttention-2)
+  - `bf16: true` (recommended on Ampere+ GPUs)
+  - `gradient_checkpointing: true` (if you are memory bound)
+- Common starting points:
+  - **LoRA**: `finetuning_type: lora`, `learning_rate: 1e-4`, `lora_rank: 8` (tune rank/alpha per model size).
+  - **Full**: `finetuning_type: full`, `learning_rate: 1e-5` (typical range: `5e-6` to `2e-5`), `lr_scheduler_type: cosine`, `warmup_ratio: 0.02`.
+- Evaluation tips:
+  - For fast iteration, set `eval_num_samples: 16` (or similar) to avoid long evaluation.
+  - For final reporting, evaluate on the full validation/test set.
+
+#### Data creation workflow (SFT)
+
+1. Convert your raw data into a supported format (recommended: `sharegpt`).
+2. Register it in `data/dataset_info.json` (or a local `dataset_info.json` under `dataset_dir`).
+3. Train with `llamafactory-cli train <your_config>.yaml`.
+
+Example: convert a FunAudioChat-style S2T jsonl into ShareGPT-audio (for ASR/S2T templates):
+
+```bash
+python scripts/convert_mm_data/convert_funaudiochat_s2t_to_qwen3_asr_sharegpt_audio.py \
+  --input <input.jsonl> \
+  --output <output.jsonl> \
+  --keep-system --keep-prompt-pool --keep-duration
+```
+
+Then add an entry to `data/dataset_info.json` (ShareGPT-audio uses `messages` + `audios`; see existing examples in `data/dataset_info.json`).
+
 ### Quickstart
 
 Use the following 3 commands to run LoRA **fine-tuning**, **inference** and **merging** of the Qwen3-4B-Instruct model, respectively.
