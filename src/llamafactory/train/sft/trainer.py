@@ -282,27 +282,51 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         except Exception:
             return None
 
+    def _pop_audio_duration_sec_from_inputs(self, inputs: Any) -> Any:
+        """Pop audio_duration_sec from inputs (top-level or nested `data` dict)."""
+        if not isinstance(inputs, dict):
+            return None
+        if "audio_duration_sec" in inputs:
+            return inputs.pop("audio_duration_sec", None)
+        data = inputs.get("data")
+        if isinstance(data, dict) and "audio_duration_sec" in data:
+            return data.pop("audio_duration_sec", None)
+        return None
+
     @override
     def training_step(
         self, model: torch.nn.Module, inputs: dict[str, Any], num_items_in_batch: Optional[int] = None
     ) -> torch.Tensor:
-        audio_dur = inputs.pop("audio_duration_sec", None)
+        audio_dur = self._pop_audio_duration_sec_from_inputs(inputs)
         if self._audio_progress_enabled and audio_dur is not None:
+            t = None
             try:
                 if torch.is_tensor(audio_dur):
-                    batch_sec = float(audio_dur.detach().sum().item())
+                    t = audio_dur.detach()
+                    if t.device != self.args.device:
+                        t = t.to(device=self.args.device)
+                    t = t.to(dtype=torch.float32).sum()
                 elif isinstance(audio_dur, (list, tuple)):
-                    batch_sec = float(sum(float(x) for x in audio_dur if x is not None))
+                    s = 0.0
+                    for x in audio_dur:
+                        if x is None:
+                            continue
+                        try:
+                            s += float(x)
+                        except Exception:
+                            continue
+                    t = torch.tensor(float(s), device=self.args.device, dtype=torch.float32)
                 else:
-                    batch_sec = float(audio_dur)
+                    t = torch.tensor(float(audio_dur), device=self.args.device, dtype=torch.float32)
             except Exception:
-                batch_sec = 0.0
+                t = None
 
-            if batch_sec > 0:
-                t = torch.tensor(batch_sec, device=self.args.device, dtype=torch.float32)
+            if t is not None:
                 if torch.distributed.is_available() and torch.distributed.is_initialized():
                     torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
-                self._audio_consumed_duration_sec += float(t.item())
+                sec = float(t.item())
+                if sec > 0:
+                    self._audio_consumed_duration_sec += sec
 
         return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
 
@@ -459,9 +483,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         # Remove auxiliary metadata keys that are not accepted by `model.forward()`.
         # For FunAudioChat, `audio_duration_sec` is used for progress logging but should never be passed to the model.
-        if isinstance(inputs, dict) and "audio_duration_sec" in inputs:
-            inputs = dict(inputs)
-            inputs.pop("audio_duration_sec", None)
+        if isinstance(inputs, dict):
+            copied = False
+            if "audio_duration_sec" in inputs:
+                inputs = dict(inputs)
+                inputs.pop("audio_duration_sec", None)
+                copied = True
+            data = inputs.get("data")
+            if isinstance(data, dict) and "audio_duration_sec" in data:
+                if not copied:
+                    inputs = dict(inputs)
+                data = dict(data)
+                data.pop("audio_duration_sec", None)
+                inputs["data"] = data
 
         return_outputs = kwargs.get("return_outputs", False)
         num_items_in_batch = kwargs.get("num_items_in_batch", None)
@@ -601,9 +635,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         #   Therefore we compute loss in a separate loss-only forward pass.
 
         # Strip auxiliary metadata that should not be fed into forward/generate.
-        if "audio_duration_sec" in inputs:
-            inputs = dict(inputs)
-            inputs.pop("audio_duration_sec", None)
+        if isinstance(inputs, dict):
+            copied = False
+            if "audio_duration_sec" in inputs:
+                inputs = dict(inputs)
+                inputs.pop("audio_duration_sec", None)
+                copied = True
+            data = inputs.get("data")
+            if isinstance(data, dict) and "audio_duration_sec" in data:
+                if not copied:
+                    inputs = dict(inputs)
+                data = dict(data)
+                data.pop("audio_duration_sec", None)
+                inputs["data"] = data
 
         labels = inputs.get("labels")
 

@@ -155,12 +155,41 @@ def _read_jsonl_duration_and_md5(path: str, *, max_bytes_per_sec: float | None =
 
 
 def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
     os.replace(tmp, path)
+
+
+def _expand_dataset_path(path: str) -> list[str]:
+    """Expand a dataset path into a list of regular files.
+
+    The file loader supports `file_name` pointing to a directory of shard files.
+    This helper returns a stable, sorted list of regular files under the directory.
+    """
+    try:
+        if os.path.isdir(path):
+            try:
+                names = sorted(os.listdir(path))
+            except OSError:
+                return []
+            out: list[str] = []
+            for name in names:
+                p = os.path.join(path, name)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    out.append(p)
+            return out
+    except OSError:
+        return []
+    return [path]
 
 
 def compute_total_audio_duration_sec(
@@ -199,8 +228,9 @@ def compute_total_audio_duration_sec(
                 "Audio duration cache: skip non-file dataset %s (load_from=%s).", attr.dataset_name, attr.load_from
             )
             continue
-        # dataset_name is the file_name in DATA_CONFIG (dataset_info.json)
-        files.append(os.path.join(dataset_dir, str(attr.dataset_name)))
+        # dataset_name is the file_name in DATA_CONFIG (dataset_info.json) and can be a directory of shards.
+        root = os.path.join(dataset_dir, str(attr.dataset_name))
+        files.extend(_expand_dataset_path(root))
 
     seen: set[str] = set()
     files = [p for p in files if p and not (p in seen or seen.add(p))]  # preserve order + de-dup
@@ -299,7 +329,7 @@ def _read_json(path: str) -> dict[str, Any] | None:
 
 
 def get_audio_duration_files(*, dataset_dir: str, dataset_names: list[str]) -> list[str]:
-    """Return file-based dataset paths (json/jsonl/etc.) for audio duration scan."""
+    """Return file-based dataset paths (expanded to shard files) for audio duration scan."""
     dataset_attrs = get_dataset_list(dataset_names, dataset_dir)
     files: list[str] = []
     for attr in dataset_attrs:
@@ -308,7 +338,8 @@ def get_audio_duration_files(*, dataset_dir: str, dataset_names: list[str]) -> l
                 "Audio duration cache: skip non-file dataset %s (load_from=%s).", attr.dataset_name, attr.load_from
             )
             continue
-        files.append(os.path.join(dataset_dir, str(attr.dataset_name)))
+        root = os.path.join(dataset_dir, str(attr.dataset_name))
+        files.extend(_expand_dataset_path(root))
 
     seen: set[str] = set()
     return [p for p in files if p and not (p in seen or seen.add(p))]  # preserve order + de-dup

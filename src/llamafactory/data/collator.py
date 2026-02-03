@@ -525,14 +525,21 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         features.update(mm_inputs)
 
+        audio_duration_tensor = None
+        if batch_audio_durations:
+            audio_duration_tensor = torch.tensor(batch_audio_durations, dtype=torch.float32)
+
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape
             features["position_ids"] = torch.arange(seq_length).long().repeat(bsz, 1)
-            features["audio_duration_sec"] = torch.tensor(batch_audio_durations, dtype=torch.float32)
-            return {"data": features, "input_ids": features["input_ids"], "labels": features["labels"]}
+            out = {"data": features, "input_ids": features["input_ids"], "labels": features["labels"]}
+            # NOTE: Keep audio_duration_sec at top-level so it won't be forwarded into the model by wrappers.
+            if audio_duration_tensor is not None:
+                out["audio_duration_sec"] = audio_duration_tensor
+            return out
 
-        if batch_audio_durations:
-            features["audio_duration_sec"] = torch.tensor(batch_audio_durations, dtype=torch.float32)
+        if audio_duration_tensor is not None:
+            features["audio_duration_sec"] = audio_duration_tensor
         return features
 
 
