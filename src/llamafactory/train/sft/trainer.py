@@ -302,10 +302,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             t = None
             try:
                 if torch.is_tensor(audio_dur):
-                    t = audio_dur.detach()
-                    if t.device != self.args.device:
-                        t = t.to(device=self.args.device)
-                    t = t.to(dtype=torch.float32).sum()
+                    ad = audio_dur.detach()
+                    if ad.device.type == "cpu":
+                        sec_local = float(ad.sum().item())
+                        t = torch.tensor(sec_local, device=self.args.device, dtype=torch.float32)
+                    else:
+                        t = ad.to(dtype=torch.float32).sum()
+                        if t.device != self.args.device:
+                            t = t.to(device=self.args.device)
                 elif isinstance(audio_dur, (list, tuple)):
                     s = 0.0
                     for x in audio_dur:
@@ -377,7 +381,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             except Exception:
                 return
             try:
-                if float(entry.get("duration_sec") or 0.0) <= 0:
+                dur = float(entry.get("duration_sec") or 0.0)
+                if int(size) > 0 and dur <= 0:
                     return
             except Exception:
                 return

@@ -381,8 +381,11 @@ def is_audio_duration_cache_complete(
     cached_datasets = obj.get("datasets")
     if cached_dir is not None and str(cached_dir) != str(dataset_dir):
         return False
-    if isinstance(cached_datasets, list) and [str(x) for x in cached_datasets] != [str(x) for x in dataset_names]:
-        return False
+    if isinstance(cached_datasets, list):
+        cached = [str(x) for x in cached_datasets]
+        expected = [str(x) for x in dataset_names]
+        if sorted(cached) != sorted(expected):
+            return False
 
     files = obj.get("files")
     if not isinstance(files, dict):
@@ -397,7 +400,10 @@ def is_audio_duration_cache_complete(
                 return False
         except Exception:
             return False
-        if _safe_float(entry.get("duration_sec")) is None:
+        dur = _safe_float(entry.get("duration_sec"))
+        if dur is None:
+            return False
+        if int(size) > 0 and not (dur > 0):
             return False
 
     return True
