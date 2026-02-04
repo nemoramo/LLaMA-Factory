@@ -19,6 +19,7 @@ import copy
 import hashlib
 import math
 import random
+import re
 import threading
 import time
 from collections import defaultdict
@@ -37,6 +38,75 @@ from .supervised import SupervisedDatasetProcessor
 
 
 logger = logging.get_logger(__name__)
+
+_SEGMENT_DURATION_RE = re.compile(r"_seg\d+_(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\.wav")
+
+
+def _infer_duration_sec_from_audio_field(audio_field: Any) -> float | None:
+    """Infer duration seconds from various audio field formats.
+
+    Supported formats (best-effort):
+    - list[dict] with `duration`/`duration_sec` or `path`
+    - list[str] where each entry can be a path or a JSON string containing a path
+      like "*_seg0001_18.59-23.09.wav" (duration inferred as end-start).
+    """
+    if audio_field is None:
+        return None
+
+    total = 0.0
+    found = False
+
+    stack: list[Any] = [audio_field]
+    while stack:
+        value = stack.pop()
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            stack.extend(value)
+            continue
+
+        if isinstance(value, dict):
+            dict_dur = None
+            for k in ("duration", "duration_sec", "audio_duration", "duration_seconds"):
+                if k in value and value[k] is not None:
+                    try:
+                        dict_dur = float(value[k])
+                    except Exception:
+                        dict_dur = None
+                    break
+            if dict_dur is not None and dict_dur > 0:
+                total += float(dict_dur)
+                found = True
+                continue
+
+            p = value.get("path")
+            if isinstance(p, str):
+                for m in _SEGMENT_DURATION_RE.finditer(p):
+                    try:
+                        start = float(m.group(1))
+                        end = float(m.group(2))
+                    except Exception:
+                        continue
+                    d = max(0.0, end - start)
+                    if d > 0:
+                        total += float(d)
+                        found = True
+            continue
+
+        if isinstance(value, str):
+            for m in _SEGMENT_DURATION_RE.finditer(value):
+                try:
+                    start = float(m.group(1))
+                    end = float(m.group(2))
+                except Exception:
+                    continue
+                d = max(0.0, end - start)
+                if d > 0:
+                    total += float(d)
+                    found = True
+            continue
+
+    return float(total) if found else None
 
 
 def _is_voxtral_processor(processor: Any | None) -> bool:
@@ -701,6 +771,7 @@ class DynamicPromptPackedBatchProcessor:
         has_images = False
         has_videos = False
         has_audios = False
+        packed_audio_duration_sec = 0.0
 
         seg_id = 1
         for seg in segments:
@@ -722,6 +793,14 @@ class DynamicPromptPackedBatchProcessor:
 
             packed_input_ids.extend(seg_input_ids)
             packed_labels.extend(seg_labels)
+            d = seg.get("audio_duration_sec")
+            if d is not None:
+                try:
+                    fd = float(d)
+                except Exception:
+                    fd = 0.0
+                if fd > 0:
+                    packed_audio_duration_sec += float(fd)
             if self.data_args.neat_packing:
                 packed_position_ids.extend(list(range(seg_len)))
                 packed_attention_mask.extend([seg_id] * seg_len)
@@ -789,6 +868,8 @@ class DynamicPromptPackedBatchProcessor:
             item["videos"] = packed_videos
         if has_audios:
             item["audios"] = packed_audios
+        # Keep `audio_duration_sec` always present so dynamic prompt packing outputs have consistent column lengths.
+        item["audio_duration_sec"] = float(packed_audio_duration_sec)
         return item
 
     def __call__(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
@@ -863,6 +944,23 @@ class DynamicPromptPackedBatchProcessor:
             else:
                 example = row
 
+            duration_sec = None
+            for k in ("duration", "duration_sec", "audio_duration", "duration_seconds"):
+                if k in row and row[k] is not None:
+                    try:
+                        duration_sec = float(row[k])
+                    except Exception:
+                        duration_sec = None
+                    break
+            if duration_sec is None:
+                duration_sec = (
+                    _infer_duration_sec_from_audio_field(row.get("audio"))
+                    or _infer_duration_sec_from_audio_field(row.get("audios"))
+                    or _infer_duration_sec_from_audio_field(example.get("_audios"))
+                    or _infer_duration_sec_from_audio_field(example.get("audios"))
+                    or _infer_duration_sec_from_audio_field(example.get("audio"))
+                )
+
             prompt = example.get("_prompt") or []
             response = example.get("_response") or []
             if not (isinstance(prompt, list) and isinstance(response, list)):
@@ -912,6 +1010,8 @@ class DynamicPromptPackedBatchProcessor:
                 item["videos"] = example.get("_videos") or []
             if example.get("_audios") is not None:
                 item["audios"] = example.get("_audios") or []
+            if duration_sec is not None and duration_sec > 0:
+                item["audio_duration_sec"] = float(duration_sec)
 
             items.append(item)
             lengths.append(l)

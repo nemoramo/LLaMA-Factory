@@ -192,7 +192,13 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
+        batch_audio_durations: list[float] = []
         for feature in features:
+            d = feature.pop("audio_duration_sec", None)
+            try:
+                batch_audio_durations.append(float(d) if d is not None else 0.0)
+            except Exception:  # noqa: BLE001
+                batch_audio_durations.append(0.0)
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
@@ -519,11 +525,21 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         features.update(mm_inputs)
 
+        audio_duration_tensor = None
+        if batch_audio_durations:
+            audio_duration_tensor = torch.tensor(batch_audio_durations, dtype=torch.float32)
+
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape
             features["position_ids"] = torch.arange(seq_length).long().repeat(bsz, 1)
-            return {"data": features, "input_ids": features["input_ids"], "labels": features["labels"]}
+            out = {"data": features, "input_ids": features["input_ids"], "labels": features["labels"]}
+            # NOTE: Keep audio_duration_sec at top-level so it won't be forwarded into the model by wrappers.
+            if audio_duration_tensor is not None:
+                out["audio_duration_sec"] = audio_duration_tensor
+            return out
 
+        if audio_duration_tensor is not None:
+            features["audio_duration_sec"] = audio_duration_tensor
         return features
 
 

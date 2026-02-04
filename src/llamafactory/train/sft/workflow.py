@@ -15,9 +15,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
+from ...data.audio_progress import (
+    get_audio_duration_file_fingerprint,
+    get_audio_duration_files,
+    get_cached_total_audio_duration_sec,
+    is_audio_duration_cache_complete,
+    maybe_launch_audio_duration_scan,
+)
 from ...extras.constants import IGNORE_INDEX
 from ...extras.logging import get_logger
 from ...extras.misc import calculate_tps
@@ -152,6 +160,59 @@ def run_sft(
         model.config.use_cache = False
 
     else:
+        audio_total_duration_sec: float | None = None
+        audio_total_duration_ready = False
+        audio_duration_cache_path = None
+        audio_duration_expected_files: dict[str, tuple[int, int]] | None = None
+        if getattr(data_args, "log_audio_epochs", False) and training_args.do_train:
+            dataset_names = data_args.dataset
+            if isinstance(dataset_names, str):
+                dataset_names = [s.strip() for s in dataset_names.split(",") if s.strip()]
+            elif not isinstance(dataset_names, list):
+                dataset_names = []
+
+            audio_duration_cache_path = os.path.join(training_args.output_dir, "audio_duration_cache.json")
+            dataset_dir = str(data_args.dataset_dir)
+            dataset_names = [str(x) for x in dataset_names]
+            expected_paths = get_audio_duration_files(dataset_dir=dataset_dir, dataset_names=dataset_names)
+            audio_duration_expected_files = get_audio_duration_file_fingerprint(expected_paths)
+
+            cached_total = (
+                get_cached_total_audio_duration_sec(audio_duration_cache_path) if audio_duration_cache_path else None
+            )
+            if cached_total is not None:
+                audio_total_duration_sec = float(cached_total)
+
+            cache_complete = (
+                is_audio_duration_cache_complete(
+                    cache_path=audio_duration_cache_path,
+                    dataset_dir=dataset_dir,
+                    dataset_names=dataset_names,
+                    expected_files=audio_duration_expected_files,
+                )
+                if audio_duration_cache_path and audio_duration_expected_files
+                else False
+            )
+            audio_total_duration_ready = bool(cache_complete and (audio_total_duration_sec or 0.0) > 0)
+
+            is_rank0 = bool(getattr(training_args, "process_index", 0) == 0)
+            if is_rank0:
+                if not audio_total_duration_ready and audio_duration_cache_path and audio_duration_expected_files:
+                    max_mb_per_sec = None
+                    try:
+                        v = os.getenv("AUDIO_DURATION_SCAN_MAX_MBPS", "").strip()
+                        if v:
+                            max_mb_per_sec = float(v)
+                    except Exception:
+                        max_mb_per_sec = None
+
+                    maybe_launch_audio_duration_scan(
+                        dataset_dir=dataset_dir,
+                        dataset_names=dataset_names,
+                        cache_path=audio_duration_cache_path,
+                        max_mb_per_sec=max_mb_per_sec,
+                    )
+
         trainer = CustomSeq2SeqTrainer(
             model=model,
             args=training_args,
@@ -160,6 +221,11 @@ def run_sft(
             eval_data_collator=eval_data_collator,
             callbacks=callbacks,
             gen_kwargs=gen_kwargs,
+            audio_total_duration_sec=audio_total_duration_sec,
+            audio_progress_enabled=bool(getattr(data_args, "log_audio_epochs", False) and training_args.do_train),
+            audio_total_duration_ready=audio_total_duration_ready,
+            audio_duration_cache_path=audio_duration_cache_path,
+            audio_duration_expected_files=audio_duration_expected_files,
             **dataset_module,
             **tokenizer_module,
             **metric_module,

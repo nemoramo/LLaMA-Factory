@@ -284,6 +284,18 @@ class DataArguments:
         },
     )
 
+    log_audio_epochs: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Log data-progress in audio-hours/epochs based on per-sample audio duration (seconds). "
+                "Also writes progress metadata into each checkpoint. "
+                "Supports jsonl `duration`-like keys and the common segment filename pattern "
+                "`*_segXXXX_start-end.wav` when duration keys are missing."
+            )
+        },
+    )
+
     def __post_init__(self):
         def split_arg(arg):
             if isinstance(arg, str):
