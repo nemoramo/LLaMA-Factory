@@ -54,7 +54,7 @@ Qwen3-ASR supports:
 - `packing: true`
 - `dynamic_prompt_packing: true` (buffered knapsack packing at training time)
 
-See `examples/qwen3_asr/qwen3_asr_sft_full.yaml` for a ready-to-use config.
+See `examples/qwen3_asr/qwen3_asr_sft_lora.yaml` for a ready-to-use config.
 
 ## FlashAttention 2 (FA2)
 
@@ -73,6 +73,6 @@ python scripts/convert_mm_data/convert_qwen3_asr_jsonl_to_openai_audio.py \
 
 ## Example configs
 
-- Full finetune: `examples/qwen3_asr/qwen3_asr_sft_full.yaml`
-- LoRA finetune: `examples/qwen3_asr/qwen3_asr_sft_lora.yaml`
+- Example config (LoRA): `examples/qwen3_asr/qwen3_asr_sft_lora.yaml`
 
+To run full fine-tuning, set `finetuning_type: full` and remove the `lora_*` fields.

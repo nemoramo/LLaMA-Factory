@@ -54,7 +54,7 @@ JSONL 每行示例：
 - `packing: true`
 - `dynamic_prompt_packing: true`（训练时做 buffered packing）
 
-示例配置见：`examples/qwen3_asr/qwen3_asr_sft_full.yaml`。
+示例配置见：`examples/qwen3_asr/qwen3_asr_sft_lora.yaml`。
 
 ## FlashAttention 2（FA2）
 
@@ -73,6 +73,6 @@ python scripts/convert_mm_data/convert_qwen3_asr_jsonl_to_openai_audio.py \
 
 ## 示例配置
 
-- 全参微调：`examples/qwen3_asr/qwen3_asr_sft_full.yaml`
-- LoRA 微调：`examples/qwen3_asr/qwen3_asr_sft_lora.yaml`
+- 示例配置（LoRA）：`examples/qwen3_asr/qwen3_asr_sft_lora.yaml`
 
+如需全参微调，可将 `finetuning_type: full`，并删除 `lora_*` 相关字段。
