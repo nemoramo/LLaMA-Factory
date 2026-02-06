@@ -231,6 +231,18 @@ def patch_config(
     configure_packing(model_args, is_trainable)
     configure_kv_cache(config, model_args, is_trainable)
 
+    # Qwen3-ASR: optionally enable training-time dynamic audio attention windows (paper: 1/2/4/8s).
+    model_type = getattr(config, "model_type", None)
+    if isinstance(model_type, str) and model_type.startswith("qwen3_asr"):
+        audio_cfg = getattr(getattr(config, "thinker_config", None), "audio_config", None)
+        if audio_cfg is not None and is_trainable and getattr(model_args, "qwen3_asr_dynamic_window", False):
+            setattr(audio_cfg, "dynamic_window_training", True)
+            ratios = getattr(model_args, "qwen3_asr_dynamic_window_ratios", None) or [1, 2, 4, 8]
+            setattr(audio_cfg, "dynamic_window_ratios", ratios)
+            probs = getattr(model_args, "qwen3_asr_dynamic_window_probs", None)
+            if probs is not None:
+                setattr(audio_cfg, "dynamic_window_probs", probs)
+
     if getattr(config, "model_type", None) == "qwen":
         setattr(config, "use_flash_attn", model_args.flash_attn == "fa2")
         for dtype_name, dtype in [("fp16", torch.float16), ("bf16", torch.bfloat16), ("fp32", torch.float32)]:

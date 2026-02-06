@@ -4,6 +4,9 @@
 model_name_or_path: Qwen/Qwen3-ASR-1.7B
 template: qwen3_asr
 trust_remote_code: true
+# Optional (paper-style): dynamic audio attention window sampling during training (per audio).
+# qwen3_asr_dynamic_window: true
+# qwen3_asr_dynamic_window_ratios: "1,2,4,8"  # 1s/2s/4s/8s
 
 ### method
 stage: sft
@@ -47,4 +50,3 @@ num_train_epochs: 1.0
 lr_scheduler_type: cosine
 warmup_ratio: 0.02
 report_to: none
-

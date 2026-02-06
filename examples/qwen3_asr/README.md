@@ -60,6 +60,22 @@ See `examples/qwen3_asr/qwen3_asr_sft_lora.yaml` for a ready-to-use config.
 
 Set `flash_attn: fa2` and use `bf16: true` (or `fp16`) if your environment has FlashAttention 2 installed.
 
+## Dynamic audio attention window (paper: 1/2/4/8s)
+
+Qwen3-ASR's audio encoder can optionally **sample a dynamic attention window per audio during training**, which helps
+match the paper's "1s~8s dynamic window" setting.
+
+Add the following to your YAML config:
+
+```yaml
+qwen3_asr_dynamic_window: true
+qwen3_asr_dynamic_window_ratios: "1,2,4,8"
+```
+
+Notes:
+- The ratios are relative to `audio_config.n_window * 2` (the base conv chunk length).
+- Sampling is done per audio, so different samples in the same packed batch can use different windows.
+
 ## Converting upstream JSONL (audio/text) to LLaMA-Factory format
 
 If your data is in Qwen3-ASR finetuning JSONL format (fields: `audio`, `text`, optional `prompt`), convert it to

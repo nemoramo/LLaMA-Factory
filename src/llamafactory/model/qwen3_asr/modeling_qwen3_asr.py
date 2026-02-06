@@ -494,27 +494,45 @@ class Qwen3ASRAudioAttention(nn.Module):
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        if cu_seqlens is None:
+            if self.config._attn_implementation == "flash_attention_2":
+                raise ValueError("`cu_seqlens` must be provided when using flash_attention_2.")
+            max_seqlen = seq_length
+        else:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            cu_seq_lens_q=cu_seqlens,  # pass cu seq lens for FA2
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
-            is_causal=False,
-            **kwargs,
-        )
+        if cu_seqlens is None:
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                is_causal=False,
+                **kwargs,
+            )
+        else:
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                cu_seq_lens_q=cu_seqlens,  # pass cu seq lens for FA2
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=max_seqlen,
+                max_length_k=max_seqlen,
+                is_causal=False,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.out_proj(attn_output)
@@ -643,10 +661,10 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         self._requires_grad = False
 
     def get_input_embeddings(self) -> nn.Module:
-        return self.conv1
+        return self.conv2d1
 
     def set_input_embeddings(self, value: nn.Module):
-        self.conv1 = value
+        self.conv2d1 = value
 
     def _prepare_attention_mask(self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
         # Flash Attention 2 doesn't need a 4D mask and relies on `cu_seqlens/max_seqlen`
@@ -719,18 +737,58 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         padded_embed = padded_embed + positional_embedding
         hidden_states = padded_embed[padded_mask_after_cnn]
         cu_chunk_lens = [0]
-        window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
-        for cnn_len in aftercnn_lens:
-            cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
-            remainder = cnn_len % window_aftercnn
+        base_chunk_aftercnn = int(padded_mask_after_cnn.shape[-1])
+        default_ratio = max(1, int(self.n_window_infer // (self.n_window * 2)))
+        window_ratios: list[int] = [default_ratio] * int(aftercnn_lens.numel())
+
+        # Optional training-time dynamic window sampling (e.g. ratios [1, 2, 4, 8] for 1s/2s/4s/8s).
+        if self.training and bool(getattr(self.config, "dynamic_window_training", False)):
+            candidates = getattr(self.config, "dynamic_window_ratios", None)
+            if candidates:
+                try:
+                    candidates = [int(x) for x in candidates]
+                    candidates = [x for x in candidates if x > 0]
+                except Exception:  # noqa: BLE001
+                    candidates = None
+
+            if candidates:
+                probs = getattr(self.config, "dynamic_window_probs", None)
+                if probs is not None:
+                    try:
+                        probs = [float(x) for x in probs]
+                    except Exception:  # noqa: BLE001
+                        probs = None
+
+                if probs is not None and len(probs) != len(candidates):
+                    raise ValueError(
+                        "Qwen3-ASR dynamic_window_probs must have the same length as dynamic_window_ratios. "
+                        f"Got len(probs)={len(probs)} vs len(ratios)={len(candidates)}."
+                    )
+
+                bsz = int(aftercnn_lens.numel())
+                if probs is None:
+                    idx = torch.randint(0, len(candidates), (bsz,), device=aftercnn_lens.device)
+                else:
+                    weights = torch.tensor(probs, device=aftercnn_lens.device, dtype=torch.float)
+                    idx = torch.multinomial(weights, num_samples=bsz, replacement=True)
+
+                cand_t = torch.tensor(candidates, device=aftercnn_lens.device, dtype=torch.int64)
+                window_ratios = cand_t[idx].tolist()
+
+        for cnn_len, ratio in zip(aftercnn_lens.tolist(), window_ratios):
+            window_aftercnn = base_chunk_aftercnn * int(ratio)
+            cu_chunk_lens += [window_aftercnn] * (int(cnn_len) // window_aftercnn)
+            remainder = int(cnn_len) % window_aftercnn
             if remainder != 0:
                 cu_chunk_lens += [remainder]
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
 
+        attention_mask = self._prepare_attention_mask(hidden_states, cu_seqlens)
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
                 cu_seqlens,
+                attention_mask=attention_mask,
             )
 
             hidden_states = layer_outputs[0]
@@ -1112,13 +1170,15 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                 The length of feature shape of each audio in LLM.
         """
         if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            feature_lens = torch.sum(feature_attention_mask, dim=1)
+        elif audio_feature_lengths is not None:
+            feature_lens = audio_feature_lengths
         else:
-            audio_feature_lengths = None
-        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+            raise ValueError("Either `feature_attention_mask` or `audio_feature_lengths` must be provided.")
 
         # audio encoder do not support batch inference to keep precision
         audio_features = []
+        audio_feature_token_lens = []
         for input_feature, feature_len in zip(input_features, feature_lens):
             audio_output = self.audio_tower(
                 input_feature[:, :feature_len],
@@ -1126,9 +1186,10 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             )
             audio_feature = audio_output.last_hidden_state
             audio_features.append(audio_feature)
+            audio_feature_token_lens.append(int(audio_feature.shape[0]))
         audio_features = torch.cat(audio_features, dim=0)
 
-        return audio_features
+        return audio_features, audio_feature_token_lens
 
     def get_placeholder_mask(
         self,
@@ -1193,41 +1254,75 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
         # 2. Merge text, audios
         if input_features is not None:
-            audio_features = self.get_audio_features(
+            audio_features, audio_feature_token_lens = self.get_audio_features(
                 input_features,
                 feature_attention_mask=feature_attention_mask,
                 audio_feature_lengths=audio_feature_lengths,
             )
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
             audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
-            # `masked_scatter` requires `audio_features.numel() >= audio_mask.sum()`. In practice, the number of
-            # `<|audio_pad|>` tokens in the packed prompt may mismatch the produced audio feature length (e.g. due to
-            # audio decoding/feature length rounding). To keep training robust, pad/truncate audio features to match
-            # the actual placeholder count in `input_ids`.
-            required_tokens = None
+            # Align audio features per sample. Global alignment can corrupt packed/multi-audio prompts by mixing
+            # boundaries between different samples. When mismatches happen (e.g. rounding differences), pad/truncate
+            # within each sample only.
+            bsz = int(inputs_embeds.shape[0])
+            required_counts = None
             if input_ids is not None:
+                required_counts = (input_ids == self.config.audio_token_id).sum(dim=-1).to("cpu").tolist()
+                required_counts = [int(x) for x in required_counts]
+            elif qwen3_asr_audio_token_count is not None:
                 try:
-                    required_tokens = int((input_ids == self.config.audio_token_id).sum().item())
+                    if isinstance(qwen3_asr_audio_token_count, (list, tuple)) and len(qwen3_asr_audio_token_count) == bsz:
+                        required_counts = [int(x) for x in qwen3_asr_audio_token_count]
                 except Exception:  # noqa: BLE001
-                    required_tokens = None
-            if required_tokens is None and qwen3_asr_audio_token_count is not None:
-                try:
-                    if isinstance(qwen3_asr_audio_token_count, (list, tuple)):
-                        required_tokens = int(sum(int(x) for x in qwen3_asr_audio_token_count))
-                    else:
-                        required_tokens = int(qwen3_asr_audio_token_count)
-                except Exception:  # noqa: BLE001
-                    required_tokens = None
+                    required_counts = None
 
-            if required_tokens is not None and required_tokens >= 0:
-                cur_tokens = int(audio_features.shape[0])
-                if cur_tokens < required_tokens:
-                    pad_tokens = required_tokens - cur_tokens
-                    audio_features = torch.cat(
-                        [audio_features, audio_features.new_zeros((pad_tokens, audio_features.shape[1]))], dim=0
-                    )
-                elif cur_tokens > required_tokens:
-                    audio_features = audio_features[:required_tokens]
+            if required_counts is None:
+                raise ValueError(
+                    "Qwen3-ASR audio token/feature length mismatch: cannot determine per-sample audio token counts. "
+                    f"qwen3_asr_audio_token_count={qwen3_asr_audio_token_count!r}"
+                )
+
+            if len(audio_feature_token_lens) != bsz:
+                raise ValueError(
+                    "Qwen3-ASR audio token/feature length mismatch: input_features batch size mismatch. "
+                    f"bsz={bsz}, len(audio_feature_token_lens)={len(audio_feature_token_lens)}, "
+                    f"required_counts={required_counts!r}"
+                )
+
+            total_required = int(audio_mask[..., 0].sum().item())
+            if total_required != int(sum(required_counts)):
+                raise ValueError(
+                    "Qwen3-ASR audio token/feature length mismatch: inconsistent token counts. "
+                    f"total_required={total_required}, sum(required_counts)={int(sum(required_counts))}, "
+                    f"required_counts={required_counts!r}, qwen3_asr_audio_token_count={qwen3_asr_audio_token_count!r}"
+                )
+
+            audio_features_flat = audio_features
+            total_cur = int(audio_features_flat.shape[0])
+            embed_dim = int(audio_features_flat.shape[1])
+            pieces = []
+            offset = 0
+            for req, cur in zip(required_counts, audio_feature_token_lens):
+                if req < 0:
+                    raise ValueError(f"Invalid required audio token count: {req}.")
+                cur_feat = audio_features_flat[offset : offset + int(cur)]
+                offset += int(cur)
+                if req == int(cur):
+                    pieces.append(cur_feat)
+                elif req < int(cur):
+                    pieces.append(cur_feat[:req])
+                else:
+                    pad = cur_feat.new_zeros((req - int(cur), embed_dim))
+                    pieces.append(torch.cat([cur_feat, pad], dim=0))
+
+            if offset != total_cur:
+                raise ValueError(
+                    "Qwen3-ASR audio token/feature length mismatch: unexpected leftover audio features. "
+                    f"total_cur={total_cur}, consumed={offset}, audio_feature_token_lens={audio_feature_token_lens!r}, "
+                    f"required_counts={required_counts!r}"
+                )
+
+            audio_features = torch.cat(pieces, dim=0) if pieces else audio_features_flat[:0]
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
         if feature_attention_mask is not None:
@@ -1384,18 +1479,11 @@ class Qwen3ASRForConditionalGeneration(Qwen3ASRPreTrainedModel, GenerationMixin)
             if key not in thinker_kwargs:
                 thinker_kwargs[key] = value
 
-        # Transformers `Seq2SeqTrainer` expects `model.generate()` to return a tensor of token ids by default.
-        # Only return a `GenerationOutput` when users explicitly request it.
-        return_dict_in_generate = bool(thinker_kwargs.get("return_dict_in_generate", False))
-        thinker_result = self.thinker.generate(
+        # Preserve upstream `generate()` semantics. Callers may rely on GenerationOutput fields (e.g. `.sequences`).
+        return self.thinker.generate(
             input_ids=input_ids,
             **thinker_kwargs,
         )
-        if return_dict_in_generate and hasattr(thinker_result, "sequences"):
-            return thinker_result
-        if hasattr(thinker_result, "sequences"):
-            return thinker_result.sequences
-        return thinker_result
 
 
 __all__ = [

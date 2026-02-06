@@ -240,6 +240,9 @@ class HuggingfaceEngine(BaseEngine):
         generate_output = model.generate(**gen_kwargs)
         if isinstance(generate_output, tuple):
             generate_output = generate_output[1][0]  # post-process the minicpm_o output
+        sequences = getattr(generate_output, "sequences", None)
+        if sequences is not None:
+            generate_output = sequences
 
         response_ids = generate_output[:, prompt_length:]
         response = tokenizer.batch_decode(

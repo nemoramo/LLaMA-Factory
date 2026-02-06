@@ -60,6 +60,21 @@ JSONL 每行示例：
 
 在 YAML 中设置 `flash_attn: fa2`，并使用 `bf16: true`（或 `fp16`），同时确保环境中已安装 FlashAttention 2。
 
+## 动态音频注意力窗口（论文 1/2/4/8s）
+
+Qwen3-ASR 的音频 encoder 支持在训练时**按音频样本随机采样注意力窗口**，用于匹配论文中的 “1s~8s dynamic window” 设置。
+
+在训练 YAML 里加入：
+
+```yaml
+qwen3_asr_dynamic_window: true
+qwen3_asr_dynamic_window_ratios: "1,2,4,8"
+```
+
+说明：
+- ratios 是相对于 `audio_config.n_window * 2`（conv 的基础 chunk 长度）的倍数。
+- 采样是按 audio 进行的，因此即便开启 packing，同一个 batch 内不同样本也可以用不同窗口。
+
 ## 将官方 JSONL 转成 LLaMA-Factory 格式
 
 如果你的数据是 Qwen3-ASR 官方 finetuning JSONL（字段：`audio`, `text`, 可选 `prompt`），可用脚本转换为

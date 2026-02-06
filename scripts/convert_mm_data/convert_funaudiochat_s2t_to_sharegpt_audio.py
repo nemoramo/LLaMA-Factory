@@ -17,21 +17,33 @@ r"""Deprecated wrapper.
 Use `convert_funaudiochat_s2t_to_qwen3_asr_sharegpt_audio.py` instead.
 """
 
-import sys
+import importlib.util
+import warnings
+from pathlib import Path
+from types import ModuleType
+
+
+_NEW = Path(__file__).with_name("convert_funaudiochat_s2t_to_qwen3_asr_sharegpt_audio.py")
+
+
+def _load_new() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("_lf_qwen3_asr_converter", _NEW)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load module from {_NEW}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def main() -> None:
-    sys.stderr.write(
-        "[WARN] `convert_funaudiochat_s2t_to_sharegpt_audio.py` is deprecated. "
-        "Use `convert_funaudiochat_s2t_to_qwen3_asr_sharegpt_audio.py` instead.\n"
+    warnings.warn(
+        "`convert_funaudiochat_s2t_to_sharegpt_audio.py` is deprecated; "
+        "use `convert_funaudiochat_s2t_to_qwen3_asr_sharegpt_audio.py` instead.",
+        DeprecationWarning,
+        stacklevel=2,
     )
-    sys.stderr.flush()
-
-    from convert_funaudiochat_s2t_to_qwen3_asr_sharegpt_audio import main as _main
-
-    _main()
+    _load_new().main()
 
 
 if __name__ == "__main__":
     main()
-

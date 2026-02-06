@@ -97,6 +97,9 @@ class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
         n_window=100,
         output_dim=3584,
         n_window_infer=400,
+        dynamic_window_training=False,
+        dynamic_window_ratios=None,
+        dynamic_window_probs=None,
         conv_chunksize=500,
         downsample_hidden_size=480,
         **kwargs,
@@ -119,6 +122,12 @@ class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
         self.n_window = n_window
         self.output_dim = output_dim
         self.n_window_infer = n_window_infer
+        # Optional training-time dynamic attention window sampling (per audio).
+        # Ratios are relative to `n_window * 2` (the base conv chunk length).
+        # Example: ratios [1, 2, 4, 8] correspond to 1s/2s/4s/8s when `n_window=50`.
+        self.dynamic_window_training = dynamic_window_training
+        self.dynamic_window_ratios = dynamic_window_ratios
+        self.dynamic_window_probs = dynamic_window_probs
         self.conv_chunksize = conv_chunksize
         self.downsample_hidden_size = downsample_hidden_size
 
