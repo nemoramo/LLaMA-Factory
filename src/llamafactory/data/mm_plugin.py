@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     class RegularizedAudioOutput(TypedDict):
         audios: list[NDArray]
         sampling_rates: list[float]
+        load_fail_mask: NotRequired[list[bool]]
 
     class MMProcessor(ProcessorMixin):
         patch_size: int
@@ -567,13 +568,61 @@ class MMPluginMixin:
         """
         results: list[NDArray] = []
         sampling_rates: list[float] = []
+        load_fail_mask: list[bool] = []
+
+        max_retries = int(os.getenv("LLAMAFACTORY_AUDIO_LOAD_RETRIES", "1"))
+        retry_sleep_sec = float(os.getenv("LLAMAFACTORY_AUDIO_LOAD_RETRY_SLEEP", "0.2"))
+        log_limit = int(os.getenv("LLAMAFACTORY_AUDIO_LOAD_ERROR_LOG_LIMIT", "20"))
+        logged = int(getattr(self, "_mm_audio_load_error_logged", 0))
+        suppressed = bool(getattr(self, "_mm_audio_load_error_suppressed", False))
 
         for audio in audios:
-            y, sr = self._load_single_audio(audio, sampling_rate)
-            results.append(y)
-            sampling_rates.append(sr)
+            last_error: Exception | None = None
+            y: NDArray | None = None
+            sr: float | None = None
+            for attempt in range(max(0, max_retries) + 1):
+                try:
+                    y, sr = self._load_single_audio(audio, sampling_rate)
+                    last_error = None
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_error = e
+                    is_not_found = isinstance(e, FileNotFoundError) or (
+                        isinstance(e, OSError) and getattr(e, "errno", None) == 2
+                    )
+                    if is_not_found or attempt >= max(0, max_retries):
+                        break
+                    time.sleep(retry_sleep_sec * float(attempt + 1))
 
-        return {"audios": results, "sampling_rates": sampling_rates}
+            if last_error is not None or y is None or sr is None:
+                # Use a dummy waveform so feature extraction can proceed and the collator can
+                # mask labels for the affected segments via `feature_load_fail_mask`.
+                results.append(np.zeros(0, dtype=np.float32))
+                sampling_rates.append(float(sampling_rate))
+                load_fail_mask.append(True)
+                if logged < log_limit:
+                    logger.warning_rank0(
+                        "Audio load error; using dummy waveform (audio=%r): %s",
+                        audio,
+                        repr(last_error),
+                    )
+                    logged += 1
+                elif not suppressed:
+                    logger.warning_rank0(
+                        "Too many audio load errors (%d+); suppressing further logs.",
+                        log_limit,
+                    )
+                    suppressed = True
+                continue
+
+            results.append(y)
+            sampling_rates.append(float(sr))
+            load_fail_mask.append(False)
+
+        setattr(self, "_mm_audio_load_error_logged", logged)
+        setattr(self, "_mm_audio_load_error_suppressed", suppressed)
+
+        return {"audios": results, "sampling_rates": sampling_rates, "load_fail_mask": load_fail_mask}
 
     def _get_mm_inputs(
         self,
@@ -646,10 +695,16 @@ class MMPluginMixin:
             feature_extractor: SequenceFeatureExtractor = getattr(processor, "feature_extractor", None)
             audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
             audio_padding = getattr(processor, "audio_padding", "max_length")
-            audios = self._regularize_audios(
+            audio_out = self._regularize_audios(
                 audios,
                 sampling_rate=audio_sampling_rate,
-            )["audios"]
+            )
+            audios = audio_out["audios"]
+            feature_load_fail_mask = audio_out.get("load_fail_mask", None)
+            if feature_load_fail_mask is None:
+                feature_load_fail_mask = [False] * len(audios)
+            elif len(feature_load_fail_mask) != len(audios):
+                feature_load_fail_mask = (list(feature_load_fail_mask) + [False] * len(audios))[: len(audios)]
             min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
             if min_samples > 0:
                 audios = [np.pad(a, (0, max(0, min_samples - a.shape[0])), mode="constant") for a in audios]
@@ -663,6 +718,7 @@ class MMPluginMixin:
                 )
             )
             mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask", None)  # prevent conflicts
+            mm_inputs["feature_load_fail_mask"] = torch.tensor(feature_load_fail_mask, dtype=torch.bool)
 
         return mm_inputs
 
