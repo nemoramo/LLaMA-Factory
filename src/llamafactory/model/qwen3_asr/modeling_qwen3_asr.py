@@ -1265,9 +1265,6 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             )
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
             audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
-            # Align audio features per sample. Global alignment can corrupt packed/multi-audio prompts by mixing
-            # boundaries between different samples. When mismatches happen (e.g. rounding differences), pad/truncate
-            # within each sample only.
             bsz = int(inputs_embeds.shape[0])
             required_counts = None
             if input_ids is not None:
@@ -1286,13 +1283,6 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                     f"qwen3_asr_audio_token_count={qwen3_asr_audio_token_count!r}"
                 )
 
-            if len(audio_feature_token_lens) != bsz:
-                raise ValueError(
-                    "Qwen3-ASR audio token/feature length mismatch: input_features batch size mismatch. "
-                    f"bsz={bsz}, len(audio_feature_token_lens)={len(audio_feature_token_lens)}, "
-                    f"required_counts={required_counts!r}"
-                )
-
             total_required = int(audio_mask[..., 0].sum().item())
             if total_required != int(sum(required_counts)):
                 raise ValueError(
@@ -1304,67 +1294,126 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             audio_features_flat = audio_features
             total_cur = int(audio_features_flat.shape[0])
             embed_dim = int(audio_features_flat.shape[1])
-            mismatch_indices = [i for i, (req, cur) in enumerate(zip(required_counts, audio_feature_token_lens)) if req != int(cur)]
-            if mismatch_indices:
-                # Warn loudly (rank0 only) and apply a conservative per-sample fallback. This avoids training crashes,
-                # but a high mismatch rate usually indicates a data/pipeline bug that should be fixed upstream.
-                warn_limit = int(os.getenv("LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_WARN_LIMIT", "20"))
-                warned = int(getattr(self, "_qwen3_asr_audio_align_warned", 0))
-                if warned < warn_limit:
-                    mismatch = [(i, int(required_counts[i]), int(audio_feature_token_lens[i])) for i in mismatch_indices]
-                    pad_n = sum(1 for _, req, cur in mismatch if req > cur)
-                    trunc_n = sum(1 for _, req, cur in mismatch if req < cur)
-                    max_abs_diff = max(abs(req - cur) for _, req, cur in mismatch)
-                    examples = ", ".join(f"{i}:{req}->{cur}" for i, req, cur in mismatch[:8])
-                    logger.warning_rank0(
-                        "Qwen3-ASR audio token/feature length mismatch: mismatched=%d/%d (%.1f%%), "
-                        "pad=%d, truncate=%d, max_abs_diff=%d, examples=[%s]. "
-                        "Falling back to per-sample pad/truncate of audio features.",
-                        len(mismatch_indices),
-                        bsz,
-                        100.0 * float(len(mismatch_indices)) / float(max(1, bsz)),
-                        pad_n,
-                        trunc_n,
-                        int(max_abs_diff),
-                        examples,
-                    )
-                    warned += 1
-                    setattr(self, "_qwen3_asr_audio_align_warned", warned)
-                    if warned == warn_limit:
+            # Fast path: most of the time audio feature length matches placeholder token length even with packing.
+            if total_cur == total_required:
+                inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features_flat)
+            else:
+                # Mismatch path: best-effort per-sample pad/truncate. This avoids cross-sample corruption and also
+                # avoids crashing for rare rounding/decoder discrepancies.
+                cur_counts_per_sample: list[int] | None = None
+
+                # Infer how many audios are packed in each sample from `audio_start_token_id`, then aggregate
+                # per-audio token lengths into per-sample token lengths.
+                if input_ids is not None:
+                    start_id = getattr(self.config, "audio_start_token_id", None)
+                    if isinstance(start_id, int):
+                        audios_per_sample = (input_ids == int(start_id)).sum(dim=-1).to("cpu").tolist()
+                        audios_per_sample = [int(x) for x in audios_per_sample]
+
+                        if len(audios_per_sample) == bsz and int(sum(audios_per_sample)) == len(audio_feature_token_lens):
+                            cur_counts_per_sample = []
+                            idx = 0
+                            for n in audios_per_sample:
+                                n = max(0, int(n))
+                                cur_counts_per_sample.append(
+                                    int(sum(int(x) for x in audio_feature_token_lens[idx : idx + n]))
+                                )
+                                idx += n
+                            if idx != len(audio_feature_token_lens):
+                                cur_counts_per_sample = None
+
+                if cur_counts_per_sample is not None and len(cur_counts_per_sample) == bsz:
+                    mismatch_indices = [
+                        i
+                        for i, (req, cur) in enumerate(zip(required_counts, cur_counts_per_sample))
+                        if int(req) != int(cur)
+                    ]
+
+                    warn_limit = int(os.getenv("LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_WARN_LIMIT", "20"))
+                    warned = int(getattr(self, "_qwen3_asr_audio_align_warned", 0))
+                    if mismatch_indices and warned < warn_limit:
+                        mismatch = [(i, int(required_counts[i]), int(cur_counts_per_sample[i])) for i in mismatch_indices]
+                        pad_n = sum(1 for _, req, cur in mismatch if req > cur)
+                        trunc_n = sum(1 for _, req, cur in mismatch if req < cur)
+                        max_abs_diff = max(abs(req - cur) for _, req, cur in mismatch)
+                        examples = ", ".join(f"{i}:{req}->{cur}" for i, req, cur in mismatch[:8])
                         logger.warning_rank0(
-                            "Suppressing further Qwen3-ASR audio alignment warnings after %d occurrences. "
-                            "Set LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_WARN_LIMIT to a larger value to log more.",
-                            warn_limit,
+                            "Qwen3-ASR audio token/feature length mismatch: mismatched=%d/%d (%.1f%%), "
+                            "pad=%d, truncate=%d, max_abs_diff=%d, examples=[%s]. "
+                            "Falling back to per-sample pad/truncate of audio features.",
+                            len(mismatch_indices),
+                            bsz,
+                            100.0 * float(len(mismatch_indices)) / float(max(1, bsz)),
+                            pad_n,
+                            trunc_n,
+                            int(max_abs_diff),
+                            examples,
+                        )
+                        warned += 1
+                        setattr(self, "_qwen3_asr_audio_align_warned", warned)
+                        if warned == warn_limit:
+                            logger.warning_rank0(
+                                "Suppressing further Qwen3-ASR audio alignment warnings after %d occurrences. "
+                                "Set LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_WARN_LIMIT to a larger value to log more.",
+                                warn_limit,
+                            )
+
+                    pieces = []
+                    offset = 0
+                    for req, cur in zip(required_counts, cur_counts_per_sample):
+                        req = int(req)
+                        cur = int(cur)
+                        if req < 0 or cur < 0:
+                            raise ValueError(f"Invalid audio token counts: req={req}, cur={cur}.")
+
+                        cur_feat = audio_features_flat[offset : offset + cur]
+                        offset += cur
+                        if req == cur:
+                            pieces.append(cur_feat)
+                        elif req < cur:
+                            pieces.append(cur_feat[:req])
+                        else:
+                            pad = cur_feat.new_zeros((req - cur, embed_dim))
+                            pieces.append(torch.cat([cur_feat, pad], dim=0))
+
+                    if offset != total_cur:
+                        raise ValueError(
+                            "Qwen3-ASR audio token/feature length mismatch: unexpected leftover audio features. "
+                            f"total_cur={total_cur}, consumed={offset}, cur_counts_per_sample={cur_counts_per_sample!r}, "
+                            f"required_counts={required_counts!r}"
                         )
 
-                pieces = []
-                offset = 0
-                for req, cur in zip(required_counts, audio_feature_token_lens):
-                    if req < 0:
-                        raise ValueError(f"Invalid required audio token count: {req}.")
-                    cur = int(cur)
-                    cur_feat = audio_features_flat[offset : offset + cur]
-                    offset += cur
-                    if req == cur:
-                        pieces.append(cur_feat)
-                    elif req < cur:
-                        pieces.append(cur_feat[:req])
+                    audio_features_aligned = torch.cat(pieces, dim=0) if pieces else audio_features_flat[:0]
+                    inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features_aligned)
+                else:
+                    # Last resort: global pad/truncate (keeps training running; mismatch should be rare).
+                    warn_limit = int(os.getenv("LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_WARN_LIMIT", "20"))
+                    warned = int(getattr(self, "_qwen3_asr_audio_align_warned", 0))
+                    if warned < warn_limit:
+                        logger.warning_rank0(
+                            "Qwen3-ASR audio token/feature length mismatch: cannot infer per-sample audio grouping "
+                            "(bsz=%d, num_audios=%d). Falling back to GLOBAL pad/truncate: cur=%d, required=%d.",
+                            bsz,
+                            len(audio_feature_token_lens),
+                            total_cur,
+                            total_required,
+                        )
+                        warned += 1
+                        setattr(self, "_qwen3_asr_audio_align_warned", warned)
+                        if warned == warn_limit:
+                            logger.warning_rank0(
+                                "Suppressing further Qwen3-ASR audio alignment warnings after %d occurrences. "
+                                "Set LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_WARN_LIMIT to a larger value to log more.",
+                                warn_limit,
+                            )
+
+                    if total_cur < total_required:
+                        pad = audio_features_flat.new_zeros((total_required - total_cur, embed_dim))
+                        audio_features_aligned = torch.cat([audio_features_flat, pad], dim=0)
                     else:
-                        pad = cur_feat.new_zeros((req - cur, embed_dim))
-                        pieces.append(torch.cat([cur_feat, pad], dim=0))
+                        audio_features_aligned = audio_features_flat[:total_required]
 
-                audio_features = torch.cat(pieces, dim=0) if pieces else audio_features_flat[:0]
-            else:
-                audio_features = audio_features_flat
-                offset = total_cur
-
-            if offset != total_cur:
-                raise ValueError(
-                    "Qwen3-ASR audio token/feature length mismatch: unexpected leftover audio features. "
-                    f"total_cur={total_cur}, consumed={offset}, audio_feature_token_lens={audio_feature_token_lens!r}, "
-                    f"required_counts={required_counts!r}"
-                )
-            inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+                    inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features_aligned)
 
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
