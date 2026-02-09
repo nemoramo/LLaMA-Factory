@@ -1830,23 +1830,121 @@ class Qwen3ASRPlugin(BasePlugin):
         audio: AudioInput,
         sampling_rate: float,
         hop_length: int | None,
+        min_samples: int | None = None,
     ) -> int | None:
         if hop_length is None or hop_length <= 0:
             return None
 
         if isinstance(audio, np.ndarray):
             n_samples = int(audio.shape[0])
+            if isinstance(min_samples, int) and min_samples > 0:
+                n_samples = max(n_samples, int(min_samples))
             return max(1, n_samples // int(hop_length))
 
         if isinstance(audio, str):
-            path, _, duration_sec, _ = self._extract_audio_fields(audio)
-            if duration_sec is None and path:
-                duration_sec = self._get_audio_duration_sec(str(path))
-            if duration_sec is None:
+            obj = None
+            audio_str = audio.strip()
+            if audio_str.startswith("{") and audio_str.endswith("}"):
+                try:
+                    obj = json.loads(audio_str)
+                    if not isinstance(obj, dict):
+                        obj = None
+                except Exception:  # noqa: BLE001
+                    obj = None
+
+            path = None
+            duration_sec = None
+            has_offset = False
+            if obj is not None:
+                path = obj.get("path") or obj.get("wav_path") or obj.get("audio_path")
+                has_offset = any(
+                    k in obj
+                    for k in (
+                        "offset_sec",
+                        "offset_secs",
+                        "offset_seconds",
+                        "offset",
+                        "start_sec",
+                        "start_secs",
+                        "start_seconds",
+                        "start_time",
+                        "start",
+                    )
+                )
+
+                for k in ("duration_sec", "duration_secs", "duration_seconds", "duration"):
+                    if k not in obj:
+                        continue
+                    try:
+                        d = float(obj.get(k))
+                        if math.isfinite(d) and d >= 0:
+                            duration_sec = d
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+
+                if duration_sec is None:
+                    for k in ("duration_ms", "duration_msec"):
+                        if k not in obj:
+                            continue
+                        try:
+                            d_ms = float(obj.get(k))
+                            d = d_ms / 1000.0
+                            if math.isfinite(d) and d >= 0:
+                                duration_sec = d
+                                break
+                        except Exception:  # noqa: BLE001
+                            continue
+            else:
+                path = audio
+
+            if duration_sec is not None:
+                n_samples = int(round(float(duration_sec) * float(sampling_rate)))
+                if isinstance(min_samples, int) and min_samples > 0:
+                    n_samples = max(n_samples, int(min_samples))
+                return max(1, n_samples // int(hop_length))
+
+            # Segment-based audio without explicit duration: do not probe file-level metadata.
+            if has_offset:
                 return None
 
-            n_samples = int(float(duration_sec) * float(sampling_rate))
-            return max(1, n_samples // int(hop_length))
+            if not isinstance(path, str) or path == "":
+                return None
+            if path.startswith("file://"):
+                path = path[7:]
+            if path.startswith("s3://"):
+                return None
+
+            # Prefer header probing to avoid feature extraction.
+            if soundfile is not None:
+                try:
+                    info = soundfile.info(path)
+                    frames = getattr(info, "frames", None)
+                    sr = getattr(info, "samplerate", None)
+                    if isinstance(frames, int) and isinstance(sr, int) and frames >= 0 and sr > 0:
+                        n_samples = int(round(float(frames) * float(sampling_rate) / float(sr)))
+                        if isinstance(min_samples, int) and min_samples > 0:
+                            n_samples = max(n_samples, int(min_samples))
+                        return max(1, n_samples // int(hop_length))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if pydub_mediainfo is not None:
+                try:
+                    meta = pydub_mediainfo(path)
+                    if isinstance(meta, dict):
+                        dur = meta.get("duration")
+                        if dur is not None:
+                            d = float(dur)
+                            if math.isfinite(d) and d >= 0:
+                                n_samples = int(round(d * float(sampling_rate)))
+                                if isinstance(min_samples, int) and min_samples > 0:
+                                    n_samples = max(n_samples, int(min_samples))
+                                return max(1, n_samples // int(hop_length))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            return None
 
         return None
 
@@ -1870,11 +1968,14 @@ class Qwen3ASRPlugin(BasePlugin):
             sampling_rate = float(getattr(feature_extractor, "sampling_rate", 16000))
             hop_length = getattr(feature_extractor, "hop_length", None)
             hop_length = int(hop_length) if isinstance(hop_length, int) and hop_length > 0 else None
+            min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
 
             unknown_audios: list[AudioInput] = []
             unknown_positions: list[int] = []
             for idx, audio in enumerate(audios):
-                feature_length = self._try_get_feature_length(audio, sampling_rate, hop_length)
+                feature_length = self._try_get_feature_length(
+                    audio, sampling_rate, hop_length, min_samples=min_samples
+                )
                 if feature_length is None:
                     audio_lengths.append(-1)
                     unknown_audios.append(audio)
