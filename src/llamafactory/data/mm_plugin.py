@@ -1965,7 +1965,7 @@ class Qwen3ASRPlugin(BasePlugin):
         audio_lengths: list[int] = []
         if self.expand_mm_tokens:
             feature_extractor = getattr(processor, "feature_extractor", None)
-            sampling_rate = float(getattr(feature_extractor, "sampling_rate", 16000))
+            sampling_rate = float(getattr(processor, "audio_sampling_rate", 16000))
             hop_length = getattr(feature_extractor, "hop_length", None)
             hop_length = int(hop_length) if isinstance(hop_length, int) and hop_length > 0 else None
             min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
