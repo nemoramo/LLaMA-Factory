@@ -486,8 +486,12 @@ class Qwen3ASRAudioAttention(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        """Input shape: Batch x Time x Channel"""
+    ) -> torch.Tensor:
+        """Input shape: (seq_len, embed_dim) after packing into a flat sequence.
+
+        Returns:
+            attn_output: (seq_len, embed_dim)
+        """
 
         seq_length, _ = hidden_states.size()
 

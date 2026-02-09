@@ -1825,6 +1825,31 @@ class Qwen3ASRPlugin(BasePlugin):
         output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_length // 100) * 13
         return int(output_lengths)
 
+    def _try_get_feature_length(
+        self,
+        audio: AudioInput,
+        sampling_rate: float,
+        hop_length: int | None,
+    ) -> int | None:
+        if hop_length is None or hop_length <= 0:
+            return None
+
+        if isinstance(audio, np.ndarray):
+            n_samples = int(audio.shape[0])
+            return max(1, n_samples // int(hop_length))
+
+        if isinstance(audio, str):
+            path, _, duration_sec, _ = self._extract_audio_fields(audio)
+            if duration_sec is None and path:
+                duration_sec = self._get_audio_duration_sec(str(path))
+            if duration_sec is None:
+                return None
+
+            n_samples = int(float(duration_sec) * float(sampling_rate))
+            return max(1, n_samples // int(hop_length))
+
+        return None
+
     @override
     def process_messages(
         self,
@@ -1841,16 +1866,39 @@ class Qwen3ASRPlugin(BasePlugin):
         messages = deepcopy(messages)
         audio_lengths: list[int] = []
         if self.expand_mm_tokens:
-            mm_inputs = self._get_mm_inputs([], [], audios, processor)
-            if "feature_attention_mask" in mm_inputs:
-                audio_lengths = mm_inputs["feature_attention_mask"].sum(-1).tolist()
+            feature_extractor = getattr(processor, "feature_extractor", None)
+            sampling_rate = float(getattr(feature_extractor, "sampling_rate", 16000))
+            hop_length = getattr(feature_extractor, "hop_length", None)
+            hop_length = int(hop_length) if isinstance(hop_length, int) and hop_length > 0 else None
+
+            unknown_audios: list[AudioInput] = []
+            unknown_positions: list[int] = []
+            for idx, audio in enumerate(audios):
+                feature_length = self._try_get_feature_length(audio, sampling_rate, hop_length)
+                if feature_length is None:
+                    audio_lengths.append(-1)
+                    unknown_audios.append(audio)
+                    unknown_positions.append(idx)
+                else:
+                    audio_lengths.append(int(feature_length))
+
+            # Fallback to full feature extraction only for audios we cannot probe cheaply.
+            if unknown_audios:
+                mm_inputs = self._get_mm_inputs([], [], unknown_audios, processor)
+                if "feature_attention_mask" in mm_inputs:
+                    fallback_lengths = mm_inputs["feature_attention_mask"].sum(-1).tolist()
+                    for idx, feature_length in zip(unknown_positions, fallback_lengths):
+                        audio_lengths[idx] = int(feature_length)
 
         for message in messages:
             content = message["content"]
             while AUDIO_PLACEHOLDER in content:
                 if self.expand_mm_tokens and audio_lengths:
                     feature_length = int(audio_lengths.pop(0))
-                    audio_seqlen = max(1, self._get_audio_token_length(feature_length))
+                    if feature_length > 0:
+                        audio_seqlen = max(1, self._get_audio_token_length(feature_length))
+                    else:
+                        audio_seqlen = 1
                 else:
                     audio_seqlen = 1
 

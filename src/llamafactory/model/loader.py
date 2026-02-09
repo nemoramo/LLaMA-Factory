@@ -78,10 +78,9 @@ def _maybe_register_funaudiochat_from_error(err: Exception) -> bool:
 def _try_register_qwen3_asr() -> bool:
     """Best-effort registration for Qwen3-ASR HF classes.
 
-    Qwen3-ASR is released as a standalone package (`qwen-asr`) and may not yet be in upstream transformers.
-    We support both:
-      - `pip install qwen-asr`
-      - vendored submodule at `third_party/qwen3-asr` (imported via sys.path)
+    We vendor a minimal Qwen3-ASR implementation under `llamafactory.model.qwen3_asr` and register its
+    Auto* mappings on demand (typically when upstream transformers does not yet recognize Qwen3-ASR
+    checkpoints).
     """
     try:
         from .qwen3_asr.register import register_qwen3_asr
