@@ -198,6 +198,34 @@ class BaseModelArguments:
         default=False,
         metadata={"help": "For debugging purposes, print the status of the parameters in the model."},
     )
+    qwen3_asr_dynamic_window: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable Qwen3-ASR training-time dynamic audio attention window sampling. "
+                "When enabled, each audio may randomly pick a window ratio from `qwen3_asr_dynamic_window_ratios`."
+            )
+        },
+    )
+    qwen3_asr_dynamic_window_ratios: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated window size ratios for Qwen3-ASR dynamic audio attention windows. "
+                "Ratios are relative to `audio_config.n_window * 2` (the base conv chunk length). "
+                "Example: \"1,2,4,8\" (paper setting)."
+            )
+        },
+    )
+    qwen3_asr_dynamic_window_probs: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional comma-separated sampling probabilities aligned with `qwen3_asr_dynamic_window_ratios`. "
+                "If omitted, ratios are sampled uniformly."
+            )
+        },
+    )
     trust_remote_code: bool = field(
         default=False,
         metadata={"help": "Whether to trust the execution of code from datasets/models defined on the Hub or not."},
@@ -215,6 +243,37 @@ class BaseModelArguments:
 
         if self.add_tokens is not None:  # support multiple tokens
             self.add_tokens = [token.strip() for token in self.add_tokens.split(",")]
+
+        def _split_numbers(arg, cast):
+            if arg is None:
+                return None
+            if isinstance(arg, str):
+                items = [item.strip() for item in arg.split(",") if item.strip()]
+                return [cast(item) for item in items]
+            if isinstance(arg, (list, tuple)):
+                return [cast(item) for item in arg]
+            return None
+
+        if self.qwen3_asr_dynamic_window and self.qwen3_asr_dynamic_window_ratios is None:
+            self.qwen3_asr_dynamic_window_ratios = [1, 2, 4, 8]
+        else:
+            ratios = _split_numbers(self.qwen3_asr_dynamic_window_ratios, int)
+            if ratios is not None:
+                self.qwen3_asr_dynamic_window_ratios = ratios
+
+        probs = _split_numbers(self.qwen3_asr_dynamic_window_probs, float)
+        if probs is not None:
+            self.qwen3_asr_dynamic_window_probs = probs
+
+        if (
+            self.qwen3_asr_dynamic_window
+            and self.qwen3_asr_dynamic_window_probs is not None
+            and self.qwen3_asr_dynamic_window_ratios is not None
+            and len(self.qwen3_asr_dynamic_window_probs) != len(self.qwen3_asr_dynamic_window_ratios)
+        ):
+            raise ValueError(
+                "`qwen3_asr_dynamic_window_probs` must have the same length as `qwen3_asr_dynamic_window_ratios`."
+            )
 
         # Process special tokens with priority: new_special_tokens_config > add_special_tokens
         if self.new_special_tokens_config is not None:

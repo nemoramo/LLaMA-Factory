@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypedDict
 import torch
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSeq2SeqLM,
@@ -74,6 +75,28 @@ def _maybe_register_funaudiochat_from_error(err: Exception) -> bool:
     return "funaudiochat" in str(err).lower() and _try_register_funaudiochat()
 
 
+def _try_register_qwen3_asr() -> bool:
+    """Best-effort registration for Qwen3-ASR HF classes.
+
+    We vendor a minimal Qwen3-ASR implementation under `llamafactory.model.qwen3_asr` and register its
+    Auto* mappings on demand (typically when upstream transformers does not yet recognize Qwen3-ASR
+    checkpoints).
+    """
+    try:
+        from .qwen3_asr.register import register_qwen3_asr
+
+        register_qwen3_asr()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Failed to register Qwen3-ASR: {e}.")
+        return False
+
+
+def _maybe_register_qwen3_asr_from_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return ("qwen3_asr" in msg or "qwen3-asr" in msg) and _try_register_qwen3_asr()
+
+
 def _get_init_kwargs(model_args: "ModelArguments") -> dict[str, Any]:
     r"""Get arguments to load config/tokenizer/model.
 
@@ -100,6 +123,8 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
         cfg = AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
     except Exception as e:  # noqa: BLE001
         if _maybe_register_funaudiochat_from_error(e):
+            cfg = AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+        elif _maybe_register_qwen3_asr_from_error(e):
             cfg = AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
         else:
             logger.debug(f"Failed to load config before tokenizer: {e}.")
@@ -176,7 +201,7 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
                 **init_kwargs,
             )
         except Exception as e:  # noqa: BLE001
-            if _maybe_register_funaudiochat_from_error(e):
+            if _maybe_register_funaudiochat_from_error(e) or _maybe_register_qwen3_asr_from_error(e):
                 processor = AutoProcessor.from_pretrained(
                     model_args.model_name_or_path,
                     use_fast=not model_args.use_fast_tokenizer,
@@ -186,7 +211,7 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
             else:
                 raise
     except Exception as e:
-        if _maybe_register_funaudiochat_from_error(e):
+        if _maybe_register_funaudiochat_from_error(e) or _maybe_register_qwen3_asr_from_error(e):
             try:
                 processor = AutoProcessor.from_pretrained(
                     model_args.model_name_or_path,
@@ -247,7 +272,7 @@ def load_config(model_args: "ModelArguments") -> "PretrainedConfig":
     try:
         return AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
     except Exception as e:  # noqa: BLE001
-        if _maybe_register_funaudiochat_from_error(e):
+        if _maybe_register_funaudiochat_from_error(e) or _maybe_register_qwen3_asr_from_error(e):
             return AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
         raise
 
@@ -293,6 +318,10 @@ def load_model(
                 load_class = AutoModelForImageTextToText
             elif type(config) in AutoModelForVision2Seq._model_mapping.keys():  # image-text
                 load_class = AutoModelForVision2Seq
+            elif isinstance(getattr(config, "model_type", None), str) and getattr(config, "model_type").startswith(
+                "qwen3_asr"
+            ):
+                load_class = AutoModel
             elif type(config) in AutoModelForSeq2SeqLM._model_mapping.keys():  # audio-text
                 load_class = AutoModelForSeq2SeqLM
             elif type(config) in AutoModelForTextToWaveform._model_mapping.keys():  # audio hack for qwen omni
@@ -303,7 +332,16 @@ def load_model(
             if model_args.train_from_scratch:
                 model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
             else:
-                model = load_class.from_pretrained(**init_kwargs)
+                try:
+                    model = load_class.from_pretrained(**init_kwargs)
+                except Exception as e:  # noqa: BLE001
+                    # Qwen3-ASR models may require local registration via `qwen-asr` package or third_party submodule.
+                    if isinstance(getattr(config, "model_type", None), str) and getattr(config, "model_type").startswith(
+                        "qwen3_asr"
+                    ) and _try_register_qwen3_asr():
+                        model = load_class.from_pretrained(**init_kwargs)
+                    else:
+                        raise
                 if getattr(model.config, "model_type", None) in ["qwen2_5_omni", "qwen3_omni_moe"]:
                     model = getattr(model, "thinker")
 

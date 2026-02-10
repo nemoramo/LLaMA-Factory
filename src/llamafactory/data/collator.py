@@ -540,6 +540,19 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         if audio_duration_tensor is not None:
             features["audio_duration_sec"] = audio_duration_tensor
+
+        # Qwen3-ASR: provide the per-sample count of `<|audio_pad|>` tokens as python ints so the model can
+        # safely pad audio features when audio token expansion length mismatches (e.g. due to audio decoding differences).
+        if self.model is not None and getattr(self.model.config, "model_type", None) == "qwen3_asr":
+            audio_token = getattr(self.template.mm_plugin, "audio_token", None)
+            if isinstance(audio_token, str) and audio_token:
+                try:
+                    audio_token_id = self.tokenizer.convert_tokens_to_ids(audio_token)
+                    if audio_token_id is not None and torch.is_tensor(features.get("input_ids")):
+                        counts = (features["input_ids"] == int(audio_token_id)).sum(dim=-1).to("cpu").tolist()
+                        features["qwen3_asr_audio_token_count"] = [int(x) for x in counts]
+                except Exception:  # noqa: BLE001
+                    pass
         return features
 
 

@@ -179,6 +179,8 @@ class HuggingfaceEngine(BaseEngine):
         )
 
         mm_inputs = template.mm_plugin.get_mm_inputs(**mm_input_dict, batch_ids=[prompt_ids], processor=processor)
+        # Training-only diagnostic flag; models typically do not accept this kwarg.
+        mm_inputs.pop("feature_load_fail_mask", None)
         for key, value in mm_inputs.items():
             if isinstance(value, list) and isinstance(value[0], torch.Tensor):  # for pixtral inputs
                 value = torch.stack(value)  # assume they have same sizes
@@ -240,6 +242,9 @@ class HuggingfaceEngine(BaseEngine):
         generate_output = model.generate(**gen_kwargs)
         if isinstance(generate_output, tuple):
             generate_output = generate_output[1][0]  # post-process the minicpm_o output
+        sequences = getattr(generate_output, "sequences", None)
+        if sequences is not None:
+            generate_output = sequences
 
         response_ids = generate_output[:, prompt_length:]
         response = tokenizer.batch_decode(

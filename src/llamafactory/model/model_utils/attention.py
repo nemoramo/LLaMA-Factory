@@ -91,6 +91,18 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
                 crq_cfg["_attn_implementation"] = requested_attn_implementation
         if hasattr(config, "text_config"):
             setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
+    elif getattr(config, "model_type", None) == "qwen3_asr":
+        # Qwen3-ASR is a composite config with nested thinker/audio/text configs.
+        setattr(config, "_attn_implementation", requested_attn_implementation)
+        thinker_cfg = getattr(config, "thinker_config", None)
+        if thinker_cfg is not None:
+            setattr(thinker_cfg, "_attn_implementation", requested_attn_implementation)
+            audio_cfg = getattr(thinker_cfg, "audio_config", None)
+            if audio_cfg is not None:
+                setattr(audio_cfg, "_attn_implementation", requested_attn_implementation)
+            text_cfg = getattr(thinker_cfg, "text_config", None)
+            if text_cfg is not None:
+                setattr(text_cfg, "_attn_implementation", requested_attn_implementation)
     elif getattr(config, "model_type", None) == "kimi_vl":
         setattr(config.vision_config, "_attn_implementation", requested_attn_implementation)
         setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
@@ -123,3 +135,16 @@ def print_attn_implementation(config: "PretrainedConfig") -> None:
             text_attn = getattr(config.text_config, "_attn_implementation", None)
             if text_attn is not None:
                 logger.info_rank0(f"  - text_config attention: {text_attn}")
+    elif getattr(config, "model_type", None) == "qwen3_asr":
+        thinker_cfg = getattr(config, "thinker_config", None)
+        if thinker_cfg is not None:
+            audio_cfg = getattr(thinker_cfg, "audio_config", None)
+            if audio_cfg is not None:
+                audio_attn = getattr(audio_cfg, "_attn_implementation", None)
+                if audio_attn is not None:
+                    logger.info_rank0(f"  - thinker.audio_config attention: {audio_attn}")
+            text_cfg = getattr(thinker_cfg, "text_config", None)
+            if text_cfg is not None:
+                text_attn = getattr(text_cfg, "_attn_implementation", None)
+                if text_attn is not None:
+                    logger.info_rank0(f"  - thinker.text_config attention: {text_attn}")

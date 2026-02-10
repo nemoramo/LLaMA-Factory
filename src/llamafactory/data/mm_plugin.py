@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     class RegularizedAudioOutput(TypedDict):
         audios: list[NDArray]
         sampling_rates: list[float]
+        load_fail_mask: NotRequired[list[bool]]
 
     class MMProcessor(ProcessorMixin):
         patch_size: int
@@ -567,13 +568,61 @@ class MMPluginMixin:
         """
         results: list[NDArray] = []
         sampling_rates: list[float] = []
+        load_fail_mask: list[bool] = []
+
+        max_retries = int(os.getenv("LLAMAFACTORY_AUDIO_LOAD_RETRIES", "1"))
+        retry_sleep_sec = float(os.getenv("LLAMAFACTORY_AUDIO_LOAD_RETRY_SLEEP", "0.2"))
+        log_limit = int(os.getenv("LLAMAFACTORY_AUDIO_LOAD_ERROR_LOG_LIMIT", "20"))
+        logged = int(getattr(self, "_mm_audio_load_error_logged", 0))
+        suppressed = bool(getattr(self, "_mm_audio_load_error_suppressed", False))
 
         for audio in audios:
-            y, sr = self._load_single_audio(audio, sampling_rate)
-            results.append(y)
-            sampling_rates.append(sr)
+            last_error: Exception | None = None
+            y: NDArray | None = None
+            sr: float | None = None
+            for attempt in range(max(0, max_retries) + 1):
+                try:
+                    y, sr = self._load_single_audio(audio, sampling_rate)
+                    last_error = None
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_error = e
+                    is_not_found = isinstance(e, FileNotFoundError) or (
+                        isinstance(e, OSError) and getattr(e, "errno", None) == 2
+                    )
+                    if is_not_found or attempt >= max(0, max_retries):
+                        break
+                    time.sleep(retry_sleep_sec * float(attempt + 1))
 
-        return {"audios": results, "sampling_rates": sampling_rates}
+            if last_error is not None or y is None or sr is None:
+                # Use a dummy waveform so feature extraction can proceed and the collator can
+                # mask labels for the affected segments via `feature_load_fail_mask`.
+                results.append(np.zeros(0, dtype=np.float32))
+                sampling_rates.append(float(sampling_rate))
+                load_fail_mask.append(True)
+                if logged < log_limit:
+                    logger.warning_rank0(
+                        "Audio load error; using dummy waveform (audio=%r): %s",
+                        audio,
+                        repr(last_error),
+                    )
+                    logged += 1
+                elif not suppressed:
+                    logger.warning_rank0(
+                        "Too many audio load errors (%d+); suppressing further logs.",
+                        log_limit,
+                    )
+                    suppressed = True
+                continue
+
+            results.append(y)
+            sampling_rates.append(float(sr))
+            load_fail_mask.append(False)
+
+        setattr(self, "_mm_audio_load_error_logged", logged)
+        setattr(self, "_mm_audio_load_error_suppressed", suppressed)
+
+        return {"audios": results, "sampling_rates": sampling_rates, "load_fail_mask": load_fail_mask}
 
     def _get_mm_inputs(
         self,
@@ -646,10 +695,16 @@ class MMPluginMixin:
             feature_extractor: SequenceFeatureExtractor = getattr(processor, "feature_extractor", None)
             audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
             audio_padding = getattr(processor, "audio_padding", "max_length")
-            audios = self._regularize_audios(
+            audio_out = self._regularize_audios(
                 audios,
                 sampling_rate=audio_sampling_rate,
-            )["audios"]
+            )
+            audios = audio_out["audios"]
+            feature_load_fail_mask = audio_out.get("load_fail_mask", None)
+            if feature_load_fail_mask is None:
+                feature_load_fail_mask = [False] * len(audios)
+            elif len(feature_load_fail_mask) != len(audios):
+                feature_load_fail_mask = (list(feature_load_fail_mask) + [False] * len(audios))[: len(audios)]
             min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
             if min_samples > 0:
                 audios = [np.pad(a, (0, max(0, min_samples - a.shape[0])), mode="constant") for a in audios]
@@ -663,6 +718,7 @@ class MMPluginMixin:
                 )
             )
             mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask", None)  # prevent conflicts
+            mm_inputs["feature_load_fail_mask"] = torch.tensor(feature_load_fail_mask, dtype=torch.bool)
 
         return mm_inputs
 
@@ -1729,6 +1785,228 @@ class Qwen2AudioPlugin(BasePlugin):
 
                 content = content.replace(
                     AUDIO_PLACEHOLDER, f"{bos_token}{self.audio_token * audio_seqlen}{eos_token}", 1
+                )
+
+            message["content"] = content
+
+        return messages
+
+    @override
+    def get_mm_inputs(
+        self,
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        imglens: list[int],
+        vidlens: list[int],
+        audlens: list[int],
+        batch_ids: list[list[int]],
+        processor: MMProcessor | None,
+    ) -> dict[str, list[int] | torch.Tensor]:
+        self._validate_input(processor, images, videos, audios)
+        return self._get_mm_inputs(images, videos, audios, processor)
+
+@dataclass
+class Qwen3ASRPlugin(BasePlugin):
+    """Multimodal plugin for Qwen3-ASR.
+
+    Qwen3-ASR expands each `<audio>` placeholder into:
+      <audio_bos_token> + <audio_token> * N + <audio_eos_token>
+
+    where `N` is computed from `feature_attention_mask` via the same length rule used by
+    `qwen_asr.core.transformers_backend.processing_qwen3_asr._get_feat_extract_output_lengths`.
+    """
+
+    @staticmethod
+    def _get_audio_token_length(feature_length: int) -> int:
+        # Mirrors Qwen3ASRProcessor's `_get_feat_extract_output_lengths`.
+        input_lengths_leave = feature_length % 100
+        feat_lengths = (input_lengths_leave - 1) // 2 + 1
+        output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_length // 100) * 13
+        return int(output_lengths)
+
+    def _try_get_feature_length(
+        self,
+        audio: AudioInput,
+        sampling_rate: float,
+        hop_length: int | None,
+        min_samples: int | None = None,
+    ) -> int | None:
+        if hop_length is None or hop_length <= 0:
+            return None
+
+        if isinstance(audio, np.ndarray):
+            n_samples = int(audio.shape[0])
+            if isinstance(min_samples, int) and min_samples > 0:
+                n_samples = max(n_samples, int(min_samples))
+            return max(1, n_samples // int(hop_length))
+
+        if isinstance(audio, str):
+            obj = None
+            audio_str = audio.strip()
+            if audio_str.startswith("{") and audio_str.endswith("}"):
+                try:
+                    obj = json.loads(audio_str)
+                    if not isinstance(obj, dict):
+                        obj = None
+                except Exception:  # noqa: BLE001
+                    obj = None
+
+            path = None
+            duration_sec = None
+            has_offset = False
+            if obj is not None:
+                path = obj.get("path") or obj.get("wav_path") or obj.get("audio_path")
+                has_offset = any(
+                    k in obj
+                    for k in (
+                        "offset_sec",
+                        "offset_secs",
+                        "offset_seconds",
+                        "offset",
+                        "start_sec",
+                        "start_secs",
+                        "start_seconds",
+                        "start_time",
+                        "start",
+                    )
+                )
+
+                for k in ("duration_sec", "duration_secs", "duration_seconds", "duration"):
+                    if k not in obj:
+                        continue
+                    try:
+                        d = float(obj.get(k))
+                        if math.isfinite(d) and d >= 0:
+                            duration_sec = d
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+
+                if duration_sec is None:
+                    for k in ("duration_ms", "duration_msec"):
+                        if k not in obj:
+                            continue
+                        try:
+                            d_ms = float(obj.get(k))
+                            d = d_ms / 1000.0
+                            if math.isfinite(d) and d >= 0:
+                                duration_sec = d
+                                break
+                        except Exception:  # noqa: BLE001
+                            continue
+            else:
+                path = audio
+
+            if duration_sec is not None:
+                n_samples = int(round(float(duration_sec) * float(sampling_rate)))
+                if isinstance(min_samples, int) and min_samples > 0:
+                    n_samples = max(n_samples, int(min_samples))
+                return max(1, n_samples // int(hop_length))
+
+            # Segment-based audio without explicit duration: do not probe file-level metadata.
+            if has_offset:
+                return None
+
+            if not isinstance(path, str) or path == "":
+                return None
+            if path.startswith("file://"):
+                path = path[7:]
+            if path.startswith("s3://"):
+                return None
+
+            # Prefer header probing to avoid feature extraction.
+            if soundfile is not None:
+                try:
+                    info = soundfile.info(path)
+                    frames = getattr(info, "frames", None)
+                    sr = getattr(info, "samplerate", None)
+                    if isinstance(frames, int) and isinstance(sr, int) and frames >= 0 and sr > 0:
+                        n_samples = int(round(float(frames) * float(sampling_rate) / float(sr)))
+                        if isinstance(min_samples, int) and min_samples > 0:
+                            n_samples = max(n_samples, int(min_samples))
+                        return max(1, n_samples // int(hop_length))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if pydub_mediainfo is not None:
+                try:
+                    meta = pydub_mediainfo(path)
+                    if isinstance(meta, dict):
+                        dur = meta.get("duration")
+                        if dur is not None:
+                            d = float(dur)
+                            if math.isfinite(d) and d >= 0:
+                                n_samples = int(round(d * float(sampling_rate)))
+                                if isinstance(min_samples, int) and min_samples > 0:
+                                    n_samples = max(n_samples, int(min_samples))
+                                return max(1, n_samples // int(hop_length))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            return None
+
+        return None
+
+    @override
+    def process_messages(
+        self,
+        messages: list[dict[str, str]],
+        images: list[ImageInput],
+        videos: list[VideoInput],
+        audios: list[AudioInput],
+        processor: MMProcessor | None,
+    ) -> list[dict[str, str]]:
+        self._validate_input(processor, images, videos, audios)
+        self._validate_messages(messages, images, videos, audios)
+        bos_token: str = getattr(processor, "audio_bos_token")
+        eos_token: str = getattr(processor, "audio_eos_token")
+        messages = deepcopy(messages)
+        audio_lengths: list[int] = []
+        if self.expand_mm_tokens:
+            feature_extractor = getattr(processor, "feature_extractor", None)
+            sampling_rate = float(getattr(processor, "audio_sampling_rate", 16000))
+            hop_length = getattr(feature_extractor, "hop_length", None)
+            hop_length = int(hop_length) if isinstance(hop_length, int) and hop_length > 0 else None
+            min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
+
+            unknown_audios: list[AudioInput] = []
+            unknown_positions: list[int] = []
+            for idx, audio in enumerate(audios):
+                feature_length = self._try_get_feature_length(
+                    audio, sampling_rate, hop_length, min_samples=min_samples
+                )
+                if feature_length is None:
+                    audio_lengths.append(-1)
+                    unknown_audios.append(audio)
+                    unknown_positions.append(idx)
+                else:
+                    audio_lengths.append(int(feature_length))
+
+            # Fallback to full feature extraction only for audios we cannot probe cheaply.
+            if unknown_audios:
+                mm_inputs = self._get_mm_inputs([], [], unknown_audios, processor)
+                if "feature_attention_mask" in mm_inputs:
+                    fallback_lengths = mm_inputs["feature_attention_mask"].sum(-1).tolist()
+                    for idx, feature_length in zip(unknown_positions, fallback_lengths):
+                        audio_lengths[idx] = int(feature_length)
+
+        for message in messages:
+            content = message["content"]
+            while AUDIO_PLACEHOLDER in content:
+                if self.expand_mm_tokens and audio_lengths:
+                    feature_length = int(audio_lengths.pop(0))
+                    if feature_length > 0:
+                        audio_seqlen = max(1, self._get_audio_token_length(feature_length))
+                    else:
+                        audio_seqlen = 1
+                else:
+                    audio_seqlen = 1
+
+                content = content.replace(
+                    AUDIO_PLACEHOLDER,
+                    f"{bos_token}{self.audio_token * audio_seqlen}{eos_token}",
+                    1,
                 )
 
             message["content"] = content
@@ -3123,6 +3401,7 @@ PLUGINS = {
     "pixtral": PixtralPlugin,
     "funaudiochat": FunAudioChatPlugin,
     "qwen2_audio": Qwen2AudioPlugin,
+    "qwen3_asr": Qwen3ASRPlugin,
     "voxtral": VoxtralPlugin,
     "qwen2_omni": Qwen2OmniPlugin,
     "qwen2_vl": Qwen2VLPlugin,
