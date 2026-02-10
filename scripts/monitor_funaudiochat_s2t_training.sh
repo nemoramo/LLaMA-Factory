@@ -77,12 +77,39 @@ DYNAMIC_PROMPT_PACKING_NUM_SHARDS="${DYNAMIC_PROMPT_PACKING_NUM_SHARDS:-0}"
 #   - Smaller (e.g., 4096): Use when memory is tight or rows are large.
 #   - Larger (e.g., 16384): Use when memory is abundant for higher throughput.
 #
+# SHARDED_PREFETCH_NEXT_SHARD: Prefetch the next shard in a background thread (per dataloader worker).
+#   - true (default): Helps hide stalls at shard boundaries in DDP.
+#   - false: Disable next-shard prefetch.
+#
+# SHARDED_PREFETCH_QUEUE_BATCHES: Max number of parquet RecordBatches to prefetch for the next shard.
+#   - 1 (default): Minimal extra RAM, still hides open/first-read stalls.
+#   - 2-4: More aggressive prefetch; use only if RAM allows.
+#
+# SHARDED_PREFETCH_LOG: Log shard prefetch events (rank0) for debugging.
+#
 SHARDED_DATASET_BACKEND="${SHARDED_DATASET_BACKEND:-off}" # off | polars_parquet_shards
 SHARDED_MANIFEST_PATH="${SHARDED_MANIFEST_PATH:-}"
 SHARDED_INPUT_ALIGNED="${SHARDED_INPUT_ALIGNED:-false}"
 SHARDED_SHUFFLE_SHARDS="${SHARDED_SHUFFLE_SHARDS:-true}"
 SHARDED_ROW_SHUFFLE_BUFFER="${SHARDED_ROW_SHUFFLE_BUFFER:-0}"
 SHARDED_PARQUET_BATCH_ROWS="${SHARDED_PARQUET_BATCH_ROWS:-8192}"
+SHARDED_PREFETCH_NEXT_SHARD="${SHARDED_PREFETCH_NEXT_SHARD:-true}"
+SHARDED_PREFETCH_QUEUE_BATCHES="${SHARDED_PREFETCH_QUEUE_BATCHES:-1}"
+SHARDED_PREFETCH_LOG="${SHARDED_PREFETCH_LOG:-false}"
+#
+# SHARDED_RESUME_MODE: coarse resume for sharded parquet backend.
+#   - off (default): disable shard-boundary resume state.
+#   - shard_boundary: persist per-rank/worker shard cursors; restart skips completed shards (may repeat within last shard).
+# Note: if enabled, prefer `IGNORE_DATA_SKIP=true` to avoid Trainer-level skipping + double-skips.
+#
+# SHARDED_RESUME_STATE_DIR: where to write resume state json files (default: <output_dir>/shard_resume_state).
+# SHARDED_RESUME_PREFER_CHECKPOINT: prefer loading state from <checkpoint_dir>/shard_resume_state if present.
+# SHARDED_RESUME_LOG: enable rank0 resume logging.
+#
+SHARDED_RESUME_MODE="${SHARDED_RESUME_MODE:-off}" # off | shard_boundary
+SHARDED_RESUME_STATE_DIR="${SHARDED_RESUME_STATE_DIR:-}"
+SHARDED_RESUME_PREFER_CHECKPOINT="${SHARDED_RESUME_PREFER_CHECKPOINT:-true}"
+SHARDED_RESUME_LOG="${SHARDED_RESUME_LOG:-false}"
 
 # Target ~60GB VRAM on H20; adjust if you see frequent OOMs.
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
@@ -252,6 +279,15 @@ run_once() {
     sharded_args+=("sharded_shuffle_shards=${SHARDED_SHUFFLE_SHARDS}")
     sharded_args+=("sharded_row_shuffle_buffer=${SHARDED_ROW_SHUFFLE_BUFFER}")
     sharded_args+=("sharded_parquet_batch_rows=${SHARDED_PARQUET_BATCH_ROWS}")
+    sharded_args+=("sharded_prefetch_next_shard=${SHARDED_PREFETCH_NEXT_SHARD}")
+    sharded_args+=("sharded_prefetch_queue_batches=${SHARDED_PREFETCH_QUEUE_BATCHES}")
+    sharded_args+=("sharded_prefetch_log=${SHARDED_PREFETCH_LOG}")
+    sharded_args+=("sharded_resume_mode=${SHARDED_RESUME_MODE}")
+    if [[ -n "${SHARDED_RESUME_STATE_DIR}" ]]; then
+      sharded_args+=("sharded_resume_state_dir=${SHARDED_RESUME_STATE_DIR}")
+    fi
+    sharded_args+=("sharded_resume_prefer_checkpoint=${SHARDED_RESUME_PREFER_CHECKPOINT}")
+    sharded_args+=("sharded_resume_log=${SHARDED_RESUME_LOG}")
   fi
 
   local data_seed_arg=()

@@ -18,6 +18,7 @@
 from collections.abc import MutableMapping
 import json
 import os
+import shutil
 import time
 from contextlib import contextmanager
 from functools import partial
@@ -52,6 +53,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
 
     _AUDIO_PROGRESS_FILENAME = "audio_progress.json"
+    _SHARD_RESUME_STATE_DIRNAME = "shard_resume_state"
 
     @override
     def _load_rng_state(self, checkpoint: Optional[str]) -> None:
@@ -436,6 +438,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             _dump(os.path.join(checkpoint_dir, self._AUDIO_PROGRESS_FILENAME))
         _dump(os.path.join(self.args.output_dir, "audio_progress_latest.json"))
 
+    def _snapshot_shard_resume_state(self, checkpoint_dir: str) -> None:
+        src = os.environ.get("LLAMAFACTORY_SHARDED_RESUME_STATE_DIR") or ""
+        if not src:
+            src = os.path.join(self.args.output_dir, self._SHARD_RESUME_STATE_DIRNAME)
+        if not os.path.isdir(src):
+            return
+
+        dst = os.path.join(checkpoint_dir, self._SHARD_RESUME_STATE_DIRNAME)
+        try:
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        except Exception as err:  # noqa: BLE001
+            logger.warning_rank0("Failed to snapshot shard resume state to %s: %s", dst, err)
+
     @override
     def _save_checkpoint(self, model, trial, metrics=None) -> None:
         try:
@@ -448,6 +463,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if self.args.should_save:
             checkpoint_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
             self._write_audio_progress(checkpoint_dir=checkpoint_dir)
+            self._snapshot_shard_resume_state(checkpoint_dir=checkpoint_dir)
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":

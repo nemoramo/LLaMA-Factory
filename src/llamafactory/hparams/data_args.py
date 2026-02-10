@@ -330,6 +330,68 @@ class DataArguments:
         metadata={"help": "PyArrow parquet iter_batches batch_size (rows) for sharded parquet backend."},
     )
 
+    sharded_prefetch_next_shard: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Prefetch the *next* parquet shard in a background thread (per dataloader worker) when using "
+                "the sharded parquet backend. Helps hide stalls at shard boundaries in DDP, at the cost of "
+                "extra CPU/IO and a small amount of extra RAM."
+            )
+        },
+    )
+
+    sharded_prefetch_queue_batches: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Max number of parquet RecordBatches to prefetch ahead for the *next* shard (per dataloader worker). "
+                "Set to 0 to disable next-shard prefetch. Keep small (1-4) to avoid RAM blowups."
+            )
+        },
+    )
+
+    sharded_prefetch_log: bool = field(
+        default=False,
+        metadata={"help": "Log shard prefetch events (rank0) for debugging sharded parquet stalls."},
+    )
+
+    sharded_resume_mode: Literal["off", "shard_boundary"] = field(
+        default="off",
+        metadata={
+            "help": (
+                "Resume mode for the sharded parquet backend. "
+                "'shard_boundary' enables coarse resume at shard boundaries by persisting per-rank/worker shard cursors. "
+                "This avoids re-reading completed shards after restart, but may repeat some data within the last shard."
+            )
+        },
+    )
+
+    sharded_resume_state_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Directory to persist sharded-resume state (JSON files). "
+                "If None, defaults to `<output_dir>/shard_resume_state`."
+            )
+        },
+    )
+
+    sharded_resume_prefer_checkpoint: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When resuming from a checkpoint, prefer loading shard-resume state from "
+                "`<checkpoint_dir>/shard_resume_state/` if present (otherwise fall back to the output_dir state)."
+            )
+        },
+    )
+
+    sharded_resume_log: bool = field(
+        default=False,
+        metadata={"help": "Log shard-resume load/save events (rank0) for debugging."},
+    )
+
     log_audio_epochs: bool = field(
         default=False,
         metadata={
@@ -387,6 +449,9 @@ class DataArguments:
                 raise ValueError("`sharded_dataset_backend` does not support `streaming`.")
             if self.val_size > 1e-6:
                 raise ValueError("`sharded_dataset_backend` does not support `val_size` splitting; set `val_size=0`.")
+        else:
+            if getattr(self, "sharded_resume_mode", "off") != "off":
+                raise ValueError("`sharded_resume_mode` requires enabling `sharded_dataset_backend`.")
 
         if self.mask_history and self.train_on_prompt:
             raise ValueError("`mask_history` is incompatible with `train_on_prompt`.")

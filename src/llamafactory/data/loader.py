@@ -684,6 +684,22 @@ def get_dataset(
             shuffle_shards = bool(getattr(data_args, "sharded_shuffle_shards", True))
             row_shuffle_buffer = int(getattr(data_args, "sharded_row_shuffle_buffer", 0) or 0)
             parquet_batch_rows = int(getattr(data_args, "sharded_parquet_batch_rows", 8192) or 8192)
+            prefetch_next_shard = bool(getattr(data_args, "sharded_prefetch_next_shard", True))
+            prefetch_queue_batches = int(getattr(data_args, "sharded_prefetch_queue_batches", 1) or 0)
+            prefetch_log = bool(getattr(data_args, "sharded_prefetch_log", False))
+            resume_mode = str(getattr(data_args, "sharded_resume_mode", "off") or "off")
+            resume_state_dir = getattr(data_args, "sharded_resume_state_dir", None)
+            resume_prefer_checkpoint = bool(getattr(data_args, "sharded_resume_prefer_checkpoint", True))
+            resume_log = bool(getattr(data_args, "sharded_resume_log", False))
+            resume_from_checkpoint = getattr(training_args, "resume_from_checkpoint", None)
+            if resume_mode != "off":
+                resolved_state_dir = (
+                    str(resume_state_dir)
+                    if isinstance(resume_state_dir, str) and resume_state_dir
+                    else os.path.join(str(getattr(training_args, "output_dir", "") or ""), "shard_resume_state")
+                )
+                if resolved_state_dir:
+                    os.environ.setdefault("LLAMAFACTORY_SHARDED_RESUME_STATE_DIR", resolved_state_dir)
 
             raw_train_ds = ShardedParquetIterableDataset(
                 manifest_path=str(sharded_manifest_path),
@@ -691,6 +707,15 @@ def get_dataset(
                 shuffle_shards=shuffle_shards,
                 row_shuffle_buffer=row_shuffle_buffer,
                 parquet_batch_rows=parquet_batch_rows,
+                prefetch_next_shard=prefetch_next_shard,
+                prefetch_queue_batches=prefetch_queue_batches,
+                prefetch_log=prefetch_log,
+                resume_mode=resume_mode,
+                resume_state_dir=resume_state_dir,
+                resume_prefer_checkpoint=resume_prefer_checkpoint,
+                resume_log=resume_log,
+                output_dir=str(getattr(training_args, "output_dir", "") or ""),
+                resume_from_checkpoint=str(resume_from_checkpoint) if isinstance(resume_from_checkpoint, str) else None,
             )
 
             dataset_module["train_dataset"] = build_dynamic_prompt_packed_iterable_dataset_from_iterable(
