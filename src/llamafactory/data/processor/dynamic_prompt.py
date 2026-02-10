@@ -253,13 +253,19 @@ class DynamicPromptDataset(Dataset):
         """Choose one entry from prompt pool.
 
         Supports weighted sampling when pool entries are dicts like:
-        {"text": "...", "weight": 0.2, ...}. If no weights are provided, uses uniform sampling.
+        {"text": "...", "weight": 0.2, ...}.
+
+        By default we sample **uniformly** (1/N) to avoid accidental skew from legacy
+        prompt_pool weights (e.g. 0.63/0.07/0.27/0.03). Set
+        `dynamic_prompt_prompt_pool_uniform_weights=false` to respect per-entry weights.
 
         IMPORTANT: returns the original item (dict/list/str), so downstream can interpret schema.
         """
         rng = self._get_rng()
         if len(pool) == 0:
             raise ValueError("prompt_pool is empty.")
+
+        force_uniform = bool(getattr(self.data_args, "dynamic_prompt_prompt_pool_uniform_weights", True))
 
         values: list[Any] = []
         weights: list[float] = []
@@ -269,6 +275,11 @@ class DynamicPromptDataset(Dataset):
                 w = self._sanitize_weight(item.get("weight"))
             values.append(item)
             weights.append(w)
+
+        if force_uniform:
+            # Respect explicit disabling (weight <= 0) but otherwise sample uniformly.
+            eligible = [v for v, w in zip(values, weights) if w > 0]
+            return rng.choice(eligible or values)
 
         if any(w > 0 for w in weights):
             return rng.choices(values, weights=weights, k=1)[0]
@@ -300,6 +311,8 @@ class DynamicPromptDataset(Dataset):
         sample_id = self._get_sample_id(example)
         h = self._stable_hash64(f"{base_seed}|{sample_id}")
 
+        force_uniform = bool(getattr(self.data_args, "dynamic_prompt_prompt_pool_uniform_weights", True))
+
         values: list[Any] = []
         weights: list[float] = []
         for item in pool:
@@ -308,6 +321,11 @@ class DynamicPromptDataset(Dataset):
                 w = self._sanitize_weight(item.get("weight"))
             values.append(item)
             weights.append(w)
+
+        if force_uniform:
+            eligible = [v for v, w in zip(values, weights) if w > 0]
+            values2 = eligible or values
+            return values2[int(h % len(values2))]
 
         total = sum(weights)
         if total > 0:
@@ -586,9 +604,22 @@ class DynamicPromptPackedBatchProcessor:
         return fw
 
     def _choose_from_pool(self, pool: Sequence[Any]) -> Any:
+        """Choose one entry from prompt pool.
+
+        Supports weighted sampling when pool entries are dicts like:
+        {"text": "...", "weight": 0.2, ...}.
+
+        By default we sample **uniformly** (1/N) to avoid accidental skew from legacy
+        prompt_pool weights (e.g. 0.63/0.07/0.27/0.03). Set
+        `dynamic_prompt_prompt_pool_uniform_weights=false` to respect per-entry weights.
+
+        IMPORTANT: returns the original item (dict/list/str), so downstream can interpret schema.
+        """
         rng = self._get_rng()
         if len(pool) == 0:
             raise ValueError("prompt_pool is empty.")
+
+        force_uniform = bool(getattr(self.data_args, "dynamic_prompt_prompt_pool_uniform_weights", True))
 
         values: list[Any] = []
         weights: list[float] = []
@@ -598,6 +629,11 @@ class DynamicPromptPackedBatchProcessor:
                 w = self._sanitize_weight(item.get("weight"))
             values.append(item)
             weights.append(w)
+
+        if force_uniform:
+            # Respect explicit disabling (weight <= 0) but otherwise sample uniformly.
+            eligible = [v for v, w in zip(values, weights) if w > 0]
+            return rng.choice(eligible or values)
 
         if any(w > 0 for w in weights):
             return rng.choices(values, weights=weights, k=1)[0]
@@ -628,6 +664,8 @@ class DynamicPromptPackedBatchProcessor:
         sample_id = self._get_sample_id(example)
         h = self._stable_hash64(f"{base_seed}|{sample_id}")
 
+        force_uniform = bool(getattr(self.data_args, "dynamic_prompt_prompt_pool_uniform_weights", True))
+
         values: list[Any] = []
         weights: list[float] = []
         for item in pool:
@@ -637,8 +675,14 @@ class DynamicPromptPackedBatchProcessor:
             values.append(item)
             weights.append(w)
 
+        if force_uniform:
+            eligible = [v for v, w in zip(values, weights) if w > 0]
+            values2 = eligible or values
+            return values2[int(h % len(values2))]
+
         total = sum(weights)
         if total > 0:
+            # Map hash to [0, total) deterministically.
             r = (h / float(2**64)) * total
             acc = 0.0
             for v, w in zip(values, weights):
