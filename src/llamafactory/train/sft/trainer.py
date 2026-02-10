@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import MutableMapping
 import json
 import os
 import time
@@ -284,12 +285,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     def _pop_audio_duration_sec_from_inputs(self, inputs: Any) -> Any:
         """Pop audio_duration_sec from inputs (top-level or nested `data` dict)."""
-        if not isinstance(inputs, dict):
+        if not isinstance(inputs, MutableMapping):
             return None
         if "audio_duration_sec" in inputs:
             return inputs.pop("audio_duration_sec", None)
         data = inputs.get("data")
-        if isinstance(data, dict) and "audio_duration_sec" in data:
+        if isinstance(data, MutableMapping) and "audio_duration_sec" in data:
             return data.pop("audio_duration_sec", None)
         return None
 
@@ -382,7 +383,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 return
             try:
                 dur = float(entry.get("duration_sec") or 0.0)
-                if int(size) > 0 and dur <= 0:
+                has_audio = entry.get("has_audio")
+                has_audio = bool(has_audio) if has_audio is not None else True
+                if int(size) > 0 and has_audio and dur <= 0:
                     return
             except Exception:
                 return
@@ -488,14 +491,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         # Remove auxiliary metadata keys that are not accepted by `model.forward()`.
         # For FunAudioChat, `audio_duration_sec` is used for progress logging but should never be passed to the model.
-        if isinstance(inputs, dict):
+        if isinstance(inputs, MutableMapping):
             copied = False
             if "audio_duration_sec" in inputs:
                 inputs = dict(inputs)
                 inputs.pop("audio_duration_sec", None)
                 copied = True
             data = inputs.get("data")
-            if isinstance(data, dict) and "audio_duration_sec" in data:
+            if isinstance(data, MutableMapping) and "audio_duration_sec" in data:
                 if not copied:
                     inputs = dict(inputs)
                 data = dict(data)
@@ -640,14 +643,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         #   Therefore we compute loss in a separate loss-only forward pass.
 
         # Strip auxiliary metadata that should not be fed into forward/generate.
-        if isinstance(inputs, dict):
+        if isinstance(inputs, MutableMapping):
             copied = False
             if "audio_duration_sec" in inputs:
                 inputs = dict(inputs)
                 inputs.pop("audio_duration_sec", None)
                 copied = True
             data = inputs.get("data")
-            if isinstance(data, dict) and "audio_duration_sec" in data:
+            if isinstance(data, MutableMapping) and "audio_duration_sec" in data:
                 if not copied:
                     inputs = dict(inputs)
                 data = dict(data)

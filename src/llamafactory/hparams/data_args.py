@@ -284,6 +284,52 @@ class DataArguments:
         },
     )
 
+    sharded_dataset_backend: Literal["off", "polars_parquet_shards"] = field(
+        default="off",
+        metadata={
+            "help": (
+                "Enable sharded dataset backend to avoid building a full HF map-style index for huge JSONL. "
+                "Currently supported: 'polars_parquet_shards' (manifest.json produced by scripts/shard_jsonl_to_parquet.py). "
+                "Default is 'off'."
+            )
+        },
+    )
+
+    sharded_manifest_path: str | None = field(
+        default=None,
+        metadata={"help": "Path to shard manifest.json for sharded dataset backend."},
+    )
+
+    sharded_input_aligned: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether the sharded parquet rows already contain aligned columns like `_prompt`/`_response`. "
+                "If False (default), loader will run on-the-fly alignment using the dataset config converter."
+            )
+        },
+    )
+
+    sharded_shuffle_shards: bool = field(
+        default=True,
+        metadata={"help": "Shuffle shard order per cycle when using sharded parquet backend."},
+    )
+
+    sharded_row_shuffle_buffer: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Row-level shuffle buffer size inside each shard for sharded parquet backend. "
+                "Set to 0 to disable."
+            )
+        },
+    )
+
+    sharded_parquet_batch_rows: int = field(
+        default=8192,
+        metadata={"help": "PyArrow parquet iter_batches batch_size (rows) for sharded parquet backend."},
+    )
+
     log_audio_epochs: bool = field(
         default=False,
         metadata={
@@ -333,6 +379,14 @@ class DataArguments:
 
         if self.streaming and getattr(self, "dynamic_prompt_packing", False):
             raise ValueError("`dynamic_prompt_packing` does not support `streaming`.")
+
+        if getattr(self, "sharded_dataset_backend", "off") != "off":
+            if not isinstance(getattr(self, "sharded_manifest_path", None), str) or not self.sharded_manifest_path:
+                raise ValueError("`sharded_manifest_path` is required when `sharded_dataset_backend` is enabled.")
+            if self.streaming:
+                raise ValueError("`sharded_dataset_backend` does not support `streaming`.")
+            if self.val_size > 1e-6:
+                raise ValueError("`sharded_dataset_backend` does not support `val_size` splitting; set `val_size=0`.")
 
         if self.mask_history and self.train_on_prompt:
             raise ValueError("`mask_history` is incompatible with `train_on_prompt`.")

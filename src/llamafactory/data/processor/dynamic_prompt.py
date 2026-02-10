@@ -41,6 +41,13 @@ logger = logging.get_logger(__name__)
 
 _SEGMENT_DURATION_RE = re.compile(r"_seg\d+_(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\.wav")
 
+try:
+    from ..sharded_reader import SHARD_BOUNDARY_KEY as _SHARD_BOUNDARY_KEY  # type: ignore
+except Exception:  # pragma: no cover
+    _SHARD_BOUNDARY_KEY = "__llamafactory_shard_boundary__"
+
+SHARD_BOUNDARY_KEY = _SHARD_BOUNDARY_KEY
+
 
 def _infer_duration_sec_from_audio_field(audio_field: Any) -> float | None:
     """Infer duration seconds from various audio field formats.
@@ -1322,6 +1329,70 @@ def build_dynamic_prompt_packed_iterable_dataset(
     return packed.repeat(None)
 
 
+def build_dynamic_prompt_packed_iterable_dataset_from_iterable(
+    iterable_ds,
+    *,
+    template,
+    tokenizer,
+    processor,
+    data_args,
+    dataset_converter: Any | None = None,
+    id_key: str | None = None,
+    seed: int | None = None,
+    buffer_size: int = 20000,
+    max_samples_per_pack: int = 8,
+    shuffle_packs: bool = True,
+    prefetch_buffers: int = 0,
+    carryover_packs: int = 0,
+):
+    """Build a buffered dynamic prompt packing dataset from an arbitrary iterable dataset.
+
+    This is used by sharded/parquet iterable readers to avoid building a full HF map-style dataset index.
+    """
+    if not isinstance(buffer_size, int) or buffer_size <= 0:
+        raise ValueError(f"Invalid buffer_size for dynamic prompt packing: {buffer_size}")
+
+    packer = DynamicPromptPackedBatchProcessor(
+        template=template,
+        tokenizer=tokenizer,
+        processor=processor,
+        data_args=data_args,
+        dataset_converter=dataset_converter,
+        id_key=id_key,
+        seed=seed,
+        max_samples_per_pack=max_samples_per_pack,
+        shuffle_packs=shuffle_packs,
+    )
+
+    prefetch_buffers = int(prefetch_buffers or 0)
+    if prefetch_buffers < 0:
+        raise ValueError(f"Invalid prefetch_buffers for dynamic prompt packing: {prefetch_buffers}")
+
+    carryover_packs = int(carryover_packs or 0)
+    if carryover_packs < 0:
+        raise ValueError(f"Invalid carryover_packs for dynamic prompt packing: {carryover_packs}")
+
+    if prefetch_buffers > 0:
+        logger.info_rank0(
+            f"Dynamic prompt packing: enable packed-buffer prefetch (prefetch_buffers={prefetch_buffers}). "
+            "This may reduce dataloader stalls but increases CPU/RAM usage."
+        )
+        return _DynamicPromptPackedPrefetchDataset(
+            iterable_ds=iterable_ds,
+            packer=packer,
+            buffer_size=int(buffer_size),
+            prefetch_buffers=prefetch_buffers,
+            carryover_packs=carryover_packs,
+        )
+
+    return _DynamicPromptPackedIterableDataset(
+        iterable_ds=iterable_ds,
+        packer=packer,
+        buffer_size=int(buffer_size),
+        carryover_packs=carryover_packs,
+    )
+
+
 class _DynamicPromptPackedPrefetchDataset(IterableDataset):
     """Torch IterableDataset that prefetches *packed buffers* in a background thread.
 
@@ -1382,6 +1453,35 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
         return examples
 
     @staticmethod
+    def _take_raw_batch_with_boundary(raw_iter, batch_size: int) -> tuple[dict[str, list[Any]] | None, bool]:
+        rows: list[dict[str, Any]] = []
+        boundary_hit = False
+
+        while len(rows) < batch_size:
+            try:
+                row = next(raw_iter)
+            except StopIteration:
+                break
+            if row is None:
+                continue
+            if not isinstance(row, dict):
+                raise ValueError(f"Dynamic prompt packing expected dict rows, got: {type(row)}")
+            if row.get(SHARD_BOUNDARY_KEY, False):
+                boundary_hit = True
+                break
+            rows.append(row)
+
+        if not rows:
+            return None, boundary_hit
+
+        keys = list(rows[0].keys())
+        examples: dict[str, list[Any]] = {k: [] for k in keys}
+        for row in rows:
+            for k in keys:
+                examples[k].append(row.get(k))
+        return examples, boundary_hit
+
+    @staticmethod
     def _yield_packed_examples(packed: dict[str, list[Any]]):
         if not packed:
             return
@@ -1433,8 +1533,18 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
                 carry_items: list[dict[str, Any]] = []
                 carry_lengths: list[int] = []
                 while not stop.is_set():
-                    examples = self._take_raw_batch(raw_iter, self.buffer_size)
+                    examples, boundary_hit = self._take_raw_batch_with_boundary(raw_iter, self.buffer_size)
                     if examples is None:
+                        if boundary_hit:
+                            if self.carryover_packs > 0 and carry_items and not stop.is_set():
+                                packed, _, _ = self.packer.pack_encoded_items(
+                                    carry_items, carry_lengths, carryover_packs=0
+                                )
+                                if packed:
+                                    self._queue_put(q, packed, stop)
+                            carry_items = []
+                            carry_lengths = []
+                            continue
                         break
 
                     if self.carryover_packs > 0:
@@ -1450,10 +1560,24 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
                     else:
                         packed = self.packer(examples)
                     if not packed:
+                        if boundary_hit:
+                            carry_items = []
+                            carry_lengths = []
                         continue
 
                     if not self._queue_put(q, packed, stop):
                         break
+
+                    if boundary_hit and self.carryover_packs > 0:
+                        # Do not allow cross-shard carryover.
+                        if carry_items and not stop.is_set():
+                            packed2, _, _ = self.packer.pack_encoded_items(
+                                carry_items, carry_lengths, carryover_packs=0
+                            )
+                            if packed2:
+                                self._queue_put(q, packed2, stop)
+                        carry_items = []
+                        carry_lengths = []
 
                 if self.carryover_packs > 0 and carry_items and not stop.is_set():
                     packed, _, _ = self.packer.pack_encoded_items(carry_items, carry_lengths, carryover_packs=0)
@@ -1487,6 +1611,79 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
         finally:
             stop.set()
             t.join(timeout=1.0)
+
+
+class _DynamicPromptPackedIterableDataset(IterableDataset):
+    """Synchronous packed iterable dataset (no background prefetch thread)."""
+
+    def __init__(
+        self,
+        *,
+        iterable_ds,
+        packer: DynamicPromptPackedBatchProcessor,
+        buffer_size: int,
+        carryover_packs: int = 0,
+    ) -> None:
+        super().__init__()
+        self.iterable_ds = iterable_ds
+        self.packer = packer
+        self.buffer_size = int(buffer_size)
+        self.carryover_packs = int(carryover_packs or 0)
+
+        if self.buffer_size <= 0:
+            raise ValueError(f"Invalid buffer_size for dynamic prompt packing: {self.buffer_size}")
+        if self.carryover_packs < 0:
+            raise ValueError(f"Invalid carryover_packs for dynamic prompt packing: {self.carryover_packs}")
+
+    def __iter__(self):
+        # Repeat indefinitely. Training length should be controlled via `max_steps`.
+        while True:
+            raw_iter = iter(self.iterable_ds)
+            yield from self._iter_one_pass(raw_iter)
+
+    def _iter_one_pass(self, raw_iter):
+        carry_items: list[dict[str, Any]] = []
+        carry_lengths: list[int] = []
+
+        while True:
+            examples, boundary_hit = _DynamicPromptPackedPrefetchDataset._take_raw_batch_with_boundary(
+                raw_iter, self.buffer_size
+            )
+            if examples is None:
+                if boundary_hit:
+                    if self.carryover_packs > 0 and carry_items:
+                        packed, _, _ = self.packer.pack_encoded_items(carry_items, carry_lengths, carryover_packs=0)
+                        yield from _DynamicPromptPackedPrefetchDataset._yield_packed_examples(packed)
+                    carry_items = []
+                    carry_lengths = []
+                    continue
+                break
+
+            if self.carryover_packs > 0:
+                items, lengths = self.packer.encode_examples(examples)
+                if items:
+                    pool_items = carry_items + items
+                    pool_lengths = carry_lengths + lengths
+                    packed, carry_items, carry_lengths = self.packer.pack_encoded_items(
+                        pool_items, pool_lengths, carryover_packs=self.carryover_packs
+                    )
+                else:
+                    packed = {}
+            else:
+                packed = self.packer(examples)
+
+            yield from _DynamicPromptPackedPrefetchDataset._yield_packed_examples(packed)
+
+            if boundary_hit and self.carryover_packs > 0:
+                if carry_items:
+                    packed2, _, _ = self.packer.pack_encoded_items(carry_items, carry_lengths, carryover_packs=0)
+                    yield from _DynamicPromptPackedPrefetchDataset._yield_packed_examples(packed2)
+                carry_items = []
+                carry_lengths = []
+
+        if self.carryover_packs > 0 and carry_items:
+            packed, _, _ = self.packer.pack_encoded_items(carry_items, carry_lengths, carryover_packs=0)
+            yield from _DynamicPromptPackedPrefetchDataset._yield_packed_examples(packed)
 
 
 class DynamicPromptProcessor(DatasetProcessor):
