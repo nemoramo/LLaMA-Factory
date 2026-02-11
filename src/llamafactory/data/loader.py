@@ -21,6 +21,7 @@ from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from ..extras import logging
 from ..extras.constants import FILEEXT2TYPE
 from ..extras.misc import check_version, has_tokenized_data
+from .fast_jsonl import FastJsonlToParquetArgs, maybe_convert_jsonl_files_to_parquet
 from .converter import align_dataset, get_dataset_converter
 from .data_utils import get_dataset_module, merge_dataset, read_cloud_json, split_dataset
 from .parser import get_dataset_list
@@ -246,6 +247,37 @@ def _load_single_dataset(
 
         if any(data_path != FILEEXT2TYPE.get(os.path.splitext(data_file)[-1][1:], None) for data_file in data_files):
             raise ValueError("File types should be identical.")
+
+        # Optional acceleration: convert local JSONL shards to parquet once and reuse.
+        # This helps when HF `load_dataset("json")` spends a long time in `Generating train split`.
+        if data_path == "json" and getattr(data_args, "fast_jsonl_backend", "off") == "polars_to_parquet":
+            cache_dir = getattr(data_args, "fast_jsonl_cache_dir", None)
+            if not cache_dir:
+                hf_home = os.environ.get("HF_HOME")
+                if hf_home:
+                    cache_dir = os.path.join(hf_home, "fast_jsonl_cache")
+                else:
+                    cache_dir = os.path.expanduser("~/.cache/huggingface/fast_jsonl_cache")
+
+            compression = str(getattr(data_args, "fast_jsonl_parquet_compression", "zstd") or "zstd")
+            if compression == "none":
+                compression = "uncompressed"
+
+            parquet_files = maybe_convert_jsonl_files_to_parquet(
+                data_files=data_files,
+                args=FastJsonlToParquetArgs(
+                    enabled=True,
+                    min_total_bytes=int(getattr(data_args, "fast_jsonl_min_total_bytes", 0) or 0),
+                    cache_dir=str(cache_dir),
+                    compression=str(compression),
+                    force_rebuild=bool(getattr(data_args, "fast_jsonl_force_rebuild", False)),
+                    infer_schema_length=getattr(data_args, "fast_jsonl_infer_schema_length", None),
+                ),
+                logger=logger,
+            )
+            if parquet_files is not None:
+                data_path = "parquet"
+                data_files = parquet_files
     else:
         raise NotImplementedError(f"Unknown load type: {dataset_attr.load_from}.")
 

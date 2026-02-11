@@ -260,6 +260,54 @@ class DataArguments:
         metadata={"help": ("Log dynamic prompt packing progress every N buffers. Set to 0 to disable.")},
     )
 
+    # ---------------------------------------------------------------------
+    # Fast local JSONL loading (optional)
+    #
+    # For very large local jsonl datasets, HuggingFace `load_dataset("json")`
+    # can spend a long time in `Generating train split` parsing JSON and
+    # materializing Arrow caches. When enabled, we convert JSONL shards to
+    # Parquet once (using Polars) and reuse the parquet cache across runs.
+    # ---------------------------------------------------------------------
+    fast_jsonl_backend: Literal["off", "polars_to_parquet"] = field(
+        default="off",
+        metadata={
+            "help": (
+                "Accelerate local JSONL loading by converting to Parquet once and reusing the cache. "
+                "`off`: use HF json loader. `polars_to_parquet`: convert *.jsonl shards to parquet via polars."
+            )
+        },
+    )
+    fast_jsonl_min_total_bytes: int = field(
+        default=1_000_000_000,
+        metadata={"help": "Only enable fast_jsonl when total JSONL bytes across shards >= this threshold."},
+    )
+    fast_jsonl_cache_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Directory to store jsonl->parquet cache. "
+                "If None, defaults to `${HF_HOME}/fast_jsonl_cache` when HF_HOME is set, else `~/.cache/huggingface/fast_jsonl_cache`."
+            )
+        },
+    )
+    fast_jsonl_parquet_compression: Literal["zstd", "snappy", "none"] = field(
+        default="zstd",
+        metadata={"help": "Parquet compression codec used for fast_jsonl cache."},
+    )
+    fast_jsonl_force_rebuild: bool = field(
+        default=False,
+        metadata={"help": "Force rebuilding the parquet cache even if it already exists."},
+    )
+    fast_jsonl_infer_schema_length: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Polars infer_schema_length for scan_ndjson when fast_jsonl_backend=polars_to_parquet. "
+                "Leave None to use polars default."
+            )
+        },
+    )
+
     dynamic_prompt_packing_max_samples_per_pack: int = field(
         default=8,
         metadata={
