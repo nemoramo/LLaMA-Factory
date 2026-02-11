@@ -123,6 +123,34 @@ class TrainingArguments(Fp8Arguments, RayArguments, BaseTrainingArguments):
         metadata={"help": "deprecated"},
     )
 
+    log_step_timing: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Log lightweight step timing breakdown (between_steps/pre_opt/opt/post_opt/step_total) "
+                "into `trainer_log.jsonl` for bottleneck diagnosis."
+            )
+        },
+    )
+    log_step_timing_steps: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "If > 0, also print a short perf line every N optimizer steps (rank0). "
+                "Recommended for short perf debug runs."
+            )
+        },
+    )
+    log_step_timing_sync_cuda: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If enabled, call `torch.cuda.synchronize()` before taking timestamps. "
+                "This makes timings more accurate but can significantly slow training; debug only."
+            )
+        },
+    )
+
     log_audio_len_stats: bool = field(
         default=False,
         metadata={

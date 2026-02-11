@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import time
+from collections.abc import MutableMapping
 from contextlib import contextmanager
 from functools import partial
 from types import MethodType

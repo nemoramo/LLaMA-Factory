@@ -167,6 +167,19 @@ class DataArguments:
         },
     )
 
+    dynamic_prompt_prompt_pool_uniform_weights: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When `dynamic_prompt_sampling` is enabled and a sample provides `prompt_pool`, "
+                "ignore per-entry `weight` fields and sample uniformly (1/N). "
+                "This avoids legacy skew (e.g. weights like 0.63/0.07/0.27/0.03). "
+                "Set to false to respect the per-entry `weight` values."
+            )
+        },
+    )
+
+
     dynamic_prompt_packing: bool = field(
         default=False,
         metadata={

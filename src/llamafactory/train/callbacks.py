@@ -178,6 +178,16 @@ class LogCallback(TrainerCallback):
         self.elapsed_time = ""
         self.remaining_time = ""
         self.thread_pool: Optional[ThreadPoolExecutor] = None
+        # Perf (optional)
+        self._perf_enabled = False
+        self._perf_sync_cuda = False
+        self._perf_print_steps = 0
+        self._perf_step_begin_time: float | None = None
+        self._perf_pre_opt_time: float | None = None
+        self._perf_opt_time: float | None = None
+        self._perf_last_step_end_time: float | None = None
+        self._perf_last_values: dict[str, float] = {}
+        self._perf_window: dict[str, dict[str, float]] = {}
         # Status
         self.aborted = False
         self.do_train = False
@@ -208,6 +218,57 @@ class LogCallback(TrainerCallback):
         self.elapsed_time = str(timedelta(seconds=int(elapsed_time)))
         self.remaining_time = str(timedelta(seconds=int(remaining_time)))
 
+    def _perf_reset_state(self) -> None:
+        self._perf_step_begin_time = None
+        self._perf_pre_opt_time = None
+        self._perf_opt_time = None
+        self._perf_last_step_end_time = None
+        self._perf_last_values = {}
+        self._perf_window = {}
+
+    def _perf_now(self, args: "TrainingArguments") -> float:
+        if self._perf_sync_cuda:
+            try:
+                if getattr(getattr(args, "device", None), "type", None) == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+        return time.perf_counter()
+
+    def _perf_update(self, key: str, value: float) -> None:
+        try:
+            v = float(value)
+        except Exception:
+            return
+        if not (v >= 0.0):
+            return
+        st = self._perf_window.get(key)
+        if st is None:
+            self._perf_window[key] = {"sum": v, "count": 1.0, "min": v, "max": v, "last": v}
+            return
+        st["sum"] = float(st.get("sum", 0.0) or 0.0) + v
+        st["count"] = float(st.get("count", 0.0) or 0.0) + 1.0
+        st["min"] = min(float(st.get("min", v) or v), v)
+        st["max"] = max(float(st.get("max", v) or v), v)
+        st["last"] = v
+
+    def _perf_summarize_and_reset(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for key, st in self._perf_window.items():
+            try:
+                count = float(st.get("count", 0.0) or 0.0)
+                if count <= 0:
+                    continue
+                s = float(st.get("sum", 0.0) or 0.0)
+                out[f"perf_{key}_sec_avg"] = round(s / count, 6)
+                out[f"perf_{key}_sec_min"] = round(float(st.get("min", 0.0) or 0.0), 6)
+                out[f"perf_{key}_sec_max"] = round(float(st.get("max", 0.0) or 0.0), 6)
+                out[f"perf_{key}_sec_last"] = round(float(st.get("last", 0.0) or 0.0), 6)
+            except Exception:
+                continue
+        self._perf_window = {}
+        return out
+
     def _write_log(self, output_dir: str, logs: dict[str, Any]) -> None:
         with open(os.path.join(output_dir, TRAINER_LOG), "a", encoding="utf-8") as f:
             f.write(json.dumps(logs) + "\n")
@@ -237,10 +298,51 @@ class LogCallback(TrainerCallback):
             self.do_train = True
             self._reset(max_steps=state.max_steps)
             self._create_thread_pool(output_dir=args.output_dir)
+            self._perf_enabled = bool(getattr(args, "log_step_timing", False))
+            self._perf_print_steps = int(getattr(args, "log_step_timing_steps", 0) or 0)
+            self._perf_sync_cuda = bool(getattr(args, "log_step_timing_sync_cuda", False))
+            self._perf_reset_state()
 
     @override
     def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         self._close_thread_pool()
+
+    @override
+    def on_step_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        if not self._perf_enabled:
+            return
+        t = self._perf_now(args)
+        if self._perf_last_step_end_time is not None:
+            between = t - float(self._perf_last_step_end_time)
+            self._perf_update("between_steps", between)
+            self._perf_last_values["between_steps"] = float(between)
+        self._perf_step_begin_time = float(t)
+        self._perf_pre_opt_time = None
+        self._perf_opt_time = None
+
+    @override
+    def on_pre_optimizer_step(
+        self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs
+    ):
+        if not self._perf_enabled or self._perf_step_begin_time is None:
+            return
+        t = self._perf_now(args)
+        self._perf_pre_opt_time = float(t)
+        pre_opt = float(t) - float(self._perf_step_begin_time)
+        self._perf_update("pre_opt", pre_opt)
+        self._perf_last_values["pre_opt"] = float(pre_opt)
+
+    @override
+    def on_optimizer_step(
+        self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs
+    ):
+        if not self._perf_enabled or self._perf_pre_opt_time is None:
+            return
+        t = self._perf_now(args)
+        self._perf_opt_time = float(t)
+        opt = float(t) - float(self._perf_pre_opt_time)
+        self._perf_update("opt_step", opt)
+        self._perf_last_values["opt_step"] = float(opt)
 
     @override
     def on_substep_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
@@ -253,6 +355,44 @@ class LogCallback(TrainerCallback):
         if self.aborted:
             control.should_epoch_stop = True
             control.should_training_stop = True
+
+        if not self._perf_enabled:
+            return
+        t = self._perf_now(args)
+        if self._perf_step_begin_time is not None:
+            step_total = float(t) - float(self._perf_step_begin_time)
+            self._perf_update("step_total", step_total)
+            self._perf_last_values["step_total"] = float(step_total)
+            if self._perf_opt_time is not None:
+                post_opt = float(t) - float(self._perf_opt_time)
+                self._perf_update("post_opt", post_opt)
+                self._perf_last_values["post_opt"] = float(post_opt)
+        self._perf_last_step_end_time = float(t)
+
+        if (
+            self._perf_print_steps
+            and self._perf_print_steps > 0
+            and getattr(state, "is_world_process_zero", False)
+            and int(getattr(state, "global_step", 0) or 0) % int(self._perf_print_steps) == 0
+        ):
+            step = int(getattr(state, "global_step", 0) or 0)
+            between = self._perf_last_values.get("between_steps")
+            pre_opt = self._perf_last_values.get("pre_opt")
+            opt = self._perf_last_values.get("opt_step")
+            post_opt = self._perf_last_values.get("post_opt")
+            total = self._perf_last_values.get("step_total")
+            msg = f"[perf] step={step}"
+            if between is not None:
+                msg += f" between={between:.3f}s"
+            if pre_opt is not None:
+                msg += f" pre_opt={pre_opt:.3f}s"
+            if opt is not None:
+                msg += f" opt={opt:.3f}s"
+            if post_opt is not None:
+                msg += f" post_opt={post_opt:.3f}s"
+            if total is not None:
+                msg += f" total={total:.3f}s"
+            logger.info_rank0(msg)
 
     @override
     def on_evaluate(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
@@ -304,6 +444,12 @@ class LogCallback(TrainerCallback):
         if effective_tokens_seen:
             logs["effective_throughput"] = round(effective_tokens_seen / (time.time() - self.start_time), 2)
             logs["effective_tokens"] = int(effective_tokens_seen)
+
+        if self._perf_enabled:
+            try:
+                logs.update(self._perf_summarize_and_reset())
+            except Exception:
+                pass
 
         if is_env_enabled("RECORD_VRAM"):
             vram_allocated, vram_reserved = get_peak_memory()

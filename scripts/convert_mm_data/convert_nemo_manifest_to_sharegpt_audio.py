@@ -128,13 +128,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--original-prob",
         type=float,
-        default=0.3,
+        default=0.5,
         help="抽到 original_text 作为目标 completion 的概率（0-1），无 original_text 时自动忽略",
     )
     p.add_argument(
         "--lang-hint-prob",
         type=float,
-        default=0.1,
+        default=0.5,
         help="抽到带语言提示 suffix 的概率（0-1），无 lang 时自动忽略",
     )
     p.add_argument(

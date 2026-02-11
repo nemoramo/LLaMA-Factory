@@ -1,3 +1,6 @@
 [submodule "third_party/text-generation-webui"]
 	path = third_party/text-generation-webui
 	url = https://github.com/oobabooga/text-generation-webui
+[submodule "third_party/qwen3-asr"]
+	path = third_party/qwen3-asr
+	url = https://github.com/QwenLM/Qwen3-ASR
