@@ -2650,19 +2650,27 @@ class FunAudioChatPlugin(BasePlugin):
 
     def _build_speech_strings(
         self, audios: list[AudioInput], processor: MMProcessor
-    ) -> tuple[list[str], list[AudioInput], list[bool]]:
+    ) -> tuple[list[str], list[AudioInput], list[bool], list[float]]:
         audio_sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
         audio_pad_token: str = getattr(processor, "audio_pad_token", "<|audio_pad|>")
 
         speech: list[str] = []
         feature_audios: list[AudioInput] = []
         feature_exist_mask: list[bool] = []
+        audio_duration_sec_by_audio: list[float] = []
 
         for audio in audios:
             if isinstance(audio, str):
                 path, token, duration_sec, num_frames = self._extract_audio_fields(audio)
                 if token is not None and token != "":
                     speech_str = token
+                    if num_frames is None and audio_pad_token:
+                        try:
+                            n = int(str(token).count(str(audio_pad_token)))
+                            if n > 0:
+                                num_frames = n
+                        except Exception:  # noqa: BLE001
+                            pass
                 else:
                     # Prefer inferring duration from file name to avoid extra audio I/O.
                     if num_frames is None and duration_sec is not None:
@@ -2693,6 +2701,16 @@ class FunAudioChatPlugin(BasePlugin):
 
                     speech_str = audio_pad_token * max(1, int(num_frames))
 
+                try:
+                    if duration_sec is not None:
+                        audio_duration_sec_by_audio.append(float(duration_sec))
+                    elif num_frames is not None:
+                        audio_duration_sec_by_audio.append(float(num_frames) / float(self.token_fps))
+                    else:
+                        audio_duration_sec_by_audio.append(0.0)
+                except Exception:  # noqa: BLE001
+                    audio_duration_sec_by_audio.append(0.0)
+
                 speech.append(speech_str)
                 if path is not None and path != "":
                     # Keep the original string so JSON-encoded audio metadata (e.g., offset) is preserved.
@@ -2707,6 +2725,13 @@ class FunAudioChatPlugin(BasePlugin):
                 path, token, duration_sec, num_frames = self._extract_audio_fields(audio)
                 if token is not None and token != "":
                     speech_str = token
+                    if num_frames is None and audio_pad_token:
+                        try:
+                            n = int(str(token).count(str(audio_pad_token)))
+                            if n > 0:
+                                num_frames = n
+                        except Exception:  # noqa: BLE001
+                            pass
                 else:
                     if num_frames is None and duration_sec is not None:
                         num_frames = int(float(duration_sec) * float(self.token_fps))
@@ -2734,6 +2759,16 @@ class FunAudioChatPlugin(BasePlugin):
 
                     speech_str = audio_pad_token * max(1, int(num_frames))
 
+                try:
+                    if duration_sec is not None:
+                        audio_duration_sec_by_audio.append(float(duration_sec))
+                    elif num_frames is not None:
+                        audio_duration_sec_by_audio.append(float(num_frames) / float(self.token_fps))
+                    else:
+                        audio_duration_sec_by_audio.append(0.0)
+                except Exception:  # noqa: BLE001
+                    audio_duration_sec_by_audio.append(0.0)
+
                 speech.append(speech_str)
                 has_waveform = isinstance(audio.get("array"), np.ndarray) or isinstance(
                     audio.get("bytes"), (bytes, bytearray)
@@ -2749,10 +2784,14 @@ class FunAudioChatPlugin(BasePlugin):
                 wav, _ = self._load_single_audio(audio, float(audio_sampling_rate))
                 num_frames = int((float(wav.shape[0]) / float(audio_sampling_rate)) * float(self.token_fps))
                 speech.append(audio_pad_token * max(1, num_frames))
+                try:
+                    audio_duration_sec_by_audio.append(float(wav.shape[0]) / float(audio_sampling_rate))
+                except Exception:  # noqa: BLE001
+                    audio_duration_sec_by_audio.append(float(num_frames) / float(self.token_fps))
                 feature_audios.append(audio)
                 feature_exist_mask.append(True)
 
-        return speech, feature_audios, feature_exist_mask
+        return speech, feature_audios, feature_exist_mask, audio_duration_sec_by_audio
 
     def _get_speech_lengths(self, speech: list[str], processor: MMProcessor) -> list[int]:
         speech_tokenizer = getattr(processor, "speech_tokenizer", None)
@@ -2798,7 +2837,7 @@ class FunAudioChatPlugin(BasePlugin):
         )
 
         messages = deepcopy(messages)
-        speech, _, _ = self._build_speech_strings(audios, processor)
+        speech, _, _, _ = self._build_speech_strings(audios, processor)
         speech_lengths = self._get_speech_lengths(speech, processor)
 
         def _find_next_placeholder(content: str, start: int) -> tuple[int, str] | None:
@@ -2857,7 +2896,7 @@ class FunAudioChatPlugin(BasePlugin):
         dl_perf_enabled = is_env_enabled("LLAMAFACTORY_PERF_LOG") and is_env_enabled("LLAMAFACTORY_DATALOADER_PERF_LOG")
         mm_inputs: dict[str, list[int] | torch.Tensor] = {}
 
-        speech, feature_audios, feature_exist_mask = self._build_speech_strings(audios, processor)
+        speech, feature_audios, feature_exist_mask, audio_duration_sec_by_audio = self._build_speech_strings(audios, processor)
         # We may downgrade some items to "no continuous features" if waveform loading fails.
         feature_exist_mask = list(feature_exist_mask)
         feature_load_fail_mask: list[bool] = [False] * len(feature_exist_mask)
@@ -2879,6 +2918,10 @@ class FunAudioChatPlugin(BasePlugin):
             mm_inputs["perf_mm_speech_tokenizer_ms"] = (time.perf_counter() - t_speech0) * 1000.0
         mm_inputs["speech_ids"] = speech_inputs.pop("input_ids")
         mm_inputs["speech_attention_mask"] = speech_inputs.pop("attention_mask")
+        if audio_duration_sec_by_audio:
+            # Duration aligned with input `audios` (flattened across batch), so collator can reconstruct
+            # per-sample durations even when dataset metadata is missing.
+            mm_inputs["audio_duration_sec_by_audio"] = torch.tensor(audio_duration_sec_by_audio, dtype=torch.float32)
 
         # Continuous waveform features are only computed for audios with an available waveform.
         if len(feature_audios) != 0:

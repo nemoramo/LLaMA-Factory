@@ -207,7 +207,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
-        batch_audio_durations: list[float] = []
+        batch_audio_durations_meta: list[float] = []
         for feature in features:
             v = feature.pop("perf_dp_encode_ms", None)
             if v is not None:
@@ -233,9 +233,9 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
             d = feature.pop("audio_duration_sec", None)
             try:
-                batch_audio_durations.append(float(d) if d is not None else 0.0)
+                batch_audio_durations_meta.append(float(d) if d is not None else 0.0)
             except Exception:  # noqa: BLE001
-                batch_audio_durations.append(0.0)
+                batch_audio_durations_meta.append(0.0)
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
@@ -429,6 +429,51 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 perf_batch[dl_key.replace("_ms", "_n")] = 1
             except Exception:
                 continue
+
+        # Reconstruct per-sample audio durations from mm_plugin's per-audio durations when available.
+        # This makes `audio_hours` robust even when dataset metadata doesn't carry duration info.
+        audio_duration_sec_by_audio = mm_inputs.pop("audio_duration_sec_by_audio", None)
+        batch_audio_durations = batch_audio_durations_meta
+        if audio_duration_sec_by_audio is not None and batch_audlens:
+            by_audio_list = None
+            try:
+                if torch.is_tensor(audio_duration_sec_by_audio):
+                    by_audio_list = audio_duration_sec_by_audio.to(dtype=torch.float32, device="cpu").tolist()
+                elif isinstance(audio_duration_sec_by_audio, (list, tuple)):
+                    by_audio_list = [float(x) if x is not None else 0.0 for x in audio_duration_sec_by_audio]
+            except Exception:  # noqa: BLE001
+                by_audio_list = None
+
+            expected = int(sum(int(x) for x in batch_audlens)) if batch_audlens else 0
+            if by_audio_list is not None and expected > 0:
+                if len(by_audio_list) != expected:
+                    # Best-effort: align to expected flattened audio count.
+                    if len(by_audio_list) < expected:
+                        by_audio_list = by_audio_list + [0.0] * (expected - len(by_audio_list))
+                    else:
+                        by_audio_list = by_audio_list[:expected]
+
+                mm_per_sample: list[float] = []
+                off = 0
+                for n in batch_audlens:
+                    nn = int(n)
+                    if nn <= 0:
+                        mm_per_sample.append(0.0)
+                        continue
+                    s = 0.0
+                    for x in by_audio_list[off : off + nn]:
+                        try:
+                            s += float(x)
+                        except Exception:
+                            continue
+                    mm_per_sample.append(float(s))
+                    off += nn
+
+                if len(mm_per_sample) == len(batch_audio_durations_meta):
+                    merged: list[float] = []
+                    for meta, mm_dur in zip(batch_audio_durations_meta, mm_per_sample):
+                        merged.append(float(meta) if float(meta) > 0 else float(mm_dur))
+                    batch_audio_durations = merged
 
         audio_feature_load_fail = mm_inputs.pop("feature_load_fail_mask", None)
         if "token_type_ids" in mm_inputs:
