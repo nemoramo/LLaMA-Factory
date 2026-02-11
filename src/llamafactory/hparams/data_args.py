@@ -297,6 +297,134 @@ class DataArguments:
         },
     )
 
+    sharded_dataset_backend: Literal["off", "polars_parquet_shards"] = field(
+        default="off",
+        metadata={
+            "help": (
+                "Enable sharded dataset backend to avoid building a full HF map-style index for huge JSONL. "
+                "Currently supported: 'polars_parquet_shards' (manifest.json produced by scripts/shard_jsonl_to_parquet.py). "
+                "Default is 'off'."
+            )
+        },
+    )
+
+    sharded_manifest_path: str | None = field(
+        default=None,
+        metadata={"help": "Path to shard manifest.json for sharded dataset backend."},
+    )
+
+    sharded_input_aligned: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether the sharded parquet rows already contain aligned columns like `_prompt`/`_response`. "
+                "If False (default), loader will run on-the-fly alignment using the dataset config converter."
+            )
+        },
+    )
+
+    sharded_shuffle_shards: bool = field(
+        default=True,
+        metadata={"help": "Shuffle shard order per cycle when using sharded parquet backend."},
+    )
+
+    sharded_row_shuffle_buffer: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Row-level shuffle buffer size inside each shard for sharded parquet backend. "
+                "Set to 0 to disable."
+            )
+        },
+    )
+
+    sharded_row_group_shuffle: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Shuffle parquet row-groups (or row-group blocks) within each shard for better dataset mixing. "
+                "This is typically cheaper than large row-level shuffle buffers."
+            )
+        },
+    )
+
+    sharded_row_group_shuffle_block_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "When `sharded_row_group_shuffle` is enabled, shuffle coarse blocks of N row-groups. "
+                "Set to 0 for full row-group shuffle, 1+ for block shuffle, or -1 for auto (aim ~1 output RecordBatch per block)."
+            )
+        },
+    )
+
+    sharded_parquet_batch_rows: int = field(
+        default=8192,
+        metadata={"help": "PyArrow parquet iter_batches batch_size (rows) for sharded parquet backend."},
+    )
+
+    sharded_prefetch_next_shard: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Prefetch the *next* parquet shard in a background thread (per dataloader worker) when using "
+                "the sharded parquet backend. Helps hide stalls at shard boundaries in DDP, at the cost of "
+                "extra CPU/IO and a small amount of extra RAM."
+            )
+        },
+    )
+
+    sharded_prefetch_queue_batches: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Max number of parquet RecordBatches to prefetch ahead for the *next* shard (per dataloader worker). "
+                "Set to 0 to disable next-shard prefetch. Keep small (1-4) to avoid RAM blowups."
+            )
+        },
+    )
+
+    sharded_prefetch_log: bool = field(
+        default=False,
+        metadata={"help": "Log shard prefetch events (rank0) for debugging sharded parquet stalls."},
+    )
+
+    sharded_resume_mode: Literal["off", "shard_boundary"] = field(
+        default="off",
+        metadata={
+            "help": (
+                "Resume mode for the sharded parquet backend. "
+                "'shard_boundary' enables coarse resume at shard boundaries by persisting per-rank/worker shard cursors. "
+                "This avoids re-reading completed shards after restart, but may repeat some data within the last shard."
+            )
+        },
+    )
+
+    sharded_resume_state_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Directory to persist sharded-resume state (JSON files). "
+                "If None, defaults to `<output_dir>/shard_resume_state`."
+            )
+        },
+    )
+
+    sharded_resume_prefer_checkpoint: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When resuming from a checkpoint, prefer loading shard-resume state from "
+                "`<checkpoint_dir>/shard_resume_state/` if present (otherwise fall back to the output_dir state)."
+            )
+        },
+    )
+
+    sharded_resume_log: bool = field(
+        default=False,
+        metadata={"help": "Log shard-resume load/save events (rank0) for debugging."},
+    )
+
     log_audio_epochs: bool = field(
         default=False,
         metadata={
@@ -346,6 +474,17 @@ class DataArguments:
 
         if self.streaming and getattr(self, "dynamic_prompt_packing", False):
             raise ValueError("`dynamic_prompt_packing` does not support `streaming`.")
+
+        if getattr(self, "sharded_dataset_backend", "off") != "off":
+            if not isinstance(getattr(self, "sharded_manifest_path", None), str) or not self.sharded_manifest_path:
+                raise ValueError("`sharded_manifest_path` is required when `sharded_dataset_backend` is enabled.")
+            if self.streaming:
+                raise ValueError("`sharded_dataset_backend` does not support `streaming`.")
+            if self.val_size > 1e-6:
+                raise ValueError("`sharded_dataset_backend` does not support `val_size` splitting; set `val_size=0`.")
+        else:
+            if getattr(self, "sharded_resume_mode", "off") != "off":
+                raise ValueError("`sharded_resume_mode` requires enabling `sharded_dataset_backend`.")
 
         if self.mask_history and self.train_on_prompt:
             raise ValueError("`mask_history` is incompatible with `train_on_prompt`.")

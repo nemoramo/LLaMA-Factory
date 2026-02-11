@@ -410,20 +410,28 @@ class LogCallback(TrainerCallback):
             return
 
         self._timing(cur_steps=state.global_step)
+        last_log: dict[str, Any] = {}
+        try:
+            if state.log_history:
+                last = state.log_history[-1]
+                if isinstance(last, dict):
+                    last_log = last
+        except Exception:
+            last_log = {}
         logs = dict(
             current_steps=self.cur_steps,
             total_steps=self.max_steps,
-            loss=state.log_history[-1].get("loss"),
-            eval_loss=state.log_history[-1].get("eval_loss"),
-            predict_loss=state.log_history[-1].get("predict_loss"),
-            reward=state.log_history[-1].get("reward"),
-            accuracy=state.log_history[-1].get("rewards/accuracies"),
-            lr=state.log_history[-1].get("learning_rate"),
-            epoch=state.log_history[-1].get("epoch"),
-            audio_hours=state.log_history[-1].get("audio_hours"),
-            audio_total_hours=state.log_history[-1].get("audio_total_hours"),
-            audio_total_ready=state.log_history[-1].get("audio_total_ready"),
-            audio_epoch=state.log_history[-1].get("audio_epoch"),
+            loss=last_log.get("loss"),
+            eval_loss=last_log.get("eval_loss"),
+            predict_loss=last_log.get("predict_loss"),
+            reward=last_log.get("reward"),
+            accuracy=last_log.get("rewards/accuracies"),
+            lr=last_log.get("learning_rate"),
+            epoch=last_log.get("epoch"),
+            audio_hours=last_log.get("audio_hours"),
+            audio_total_hours=last_log.get("audio_total_hours"),
+            audio_total_ready=last_log.get("audio_total_ready"),
+            audio_epoch=last_log.get("audio_epoch"),
             percentage=round(self.cur_steps / self.max_steps * 100, 2) if self.max_steps != 0 else 100,
             elapsed_time=self.elapsed_time,
             remaining_time=self.remaining_time,
@@ -447,6 +455,23 @@ class LogCallback(TrainerCallback):
             vram_allocated, vram_reserved = get_peak_memory()
             logs["vram_allocated"] = round(vram_allocated / (1024**3), 2)
             logs["vram_reserved"] = round(vram_reserved / (1024**3), 2)
+
+        # Forward all `perf_*` keys into `trainer_log.jsonl` (env gating happens at the source).
+        for k, v in last_log.items():
+            if not (isinstance(k, str) and k.startswith("perf_")):
+                continue
+            if v is None:
+                continue
+            if torch.is_tensor(v):
+                try:
+                    t = v.detach()
+                    if t.numel() == 1:
+                        v = t.cpu().item()
+                    else:
+                        v = t.cpu().tolist()
+                except Exception:
+                    continue
+            logs[k] = v
 
         logs = {k: v for k, v in logs.items() if v is not None}
         if self.webui_mode and all(key in logs for key in ("loss", "lr", "epoch")):

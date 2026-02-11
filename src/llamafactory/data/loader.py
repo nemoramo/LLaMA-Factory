@@ -38,7 +38,9 @@ from .processor import (
 from .processor.dynamic_prompt import (
     DynamicPromptDataset,
     build_dynamic_prompt_packed_iterable_dataset,
+    build_dynamic_prompt_packed_iterable_dataset_from_iterable,
 )
+from .sharded_reader import ShardedParquetIterableDataset
 
 
 if TYPE_CHECKING:
@@ -510,6 +512,248 @@ def get_dataset(
 
         if data_args.streaming:
             raise ValueError("Turn off `streaming` when saving dataset to disk.")
+
+    sharded_backend = str(getattr(data_args, "sharded_dataset_backend", "off") or "off").strip()
+    sharded_manifest_path = getattr(data_args, "sharded_manifest_path", None)
+    use_sharded_train = (
+        stage == "sft"
+        and not data_args.streaming
+        and bool(getattr(data_args, "packing", False))
+        and (data_args.dynamic_prompt_sampling or getattr(data_args, "dynamic_prompt_packing", False))
+        and sharded_backend != "off"
+        and isinstance(sharded_manifest_path, str)
+        and sharded_manifest_path.strip()
+    )
+
+    if use_sharded_train:
+        if float(getattr(data_args, "val_size", 0.0) or 0.0) > 0:
+            raise ValueError(
+                "Sharded parquet backend does not support `val_size` splitting. "
+                "Set `val_size=0` and provide `eval_dataset` explicitly (or disable sharded backend)."
+            )
+
+        if getattr(data_args, "dynamic_prompt_packing", False) and not data_args.packing:
+            raise ValueError("`dynamic_prompt_packing` requires `packing=true` (SFT only).")
+
+        max_samples_per_pack = int(getattr(data_args, "dynamic_prompt_packing_max_samples_per_pack", 8) or 8)
+        buffer_size = int(getattr(data_args, "dynamic_prompt_packing_buffer_size", 20000) or 20000)
+        shuffle_packs = bool(getattr(data_args, "dynamic_prompt_packing_shuffle", True))
+        prefetch_buffers = int(getattr(data_args, "dynamic_prompt_packing_prefetch_buffers", 0) or 0)
+        carryover_packs = int(getattr(data_args, "dynamic_prompt_packing_carryover_packs", 0) or 0)
+
+        max_steps = int(getattr(training_args, "max_steps", 0) or 0)
+        if max_steps <= 0:
+            raise ValueError(
+                "Sharded parquet backend uses an IterableDataset without `__len__`; please set `max_steps` > 0 "
+                "(and optionally `num_train_epochs=1`)."
+            )
+
+        # Prefer per-rank dataloading for iterable datasets. Without this, Accelerate may default to
+        # `dispatch_batches=True` (rank0 iterates + broadcast), causing cross-rank duplication.
+        world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        if world_size > 1 and hasattr(training_args, "accelerator_config"):
+            cfg = training_args.accelerator_config
+            if cfg is None:
+                logger.warning_rank0(
+                    "Sharded parquet backend: `training_args.accelerator_config` is None; cannot auto-set "
+                    "`dispatch_batches`. If you observe cross-rank duplication, consider setting "
+                    "`dispatch_batches: false` in your Accelerate config."
+                )
+            elif isinstance(cfg, dict):
+                if cfg.get("dispatch_batches", None) is None:
+                    cfg["dispatch_batches"] = False
+                    logger.info_rank0(
+                        "Sharded parquet backend: set `dispatch_batches: false` to enable per-rank sharded dataloading."
+                    )
+                elif cfg.get("dispatch_batches", False):
+                    logger.warning_rank0(
+                        "Sharded parquet backend: detected `dispatch_batches: true`. This may cause rank0-only "
+                        "iteration + broadcast, leading to cross-rank duplication. Consider setting "
+                        "`dispatch_batches: false`."
+                    )
+            else:
+                if getattr(cfg, "dispatch_batches", None) is None:
+                    cfg.dispatch_batches = False
+                    logger.info_rank0(
+                        "Sharded parquet backend: set `dispatch_batches: false` to enable per-rank sharded dataloading."
+                    )
+                elif getattr(cfg, "dispatch_batches", False):
+                    logger.warning_rank0(
+                        "Sharded parquet backend: detected `dispatch_batches: true`. This may cause rank0-only "
+                        "iteration + broadcast, leading to cross-rank duplication. Consider setting "
+                        "`dispatch_batches: false`."
+                    )
+
+        # Load eval dataset (train dataset is read from sharded parquet).
+        with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
+            eval_dataset = _get_merged_dataset(
+                data_args.eval_dataset,
+                model_args,
+                data_args,
+                training_args,
+                stage,
+                lazy_align=False,
+                return_dict=data_args.eval_on_each_dataset,
+            )
+
+        dataset_module = {}
+        with training_args.main_process_first(
+            desc="pre-process dataset", local=(not data_args.data_shared_file_system)
+        ):
+            if eval_dataset is not None:
+                if isinstance(eval_dataset, dict):
+                    eval_out: dict[str, Any] = {}
+                    for key, ds in eval_dataset.items():
+                        eval_out[key] = _get_preprocessed_dataset(
+                            ds, data_args, training_args, stage, template, tokenizer, processor, is_eval=True
+                        )
+                    dataset_module["eval_dataset"] = eval_out
+                else:
+                    dataset_module["eval_dataset"] = _get_preprocessed_dataset(
+                        eval_dataset,
+                        data_args,
+                        training_args,
+                        stage,
+                        template,
+                        tokenizer,
+                        processor,
+                        is_eval=True,
+                    )
+
+            input_aligned = bool(getattr(data_args, "sharded_input_aligned", False))
+            dataset_converter = None
+            id_key = None
+
+            if not input_aligned:
+                dataset_names = data_args.dataset or []
+                if len(dataset_names) == 0:
+                    raise ValueError("Sharded parquet backend: `dataset` is empty.")
+
+                dataset_attrs = get_dataset_list(dataset_names, data_args.dataset_dir)
+                if not dataset_attrs:
+                    raise ValueError("Sharded parquet backend: failed to resolve dataset list.")
+
+                # Pick a "base" conversion schema for on-the-fly alignment.
+                dataset_attr = dataset_attrs[0]
+                best_score = 0
+                for cand in dataset_attrs:
+                    score = 0
+                    for field in ("tools", "images", "videos", "audios"):
+                        if getattr(cand, field, None):
+                            score += 1
+                    if score > best_score:
+                        dataset_attr = cand
+                        best_score = score
+
+                def _modality_compatible(base_val: Any, other_val: Any) -> bool:
+                    if base_val is None:
+                        return other_val is None
+                    return other_val is None or other_val == base_val
+
+                for other in dataset_attrs[1:]:
+                    if (
+                        other.formatting != dataset_attr.formatting
+                        or other.messages != dataset_attr.messages
+                        or other.system != dataset_attr.system
+                        or not _modality_compatible(dataset_attr.tools, other.tools)
+                        or not _modality_compatible(dataset_attr.images, other.images)
+                        or not _modality_compatible(dataset_attr.videos, other.videos)
+                        or not _modality_compatible(dataset_attr.audios, other.audios)
+                        or other.role_tag != dataset_attr.role_tag
+                        or other.content_tag != dataset_attr.content_tag
+                        or other.user_tag != dataset_attr.user_tag
+                        or other.assistant_tag != dataset_attr.assistant_tag
+                        or other.observation_tag != dataset_attr.observation_tag
+                        or other.function_tag != dataset_attr.function_tag
+                        or other.system_tag != dataset_attr.system_tag
+                    ):
+                        raise ValueError(
+                            "Sharded parquet backend with on-the-fly alignment requires all mixed datasets "
+                            "to share the same `formatting` and column/tag mapping. "
+                            f"Got mismatch between {dataset_attr.dataset_name} and {other.dataset_name}."
+                        )
+
+                dataset_converter = get_dataset_converter(dataset_attr.formatting, dataset_attr, data_args)
+                id_key = data_args.dynamic_prompt_id_key
+                logger.info_rank0(
+                    "Sharded parquet backend: dataset is not aligned; will convert to `_prompt/_response/...` on-the-fly."
+                )
+            else:
+                logger.info_rank0("Sharded parquet backend: input is aligned (_prompt/_response present).")
+
+            shuffle_shards = bool(getattr(data_args, "sharded_shuffle_shards", True))
+            row_shuffle_buffer = int(getattr(data_args, "sharded_row_shuffle_buffer", 0) or 0)
+            row_group_shuffle = bool(getattr(data_args, "sharded_row_group_shuffle", False))
+            row_group_shuffle_block_size = int(getattr(data_args, "sharded_row_group_shuffle_block_size", 0) or 0)
+            parquet_batch_rows = int(getattr(data_args, "sharded_parquet_batch_rows", 8192) or 8192)
+            prefetch_next_shard = bool(getattr(data_args, "sharded_prefetch_next_shard", True))
+            prefetch_queue_batches = int(getattr(data_args, "sharded_prefetch_queue_batches", 1) or 0)
+            prefetch_log = bool(getattr(data_args, "sharded_prefetch_log", False))
+            resume_mode = str(getattr(data_args, "sharded_resume_mode", "off") or "off")
+            resume_state_dir = getattr(data_args, "sharded_resume_state_dir", None)
+            resume_prefer_checkpoint = bool(getattr(data_args, "sharded_resume_prefer_checkpoint", True))
+            resume_log = bool(getattr(data_args, "sharded_resume_log", False))
+            resume_from_checkpoint = getattr(training_args, "resume_from_checkpoint", None)
+            if resume_mode != "off":
+                resolved_state_dir = (
+                    str(resume_state_dir)
+                    if isinstance(resume_state_dir, str) and resume_state_dir
+                    else os.path.join(str(getattr(training_args, "output_dir", "") or ""), "shard_resume_state")
+                )
+                if resolved_state_dir:
+                    os.environ.setdefault("LLAMAFACTORY_SHARDED_RESUME_STATE_DIR", resolved_state_dir)
+
+            try:
+                import pyarrow.parquet  # type: ignore  # noqa: F401
+            except Exception as err:  # noqa: BLE001
+                raise ImportError(
+                    "Sharded parquet backend requires `pyarrow`. "
+                    "Install it in the training environment (not user-site when PYTHONNOUSERSITE=1), e.g. "
+                    "`pip install pyarrow` or `conda install -c conda-forge pyarrow`."
+                ) from err
+
+            raw_train_ds = ShardedParquetIterableDataset(
+                manifest_path=str(sharded_manifest_path),
+                seed=int(training_args.seed),
+                shuffle_shards=shuffle_shards,
+                row_shuffle_buffer=row_shuffle_buffer,
+                row_group_shuffle=row_group_shuffle,
+                row_group_shuffle_block_size=row_group_shuffle_block_size,
+                parquet_batch_rows=parquet_batch_rows,
+                prefetch_next_shard=prefetch_next_shard,
+                prefetch_queue_batches=prefetch_queue_batches,
+                prefetch_log=prefetch_log,
+                resume_mode=resume_mode,
+                resume_state_dir=resume_state_dir,
+                resume_prefer_checkpoint=resume_prefer_checkpoint,
+                resume_log=resume_log,
+                output_dir=str(getattr(training_args, "output_dir", "") or ""),
+                resume_from_checkpoint=str(resume_from_checkpoint) if isinstance(resume_from_checkpoint, str) else None,
+            )
+
+            dataset_module["train_dataset"] = build_dynamic_prompt_packed_iterable_dataset_from_iterable(
+                raw_train_ds,
+                template=template,
+                tokenizer=tokenizer,
+                processor=processor,
+                data_args=data_args,
+                dataset_converter=dataset_converter,
+                id_key=id_key,
+                seed=training_args.seed,
+                buffer_size=buffer_size,
+                max_samples_per_pack=max_samples_per_pack,
+                shuffle_packs=shuffle_packs,
+                prefetch_buffers=prefetch_buffers,
+                carryover_packs=carryover_packs,
+            )
+
+            logger.info_rank0("Wrapped train dataset with sharded parquet reader + buffered knapsack packing.")
+            logger.info_rank0(
+                "Note: on-the-fly packing changes epoch semantics (raw samples/tokens per step vary); "
+                "prefer controlling training budget via `max_steps`."
+            )
+
+        return dataset_module
 
     # Load and preprocess dataset
     with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):

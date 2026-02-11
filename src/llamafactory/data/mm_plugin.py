@@ -27,7 +27,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, BinaryIO, Literal, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, Optional, TypedDict, Union
 from urllib.parse import urlparse
 
 import numpy as np
@@ -41,14 +41,21 @@ from typing_extensions import NotRequired, override
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
 from ..extras import logging
+from ..extras.misc import is_env_enabled
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
+from ..extras.storage_uri import maybe_map_mount_to_tos_uri
 
 
-# Optional S3 support. Only used when audio paths start with s3://
+# Optional S3/TOS support. Only used when audio paths start with s3:// or tos:// (or when mapping fuse mounts).
 try:
     import boto3  # type: ignore[import-untyped]
 except Exception:  # noqa: BLE001
     boto3 = None
+
+try:
+    from botocore.config import Config as _BotoConfig  # type: ignore[import-untyped]
+except Exception:  # noqa: BLE001
+    _BotoConfig = None
 
 # Optional pydub support. Preferred backend for audio loading when available.
 try:
@@ -82,6 +89,133 @@ except Exception:  # noqa: BLE001
     soundfile = None
 
 
+_S3_CLIENT_CACHE: tuple[int, Any] | None = None
+_TOS_CLIENT_CACHE: tuple[int, Any] | None = None
+
+
+def _env_first(*names: str, default: str | None = None) -> str | None:
+    for name in names:
+        v = os.environ.get(name)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+
+def _parse_int_env(
+    name: str,
+    *,
+    default: int,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
+    raw = os.environ.get(str(name))
+    if raw is None:
+        v = int(default)
+    else:
+        s = str(raw).strip()
+        if s == "":
+            v = int(default)
+        else:
+            try:
+                v = int(s)
+            except Exception:
+                logger.warning_rank0("Invalid %s=%r (expected int); using default=%d.", str(name), raw, int(default))
+                v = int(default)
+
+    if min_value is not None and v < int(min_value):
+        logger.warning_rank0("%s=%d is too small; clamping to %d.", str(name), int(v), int(min_value))
+        v = int(min_value)
+    if max_value is not None and v > int(max_value):
+        logger.warning_rank0("%s=%d is too large; clamping to %d.", str(name), int(v), int(max_value))
+        v = int(max_value)
+    return int(v)
+
+
+def _ensure_http_scheme(endpoint: str) -> str:
+    ep = (endpoint or "").strip()
+    if ep.startswith("http://") or ep.startswith("https://"):
+        return ep
+    return f"https://{ep}"
+
+
+def _get_s3_client():
+    global _S3_CLIENT_CACHE
+    if boto3 is None:
+        raise ImportError(
+            "Loading audio from S3/TOS requires `boto3`. Please install it in your environment, e.g. `pip install boto3`."
+        )
+    pid = os.getpid()
+    if _S3_CLIENT_CACHE is not None and _S3_CLIENT_CACHE[0] == pid:
+        return _S3_CLIENT_CACHE[1]
+
+    cfg = None
+    if _BotoConfig is not None:
+        # Avoid a tiny default pool when many dataloader workers fetch in parallel.
+        max_conn = _parse_int_env(
+            "LLAMAFACTORY_S3_MAX_POOL_CONNECTIONS",
+            default=64,
+            min_value=8,
+            max_value=1024,
+        )
+        cfg = _BotoConfig(max_pool_connections=int(max_conn))
+
+    client = boto3.client("s3", config=cfg) if cfg is not None else boto3.client("s3")
+    _S3_CLIENT_CACHE = (pid, client)
+    return client
+
+
+def _get_tos_client():
+    global _TOS_CLIENT_CACHE
+    if boto3 is None:
+        raise ImportError(
+            "Loading audio from S3/TOS requires `boto3`. Please install it in your environment, e.g. `pip install boto3`."
+        )
+    pid = os.getpid()
+    if _TOS_CLIENT_CACHE is not None and _TOS_CLIENT_CACHE[0] == pid:
+        return _TOS_CLIENT_CACHE[1]
+
+    ak = _env_first("TOS_ACCESS_KEY_ID", "TOS_AK", "AWS_ACCESS_KEY_ID")
+    sk = _env_first("TOS_SECRET_ACCESS_KEY", "TOS_SK", "AWS_SECRET_ACCESS_KEY")
+    token = _env_first("TOS_SESSION_TOKEN", "AWS_SESSION_TOKEN")
+    endpoint = _env_first("TOS_ENDPOINT", "TOS_ENDPOINT_URL")
+    region = _env_first("TOS_REGION", "AWS_DEFAULT_REGION")
+    addressing_style = (_env_first("TOS_ADDRESSING_STYLE", default="virtual") or "virtual").strip().lower()
+    if addressing_style not in ("virtual", "path"):
+        addressing_style = "virtual"
+
+    if not ak or not sk or not endpoint or not region:
+        raise RuntimeError(
+            "TOS access requires env vars: TOS_ACCESS_KEY_ID/TOS_SECRET_ACCESS_KEY/TOS_ENDPOINT/TOS_REGION "
+            "(or their AWS_* fallbacks)."
+        )
+
+    endpoint = _ensure_http_scheme(endpoint)
+
+    cfg = None
+    if _BotoConfig is not None:
+        max_conn = _parse_int_env(
+            "LLAMAFACTORY_TOS_MAX_POOL_CONNECTIONS",
+            default=64,
+            min_value=8,
+            max_value=1024,
+        )
+        cfg = _BotoConfig(
+            signature_version="s3v4",
+            s3={"addressing_style": addressing_style},
+            max_pool_connections=int(max_conn),
+        )
+
+    sess = boto3.session.Session(
+        aws_access_key_id=ak,
+        aws_secret_access_key=sk,
+        aws_session_token=token,
+        region_name=region,
+    )
+    client = sess.client("s3", endpoint_url=endpoint, config=cfg) if cfg is not None else sess.client("s3", endpoint_url=endpoint)
+    _TOS_CLIENT_CACHE = (pid, client)
+    return client
+
+
 if is_pillow_available():
     from PIL import Image
     from PIL.Image import Image as ImageObject
@@ -112,7 +246,7 @@ if TYPE_CHECKING:
 
     ImageInput = Union[str, bytes, EncodedImage, BinaryIO, ImageObject]
     VideoInput = Union[str, BinaryIO, list[list[ImageInput]]]
-    AudioInput = Union[str, BinaryIO, NDArray]
+    AudioInput = Union[str, BinaryIO, NDArray, dict[str, Any]]
 
     class RegularizedImageOutput(TypedDict):
         images: list[ImageObject]
@@ -445,8 +579,26 @@ class MMPluginMixin:
     ) -> tuple[NDArray, float]:
         """Normalize a single audio input to (np.ndarray, sr).
 
-        Supports numpy arrays, file-like objects, local paths and s3:// URIs.
+        Supports numpy arrays, file-like objects, local paths and s3:// / tos:// URIs.
         """
+        # Dict wrapper support (used by optional audio SpecAugment meta preservation).
+        if isinstance(audio, dict):
+            arr = audio.get("array")
+            if isinstance(arr, np.ndarray):
+                return arr, sampling_rate
+
+            raw_bytes = audio.get("bytes")
+            if isinstance(raw_bytes, (bytes, bytearray)):
+                audio = BytesIO(bytes(raw_bytes))
+            else:
+                path = audio.get("path") or audio.get("wav_path") or audio.get("audio_path") or audio.get("uri")
+                if isinstance(path, (str, os.PathLike)) and os.fspath(path):
+                    audio = path
+                else:
+                    raw = audio.get("raw")
+                    if raw is not None:
+                        audio = raw
+
         # Already decoded array
         if isinstance(audio, np.ndarray):
             return audio, sampling_rate
@@ -479,19 +631,17 @@ class MMPluginMixin:
         # String or os.PathLike path / URI
         if isinstance(audio, (str, os.PathLike)):
             path = os.fspath(audio)
-            # S3 URI: s3://bucket/key
-            if path.startswith("s3://"):
-                if boto3 is None:
-                    raise ImportError(
-                        "Loading audio from S3 requires `boto3`. "
-                        "Please install it in your environment, e.g. `pip install boto3`."
-                    )
+            mapped = maybe_map_mount_to_tos_uri(path)
+            if mapped is not None:
+                path = mapped
 
+            # S3/TOS URI: s3://bucket/key or tos://bucket/key
+            if path.startswith(("s3://", "tos://")):
                 parsed = urlparse(path)
                 bucket = parsed.netloc
                 key = parsed.path.lstrip("/")
 
-                s3_client = boto3.client("s3")
+                s3_client = _get_tos_client() if path.startswith("tos://") else _get_s3_client()
                 obj = s3_client.get_object(Bucket=bucket, Key=key)
                 data = obj["Body"].read()
                 bio = BytesIO(data)
@@ -2226,6 +2376,70 @@ class FunAudioChatPlugin(BasePlugin):
         Note: Some datasets store per-utterance `offset`+`duration` for long audio files (e.g., MGB2).
         In that case, `duration_sec` is segment-level, so we must avoid caching it for the full path.
         """
+        # Dict wrapper (e.g., SpecAugment preserves raw metadata while supplying decoded waveform array).
+        if isinstance(audio, dict):
+            path = None
+            token = None
+            duration_sec = None
+            num_frames = None
+
+            p = audio.get("path") or audio.get("wav_path") or audio.get("audio_path")
+            if isinstance(p, str) and p:
+                path = p
+
+            t = audio.get("token")
+            if isinstance(t, str) and t:
+                token = t
+
+            for k in ("duration_sec", "duration_secs", "duration_seconds", "duration"):
+                if k not in audio or audio.get(k) is None:
+                    continue
+                try:
+                    d = float(audio.get(k))
+                    if math.isfinite(d) and d >= 0:
+                        duration_sec = d
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+            if duration_sec is None:
+                for k in ("duration_ms", "duration_msec"):
+                    if k not in audio or audio.get(k) is None:
+                        continue
+                    try:
+                        d_ms = float(audio.get(k))
+                        d = d_ms / 1000.0
+                        if math.isfinite(d) and d >= 0:
+                            duration_sec = d
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+
+            for k in ("num_frames", "num_frames_25hz"):
+                if k not in audio or audio.get(k) is None:
+                    continue
+                try:
+                    nf = int(audio.get(k))
+                    if nf >= 0:
+                        num_frames = nf
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+            raw = audio.get("raw")
+            if isinstance(raw, str):
+                p2, t2, d2, nf2 = self._extract_audio_fields(raw)
+                if path is None:
+                    path = p2
+                if token is None:
+                    token = t2
+                if duration_sec is None:
+                    duration_sec = d2
+                if num_frames is None:
+                    num_frames = nf2
+
+            return path, token, duration_sec, num_frames
+
         if not isinstance(audio, str):
             return None, None, None, None
 
@@ -2303,6 +2517,24 @@ class FunAudioChatPlugin(BasePlugin):
 
     @override
     def _load_single_audio(self, audio: AudioInput, sampling_rate: float) -> tuple[NDArray, float]:
+        # Dict wrapper support (e.g., SpecAugment preserves raw metadata alongside decoded waveform).
+        if isinstance(audio, dict):
+            arr = audio.get("array")
+            if isinstance(arr, np.ndarray):
+                return arr, float(sampling_rate)
+
+            raw_bytes = audio.get("bytes")
+            if isinstance(raw_bytes, (bytes, bytearray)):
+                audio = BytesIO(bytes(raw_bytes))
+            else:
+                path = audio.get("path") or audio.get("wav_path") or audio.get("audio_path") or audio.get("uri")
+                if isinstance(path, (str, os.PathLike)) and os.fspath(path):
+                    audio = path
+                else:
+                    raw = audio.get("raw")
+                    if raw is not None:
+                        audio = raw
+
         # Support JSON-encoded audio items (from FunAudioChat dataset format).
         if isinstance(audio, str):
             obj = self._parse_audio_json(audio)
@@ -2469,6 +2701,49 @@ class FunAudioChatPlugin(BasePlugin):
                 else:
                     feature_exist_mask.append(False)
 
+            elif isinstance(audio, dict):
+                # Dict wrapper: prefer raw metadata (duration/num_frames/token) for speech length,
+                # while keeping the dict itself for continuous feature extraction (may contain `array`).
+                path, token, duration_sec, num_frames = self._extract_audio_fields(audio)
+                if token is not None and token != "":
+                    speech_str = token
+                else:
+                    if num_frames is None and duration_sec is not None:
+                        num_frames = int(float(duration_sec) * float(self.token_fps))
+
+                    if num_frames is None and path:
+                        m = self._segment_duration_re.search(path)
+                        if m is not None:
+                            try:
+                                start = float(m.group(1))
+                                end = float(m.group(2))
+                                duration = max(0.0, end - start)
+                                num_frames = int(duration * float(self.token_fps))
+                            except Exception:  # noqa: BLE001
+                                num_frames = None
+
+                    if num_frames is None:
+                        duration = None
+                        if path:
+                            duration = self._get_audio_duration_sec(path)
+                        if duration is not None:
+                            num_frames = int(float(duration) * float(self.token_fps))
+                        else:
+                            wav, _ = self._load_single_audio(audio, float(audio_sampling_rate))
+                            num_frames = int((float(wav.shape[0]) / float(audio_sampling_rate)) * float(self.token_fps))
+
+                    speech_str = audio_pad_token * max(1, int(num_frames))
+
+                speech.append(speech_str)
+                has_waveform = isinstance(audio.get("array"), np.ndarray) or isinstance(
+                    audio.get("bytes"), (bytes, bytearray)
+                )
+                if has_waveform or (path is not None and path != "") or isinstance(audio.get("raw"), (str, os.PathLike)):
+                    feature_audios.append(audio)
+                    feature_exist_mask.append(True)
+                else:
+                    feature_exist_mask.append(False)
+
             else:
                 # NDArray / file-like
                 wav, _ = self._load_single_audio(audio, float(audio_sampling_rate))
@@ -2579,6 +2854,7 @@ class FunAudioChatPlugin(BasePlugin):
         if processor is None:
             raise ValueError("Processor was not found, please check and update your model file.")
 
+        dl_perf_enabled = is_env_enabled("LLAMAFACTORY_PERF_LOG") and is_env_enabled("LLAMAFACTORY_DATALOADER_PERF_LOG")
         mm_inputs: dict[str, list[int] | torch.Tensor] = {}
 
         speech, feature_audios, feature_exist_mask = self._build_speech_strings(audios, processor)
@@ -2590,6 +2866,7 @@ class FunAudioChatPlugin(BasePlugin):
         if speech_tokenizer is None:
             raise ValueError("Speech tokenizer was not found, please check and update your model file.")
 
+        t_speech0 = time.perf_counter() if dl_perf_enabled else 0.0
         speech_inputs = speech_tokenizer(
             speech,
             return_attention_mask=True,
@@ -2598,6 +2875,8 @@ class FunAudioChatPlugin(BasePlugin):
             pad_to_multiple_of=audio_group_size,
             return_tensors="pt",
         )
+        if dl_perf_enabled:
+            mm_inputs["perf_mm_speech_tokenizer_ms"] = (time.perf_counter() - t_speech0) * 1000.0
         mm_inputs["speech_ids"] = speech_inputs.pop("input_ids")
         mm_inputs["speech_attention_mask"] = speech_inputs.pop("attention_mask")
 
@@ -2616,6 +2895,7 @@ class FunAudioChatPlugin(BasePlugin):
             logged = int(getattr(self, "_audio_load_error_logged", 0))
             suppressed = bool(getattr(self, "_audio_load_error_suppressed", False))
 
+            t_load0 = time.perf_counter() if dl_perf_enabled else 0.0
             wavs: list[NDArray] = []
             # Map `feature_audios` back to their sample indices.
             true_indices = [i for i, m in enumerate(feature_exist_mask) if m]
@@ -2656,12 +2936,15 @@ class FunAudioChatPlugin(BasePlugin):
 
             setattr(self, "_audio_load_error_logged", logged)
             setattr(self, "_audio_load_error_suppressed", suppressed)
+            if dl_perf_enabled:
+                mm_inputs["perf_mm_audio_load_ms"] = (time.perf_counter() - t_load0) * 1000.0
 
             # Only run the feature extractor when at least one waveform is available.
             min_samples = int(getattr(feature_extractor, "n_fft", 400) or 400)
             if len(wavs) != 0:
                 if min_samples > 0:
                     wavs = [np.pad(w, (0, max(0, min_samples - w.shape[0])), mode="constant") for w in wavs]
+                t_fx0 = time.perf_counter() if dl_perf_enabled else 0.0
                 wav_inputs = feature_extractor(
                     wavs,
                     sampling_rate=audio_sampling_rate,
@@ -2669,6 +2952,8 @@ class FunAudioChatPlugin(BasePlugin):
                     padding=audio_padding,
                     return_tensors="pt",
                 )
+                if dl_perf_enabled:
+                    mm_inputs["perf_mm_feature_extractor_ms"] = (time.perf_counter() - t_fx0) * 1000.0
                 mm_inputs.update(wav_inputs)
                 mm_inputs["feature_attention_mask"] = mm_inputs.pop("attention_mask", None)
 

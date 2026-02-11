@@ -1118,14 +1118,37 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
                 # positions in row-major order. If a mismatch happens (rare), we truncate/pad to avoid crashes.
                 flat_audio_features = audio_features[audio_features_mask]  # [N_audio_frames, D]
                 n_audio_features = int(flat_audio_features.shape[0])
-                if n_audio_tokens != n_audio_features and not getattr(self, "_warned_audio_token_mismatch", False):
-                    logger.warning(
-                        "Audio features and audio tokens mismatch (tokens=%s, features=%s); "
-                        "truncation/padding fallback was applied.",
-                        n_audio_tokens,
-                        n_audio_features,
-                    )
-                    self._warned_audio_token_mismatch = True
+                if n_audio_tokens != n_audio_features:
+                    diff = abs(int(n_audio_tokens) - int(n_audio_features))
+                    try:
+                        tol = int(os.getenv("LLAMAFACTORY_AUDIO_TOKEN_MISMATCH_TOL", "5") or "5")
+                    except Exception:  # noqa: BLE001
+                        tol = 5
+                    tol = max(0, int(tol))
+
+                    # Ignore small mismatches (commonly caused by rounding/edge effects).
+                    if diff > tol:
+                        if os.getenv("LLAMAFACTORY_PERF_LOG", "0").lower() in ["true", "y", "1"]:
+                            self._perf_audio_token_mismatch_n = int(
+                                getattr(self, "_perf_audio_token_mismatch_n", 0) or 0
+                            ) + 1
+                            self._perf_audio_token_mismatch_abs_sum = float(
+                                getattr(self, "_perf_audio_token_mismatch_abs_sum", 0.0) or 0.0
+                            ) + float(diff)
+                            prev_max = float(getattr(self, "_perf_audio_token_mismatch_abs_max", 0.0) or 0.0)
+                            if float(diff) > prev_max:
+                                self._perf_audio_token_mismatch_abs_max = float(diff)
+
+                        if not getattr(self, "_warned_audio_token_mismatch", False):
+                            logger.warning(
+                                "Audio features and audio tokens mismatch (tokens=%s, features=%s, diff=%s, tol=%s); "
+                                "truncation/padding fallback was applied.",
+                                n_audio_tokens,
+                                n_audio_features,
+                                diff,
+                                tol,
+                            )
+                            self._warned_audio_token_mismatch = True
 
                 if n_audio_features < n_audio_tokens:
                     pad = flat_audio_features.new_zeros((n_audio_tokens - n_audio_features, embed_dim))

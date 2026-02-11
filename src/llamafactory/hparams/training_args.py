@@ -151,6 +151,18 @@ class TrainingArguments(Fp8Arguments, RayArguments, BaseTrainingArguments):
         },
     )
 
+    log_audio_len_stats: bool = field(
+        default=False,
+        metadata={
+            "help": "Log audio feature-length statistics (e.g., max/mean frames) to diagnose DDP stragglers. "
+            "Works best for speech models (e.g., FunAudioChat) where compute scales with audio frame lengths."
+        },
+    )
+    log_audio_len_stats_rankwise: bool = field(
+        default=True,
+        metadata={"help": "When log_audio_len_stats is enabled, also log per-rank max/mean stats via all_gather."},
+    )
+
     def __post_init__(self):
         RayArguments.__post_init__(self)
         BaseTrainingArguments.__post_init__(self)
