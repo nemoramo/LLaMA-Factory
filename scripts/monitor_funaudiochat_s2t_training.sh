@@ -56,8 +56,10 @@ DYNAMIC_PROMPT_PACKING_NUM_SHARDS="${DYNAMIC_PROMPT_PACKING_NUM_SHARDS:-0}"
 #   - off (default): Disable sharded backend, use standard HuggingFace datasets.
 #   - polars_parquet_shards: Use Polars to stream-read Parquet shards.
 #
-# SHARDED_MANIFEST_PATH: Path to the JSONL manifest file listing all shards.
-#   Each line should contain {"path": "/path/to/shard.parquet", "num_rows": N}.
+# SHARDED_MANIFEST_PATH: Path to `manifest.json` (object) listing all shards.
+#   Produced by: `scripts/shard_jsonl_to_parquet.py build`.
+#   Minimal shape:
+#     {"num_shards":384,"shards":[{"shard_id":0,"files":["shards/part-00000.parquet"],"total_bytes":12345}, ...]}
 #   Required when SHARDED_DATASET_BACKEND != off.
 #
 # SHARDED_INPUT_ALIGNED: Whether samples are pre-aligned to shard boundaries.
