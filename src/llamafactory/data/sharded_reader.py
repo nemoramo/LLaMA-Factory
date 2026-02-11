@@ -120,6 +120,15 @@ def _env_first(*names: str, default: str | None = None) -> str | None:
     return default
 
 
+def _maybe_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
 def _get_pyarrow_s3_filesystem(mode: str):
     mode = str(mode or "").strip().lower()
     if mode not in ("s3", "tos"):
@@ -620,11 +629,13 @@ class ShardedParquetIterableDataset(IterableDataset):
                     ok = False
                 if int(st.get("world_size") or 0) != int(world_size):
                     ok = False
-                if int(st.get("rank") or -1) != int(rank):
+                st_rank = _maybe_int(st.get("rank"))
+                if st_rank is None or int(st_rank) != int(rank):
                     ok = False
                 if int(st.get("num_workers") or 0) != int(num_workers):
                     ok = False
-                if int(st.get("worker_id") or -1) != int(worker_id):
+                st_worker_id = _maybe_int(st.get("worker_id"))
+                if st_worker_id is None or int(st_worker_id) != int(worker_id):
                     ok = False
                 ids = st.get("shards_worker_ids")
                 if not isinstance(ids, list):
