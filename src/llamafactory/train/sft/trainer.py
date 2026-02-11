@@ -33,6 +33,7 @@ from typing_extensions import override
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
+from ...extras.misc import is_env_enabled
 from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, patch_accelerator_for_fp8, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
@@ -47,6 +48,125 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+class _PerfAccumulator:
+    def __init__(self) -> None:
+        self.data_wait_ms_sum = 0.0
+        self.data_wait_n = 0
+
+        self.prepare_ms_sum = 0.0
+        self.prepare_n = 0
+
+        self.train_step_ms_sum = 0.0
+        self.train_step_n = 0
+
+        self.extra_ms_sum: dict[str, float] = {}
+        self.extra_n: dict[str, int] = {}
+
+    def add_data_wait_ms(self, ms: float) -> None:
+        self.data_wait_ms_sum += float(ms)
+        self.data_wait_n += 1
+
+    def add_prepare_ms(self, ms: float) -> None:
+        self.prepare_ms_sum += float(ms)
+        self.prepare_n += 1
+
+    def add_train_step_ms(self, ms: float) -> None:
+        self.train_step_ms_sum += float(ms)
+        self.train_step_n += 1
+
+    def add_extra_ms(self, key_ms: str, ms: float, n: int = 1) -> None:
+        if not (isinstance(key_ms, str) and key_ms.startswith("perf_") and key_ms.endswith("_ms")):
+            return
+        n_int = int(n) if isinstance(n, (int, float)) else 1
+        if n_int <= 0:
+            return
+        self.extra_ms_sum[key_ms] = float(self.extra_ms_sum.get(key_ms, 0.0)) + float(ms) * float(n_int)
+        self.extra_n[key_ms] = int(self.extra_n.get(key_ms, 0) or 0) + int(n_int)
+
+    def add_from_batch_perf(self, perf: dict[str, Any]) -> None:
+        # Expect batch-level keys like `perf_dl_foo_ms` and `perf_dl_foo_n`.
+        if not isinstance(perf, dict):
+            return
+
+        for k, v in perf.items():
+            if not (isinstance(k, str) and k.startswith("perf_dl_") and k.endswith("_ms")):
+                continue
+            try:
+                ms = float(v)
+            except Exception:
+                continue
+            n_key = k[:-3] + "_n"
+            n_val = perf.get(n_key, 1)
+            try:
+                n = int(n_val)
+            except Exception:
+                n = 1
+            self.add_extra_ms(k, ms, n=n)
+
+    def metrics_and_reset(self) -> dict[str, float | int]:
+        out: dict[str, float | int] = {}
+
+        if self.data_wait_n > 0:
+            out["perf_data_wait_ms"] = self.data_wait_ms_sum / float(self.data_wait_n)
+            out["perf_data_wait_n"] = int(self.data_wait_n)
+
+        if self.prepare_n > 0:
+            out["perf_prepare_ms"] = self.prepare_ms_sum / float(self.prepare_n)
+            out["perf_prepare_n"] = int(self.prepare_n)
+
+        if self.train_step_n > 0:
+            out["perf_train_step_ms"] = self.train_step_ms_sum / float(self.train_step_n)
+            out["perf_train_step_n"] = int(self.train_step_n)
+
+        if self.train_step_n > 0 and self.prepare_n > 0:
+            avg_step = self.train_step_ms_sum / float(self.train_step_n)
+            avg_prepare = self.prepare_ms_sum / float(self.prepare_n)
+            out["perf_compute_ms"] = max(0.0, float(avg_step - avg_prepare))
+            out["perf_compute_n"] = int(min(self.train_step_n, self.prepare_n))
+
+        for k, s in self.extra_ms_sum.items():
+            n = int(self.extra_n.get(k, 0) or 0)
+            if n <= 0:
+                continue
+            out[k] = float(s) / float(n)
+            out[k[:-3] + "_n"] = int(n)
+
+        # Reset
+        self.data_wait_ms_sum = 0.0
+        self.data_wait_n = 0
+        self.prepare_ms_sum = 0.0
+        self.prepare_n = 0
+        self.train_step_ms_sum = 0.0
+        self.train_step_n = 0
+        self.extra_ms_sum.clear()
+        self.extra_n.clear()
+
+        return out
+
+
+class _PerfDataLoader:
+    def __init__(self, dataloader: Any, perf: _PerfAccumulator) -> None:
+        self._dataloader = dataloader
+        self._perf = perf
+
+    def __len__(self) -> int:
+        return len(self._dataloader)
+
+    def __iter__(self):
+        it = iter(self._dataloader)
+        while True:
+            t0 = time.perf_counter()
+            try:
+                batch = next(it)
+            except StopIteration:
+                return
+            self._perf.add_data_wait_ms((time.perf_counter() - t0) * 1000.0)
+            yield batch
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._dataloader, name)
 
 
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
@@ -186,6 +306,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
             self.model_accepts_loss_kwargs = False
 
+        self._perf_enabled = is_env_enabled("LLAMAFACTORY_PERF_LOG")
+        self._perf = _PerfAccumulator()
+        self._perf_in_training_step = False
+
         self.finetuning_args = finetuning_args
         self._default_gen_kwargs: dict[str, Any] = gen_kwargs.copy() if gen_kwargs is not None else {}
         if gen_kwargs is not None:
@@ -296,10 +420,34 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             return data.pop("audio_duration_sec", None)
         return None
 
+    def _pop_perf_meta_from_inputs(self, inputs: Any) -> dict[str, Any]:
+        """Pop perf_* keys from inputs (top-level or nested `data` dict)."""
+        if not isinstance(inputs, MutableMapping):
+            return {}
+
+        perf: dict[str, Any] = {}
+        for k in list(inputs.keys()):
+            if isinstance(k, str) and k.startswith("perf_"):
+                perf[k] = inputs.pop(k, None)
+
+        data = inputs.get("data")
+        if isinstance(data, MutableMapping):
+            for k in list(data.keys()):
+                if isinstance(k, str) and k.startswith("perf_"):
+                    perf[k] = data.pop(k, None)
+
+        return perf
+
     @override
     def training_step(
         self, model: torch.nn.Module, inputs: dict[str, Any], num_items_in_batch: Optional[int] = None
     ) -> torch.Tensor:
+        t_step0 = time.perf_counter() if self._perf_enabled else 0.0
+
+        perf_meta = self._pop_perf_meta_from_inputs(inputs)
+        if self._perf_enabled and perf_meta:
+            self._perf.add_from_batch_perf(perf_meta)
+
         audio_dur = self._pop_audio_duration_sec_from_inputs(inputs)
         if self._audio_progress_enabled and audio_dur is not None:
             t = None
@@ -335,7 +483,32 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 if sec > 0:
                     self._audio_consumed_duration_sec += sec
 
-        return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        if not self._perf_enabled:
+            return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+        self._perf_in_training_step = True
+        try:
+            out = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        finally:
+            self._perf_in_training_step = False
+        self._perf.add_train_step_ms((time.perf_counter() - t_step0) * 1000.0)
+        return out
+
+    @override
+    def _prepare_inputs(self, inputs: dict[str, Any] | Any) -> dict[str, Any]:
+        # Always strip perf_* keys defensively (they are logging-only metadata).
+        try:
+            self._pop_perf_meta_from_inputs(inputs)
+        except Exception:
+            pass
+
+        if self._perf_enabled and self._perf_in_training_step:
+            t0 = time.perf_counter()
+            prepared = super()._prepare_inputs(inputs)
+            self._perf.add_prepare_ms((time.perf_counter() - t0) * 1000.0)
+            return prepared
+
+        return super()._prepare_inputs(inputs)
 
     def _maybe_refresh_audio_total_duration_sec(self) -> None:
         if not self._audio_progress_enabled or self._audio_total_duration_ready:
@@ -399,9 +572,44 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        # Copy `logs` defensively: we may add perf/audio progress keys.
+        logs = dict(logs)
+
+        is_train_log = "loss" in logs or "learning_rate" in logs
+        if self._perf_enabled and is_train_log:
+            logs.update(self._perf.metrics_and_reset())
+
+            # Surface FunAudioChat audio-token mismatch counters if present on the unwrapped model.
+            try:
+                unwrapped = self.accelerator.unwrap_model(self.model)
+            except Exception:
+                unwrapped = self.model.module if hasattr(self.model, "module") else self.model
+
+            if unwrapped is not None:
+                n = getattr(unwrapped, "_perf_audio_token_mismatch_n", None)
+                abs_sum = getattr(unwrapped, "_perf_audio_token_mismatch_abs_sum", None)
+                abs_max = getattr(unwrapped, "_perf_audio_token_mismatch_abs_max", None)
+                if n is not None:
+                    try:
+                        logs["perf_audio_token_mismatch_n"] = int(n)
+                    except Exception:
+                        pass
+                    setattr(unwrapped, "_perf_audio_token_mismatch_n", 0)
+                if abs_sum is not None:
+                    try:
+                        logs["perf_audio_token_mismatch_abs_sum"] = float(abs_sum)
+                    except Exception:
+                        pass
+                    setattr(unwrapped, "_perf_audio_token_mismatch_abs_sum", 0.0)
+                if abs_max is not None:
+                    try:
+                        logs["perf_audio_token_mismatch_abs_max"] = float(abs_max)
+                    except Exception:
+                        pass
+                    setattr(unwrapped, "_perf_audio_token_mismatch_abs_max", 0.0)
+
         if self._audio_progress_enabled:
             self._maybe_refresh_audio_total_duration_sec()
-            logs = dict(logs)
             logs["audio_hours"] = float(self._audio_consumed_duration_sec / 3600.0)
             if self._audio_total_duration_sec > 0:
                 logs["audio_total_hours"] = float(self._audio_total_duration_sec / 3600.0)
@@ -490,6 +698,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler(*args, **kwargs)
 
     @override
+    def get_train_dataloader(self):
+        dataloader = super().get_train_dataloader()
+        if self._perf_enabled and not isinstance(dataloader, _PerfDataLoader):
+            return _PerfDataLoader(dataloader, self._perf)
+        return dataloader
+
+    @override
     def get_eval_dataloader(self, eval_dataset: Optional["Dataset"] = None):
         if self.eval_data_collator is None or self.eval_data_collator is self.data_collator:
             return super().get_eval_dataloader(eval_dataset)
@@ -509,16 +724,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # For FunAudioChat, `audio_duration_sec` is used for progress logging but should never be passed to the model.
         if isinstance(inputs, MutableMapping):
             copied = False
-            if "audio_duration_sec" in inputs:
+            if "audio_duration_sec" in inputs or any(isinstance(k, str) and k.startswith("perf_") for k in inputs.keys()):
                 inputs = dict(inputs)
                 inputs.pop("audio_duration_sec", None)
+                for k in list(inputs.keys()):
+                    if isinstance(k, str) and k.startswith("perf_"):
+                        inputs.pop(k, None)
                 copied = True
             data = inputs.get("data")
-            if isinstance(data, MutableMapping) and "audio_duration_sec" in data:
+            if isinstance(data, MutableMapping) and (
+                "audio_duration_sec" in data or any(isinstance(k, str) and k.startswith("perf_") for k in data.keys())
+            ):
                 if not copied:
                     inputs = dict(inputs)
                 data = dict(data)
                 data.pop("audio_duration_sec", None)
+                for k in list(data.keys()):
+                    if isinstance(k, str) and k.startswith("perf_"):
+                        data.pop(k, None)
                 inputs["data"] = data
 
         return_outputs = kwargs.get("return_outputs", False)
@@ -661,16 +884,24 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         # Strip auxiliary metadata that should not be fed into forward/generate.
         if isinstance(inputs, MutableMapping):
             copied = False
-            if "audio_duration_sec" in inputs:
+            if "audio_duration_sec" in inputs or any(isinstance(k, str) and k.startswith("perf_") for k in inputs.keys()):
                 inputs = dict(inputs)
                 inputs.pop("audio_duration_sec", None)
+                for k in list(inputs.keys()):
+                    if isinstance(k, str) and k.startswith("perf_"):
+                        inputs.pop(k, None)
                 copied = True
             data = inputs.get("data")
-            if isinstance(data, MutableMapping) and "audio_duration_sec" in data:
+            if isinstance(data, MutableMapping) and (
+                "audio_duration_sec" in data or any(isinstance(k, str) and k.startswith("perf_") for k in data.keys())
+            ):
                 if not copied:
                     inputs = dict(inputs)
                 data = dict(data)
                 data.pop("audio_duration_sec", None)
+                for k in list(data.keys()):
+                    if isinstance(k, str) and k.startswith("perf_"):
+                        data.pop(k, None)
                 inputs["data"] = data
 
         labels = inputs.get("labels")

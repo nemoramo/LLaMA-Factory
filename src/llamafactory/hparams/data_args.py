@@ -325,6 +325,26 @@ class DataArguments:
         },
     )
 
+    sharded_row_group_shuffle: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Shuffle parquet row-groups (or row-group blocks) within each shard for better dataset mixing. "
+                "This is typically cheaper than large row-level shuffle buffers."
+            )
+        },
+    )
+
+    sharded_row_group_shuffle_block_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "When `sharded_row_group_shuffle` is enabled, shuffle coarse blocks of N row-groups. "
+                "Set to 0 for full row-group shuffle, 1+ for block shuffle, or -1 for auto (aim ~1 output RecordBatch per block)."
+            )
+        },
+    )
+
     sharded_parquet_batch_rows: int = field(
         default=8192,
         metadata={"help": "PyArrow parquet iter_batches batch_size (rows) for sharded parquet backend."},

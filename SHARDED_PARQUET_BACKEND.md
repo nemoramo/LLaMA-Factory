@@ -49,6 +49,12 @@ Existing related knobs:
 
 - `sharded_parquet_batch_rows`: Parquet `iter_batches(batch_size=...)`. If rows are large, reduce this first.
 - `sharded_row_shuffle_buffer`: adds per-shard row shuffle buffering (more RAM).
+- `sharded_row_group_shuffle` (bool, default `false`): shuffle parquet **row-groups** within each shard for better mixing.
+  This is usually cheaper than large `sharded_row_shuffle_buffer` values.
+- `sharded_row_group_shuffle_block_size` (int, default `0`):
+  - `0`: fully shuffle row-groups (best mixing; may increase random IO if parquet is remote)
+  - `1+`: shuffle blocks of N row-groups (trade mixing for more sequential reads)
+  - `-1`: auto block size (aim ~1 output RecordBatch per block)
 
 Dataloader knobs (TrainingArguments):
 
@@ -174,3 +180,59 @@ export SHARDED_RESUME_LOG=false
 ./scripts/monitor_funaudiochat_s2t_training.sh
 ```
 
+## 5) TOS (S3-Compatible) Direct Read (Bypass fuse mount stalls)
+
+If your audio (or even parquet shards) are on a Volcengine TOS bucket that is mounted via `hpvs_fs` (fuse),
+high concurrency (`dataloader_num_workers` x DDP ranks) can show noticeable jitter / stalls.
+
+This worktree supports **direct object-store reads** via S3-compatible APIs:
+
+- **Audio**: `src/llamafactory/data/mm_plugin.py` supports `tos://bucket/key` (and `s3://bucket/key`) using `boto3`.
+- **Parquet shards**: `src/llamafactory/data/sharded_reader.py` supports `tos://bucket/key` using `pyarrow.fs.S3FileSystem`.
+
+### Required env vars (no code changes)
+
+Use the same conventions as `speech_related_tools/data/s3_tool.py`:
+
+- `TOS_ENDPOINT` (or `TOS_ENDPOINT_URL`)
+- `TOS_REGION`
+- `TOS_ACCESS_KEY_ID` (or `TOS_AK`)
+- `TOS_SECRET_ACCESS_KEY` (or `TOS_SK`)
+- Optional: `TOS_SESSION_TOKEN`
+- Optional: `TOS_ADDRESSING_STYLE=virtual|path` (default: `virtual`)
+
+Note: **do not** put AK/SK into repo files; export them in your shell / job environment.
+
+### Option A: Put `tos://...` directly in your manifests
+
+If your dataset audio paths are already `tos://bucket/key`, it will work out of the box once the env vars are set.
+
+### Option B: Keep local paths, but bypass fuse mounts (recommended for existing `/mnt/...` paths)
+
+If your manifests contain fuse-mount paths like:
+
+- `/mnt/asr-audio-data/...`
+- `/mnt/tts-data-tos/...`
+
+You can map those paths to `tos://` automatically by enabling:
+
+```bash
+export LLAMAFACTORY_TOS_SDK_FOR_MOUNT=1
+```
+
+Optional mapping override (comma-separated `mount_prefix:bucket`):
+
+```bash
+export LLAMAFACTORY_TOS_MOUNT_MAP="/mnt/asr-audio-data:asr-audio-data,/mnt/tts-data-tos:tts-data-tos"
+```
+
+### Connection pool tuning (optional)
+
+When using object-store reads at high concurrency, increase the per-process HTTP connection pools:
+
+```bash
+export LLAMAFACTORY_TOS_MAX_POOL_CONNECTIONS=64
+export LLAMAFACTORY_S3_MAX_POOL_CONNECTIONS=64
+```
+
+These are **not** global limits (each dataloader worker process will have its own pool), so keep values reasonable.

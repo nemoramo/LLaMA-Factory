@@ -683,6 +683,8 @@ def get_dataset(
 
             shuffle_shards = bool(getattr(data_args, "sharded_shuffle_shards", True))
             row_shuffle_buffer = int(getattr(data_args, "sharded_row_shuffle_buffer", 0) or 0)
+            row_group_shuffle = bool(getattr(data_args, "sharded_row_group_shuffle", False))
+            row_group_shuffle_block_size = int(getattr(data_args, "sharded_row_group_shuffle_block_size", 0) or 0)
             parquet_batch_rows = int(getattr(data_args, "sharded_parquet_batch_rows", 8192) or 8192)
             prefetch_next_shard = bool(getattr(data_args, "sharded_prefetch_next_shard", True))
             prefetch_queue_batches = int(getattr(data_args, "sharded_prefetch_queue_batches", 1) or 0)
@@ -706,6 +708,8 @@ def get_dataset(
                 seed=int(training_args.seed),
                 shuffle_shards=shuffle_shards,
                 row_shuffle_buffer=row_shuffle_buffer,
+                row_group_shuffle=row_group_shuffle,
+                row_group_shuffle_block_size=row_group_shuffle_block_size,
                 parquet_batch_rows=parquet_batch_rows,
                 prefetch_next_shard=prefetch_next_shard,
                 prefetch_queue_batches=prefetch_queue_batches,

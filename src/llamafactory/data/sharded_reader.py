@@ -5,9 +5,11 @@ import os
 import random
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -99,6 +101,113 @@ def _partition_items(items: list[Any], index: int, modulo: int) -> list[Any]:
     return [x for i, x in enumerate(items) if (i % modulo) == index]
 
 
+_PYARROW_S3FS_CACHE: dict[tuple[int, str], Any] = {}
+
+
+def _ensure_http_scheme(endpoint: str) -> str:
+    ep = (endpoint or "").strip()
+    if ep.startswith("http://") or ep.startswith("https://"):
+        return ep
+    return f"https://{ep}"
+
+
+def _env_first(*names: str, default: str | None = None) -> str | None:
+    for name in names:
+        v = os.environ.get(name)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+
+def _maybe_map_mount_to_tos_uri(path: str) -> str | None:
+    # Only map when explicitly enabled; otherwise treat mount paths as local FS.
+    raw_flag = (os.environ.get("LLAMAFACTORY_TOS_SDK_FOR_MOUNT") or "").strip().lower()
+    if raw_flag not in ("1", "true", "yes", "y", "on"):
+        return None
+
+    # Optional override: "mount_prefix:bucket,mount_prefix2:bucket2"
+    raw_map = (os.environ.get("LLAMAFACTORY_TOS_MOUNT_MAP") or "").strip()
+    if raw_map:
+        pairs: list[tuple[str, str]] = []
+        for part in raw_map.split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            mp, bucket = part.split(":", 1)
+            mp = mp.strip()
+            bucket = bucket.strip()
+            if not mp or not bucket:
+                continue
+            pairs.append((os.path.normpath(mp), bucket))
+    else:
+        pairs = [
+            (os.path.normpath("/mnt/asr-audio-data"), "asr-audio-data"),
+            (os.path.normpath("/mnt/tts-data-tos"), "tts-data-tos"),
+        ]
+
+    p_norm = os.path.normpath(path)
+    for mp_norm, bucket in pairs:
+        if p_norm == mp_norm or p_norm.startswith(mp_norm + os.sep):
+            rel = p_norm[len(mp_norm) :].lstrip(os.sep).replace(os.sep, "/")
+            return f"tos://{bucket}/{rel}"
+    return None
+
+
+def _get_pyarrow_s3_filesystem(mode: str):
+    mode = str(mode or "").strip().lower()
+    if mode not in ("s3", "tos"):
+        raise ValueError(f"Invalid mode: {mode!r}")
+
+    cache_key = (os.getpid(), mode)
+    fs = _PYARROW_S3FS_CACHE.get(cache_key)
+    if fs is not None:
+        return fs
+
+    import pyarrow.fs as pafs  # type: ignore
+
+    if mode == "s3":
+        fs = pafs.S3FileSystem()
+        _PYARROW_S3FS_CACHE[cache_key] = fs
+        return fs
+
+    ak = _env_first("TOS_ACCESS_KEY_ID", "TOS_AK", "AWS_ACCESS_KEY_ID")
+    sk = _env_first("TOS_SECRET_ACCESS_KEY", "TOS_SK", "AWS_SECRET_ACCESS_KEY")
+    token = _env_first("TOS_SESSION_TOKEN", "AWS_SESSION_TOKEN")
+    endpoint = _env_first("TOS_ENDPOINT", "TOS_ENDPOINT_URL")
+    region = _env_first("TOS_REGION", "AWS_DEFAULT_REGION")
+    addressing_style = (_env_first("TOS_ADDRESSING_STYLE", default="virtual") or "virtual").strip().lower()
+    if addressing_style not in ("virtual", "path"):
+        addressing_style = "virtual"
+
+    if not ak or not sk or not endpoint or not region:
+        raise RuntimeError(
+            "TOS access requires env vars: TOS_ACCESS_KEY_ID/TOS_SECRET_ACCESS_KEY/TOS_ENDPOINT/TOS_REGION "
+            "(or their AWS_* fallbacks)."
+        )
+
+    endpoint = _ensure_http_scheme(endpoint)
+    parsed = urlparse(endpoint)
+    scheme = parsed.scheme or "https"
+    endpoint_override = parsed.netloc or parsed.path
+    endpoint_override = endpoint_override.strip("/")
+    if not endpoint_override:
+        raise RuntimeError("Invalid TOS_ENDPOINT.")
+
+    # If endpoint_override is set, pyarrow defaults to path-style unless force_virtual_addressing=True.
+    force_virtual = addressing_style == "virtual"
+    fs = pafs.S3FileSystem(
+        access_key=ak,
+        secret_key=sk,
+        session_token=token,
+        region=region,
+        scheme=scheme,
+        endpoint_override=endpoint_override,
+        force_virtual_addressing=force_virtual,
+    )
+    _PYARROW_S3FS_CACHE[cache_key] = fs
+    return fs
+
+
 def _iter_parquet_rows(
     path: str,
     *,
@@ -120,12 +229,50 @@ def _iter_parquet_record_batches(
     *,
     batch_rows: int,
     columns: list[str] | None = None,
+    row_group_shuffle: bool = False,
+    row_group_shuffle_block_size: int = 0,
+    row_group_shuffle_seed: int = 0,
 ):
     # Import inside so importing LLaMA-Factory doesn't hard-require pyarrow.
     import pyarrow.parquet as pq  # type: ignore
 
-    pf = pq.ParquetFile(path)
-    for batch in pf.iter_batches(batch_size=int(batch_rows), columns=columns):
+    if isinstance(path, str):
+        mapped = _maybe_map_mount_to_tos_uri(path)
+        if mapped is not None:
+            path = mapped
+
+    if isinstance(path, str) and path.startswith(("s3://", "tos://")):
+        parsed = urlparse(path)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        fs = _get_pyarrow_s3_filesystem("tos" if path.startswith("tos://") else "s3")
+        pf = pq.ParquetFile(f"{bucket}/{key}", filesystem=fs)
+    else:
+        pf = pq.ParquetFile(path)
+
+    row_groups = None
+    if bool(row_group_shuffle) and int(getattr(pf, "num_row_groups", 0) or 0) > 1:
+        num_row_groups = int(pf.num_row_groups)
+        block_size = int(row_group_shuffle_block_size or 0)
+        if block_size == -1:
+            # Auto: shuffle coarse row-group blocks so each block is ~1 output RecordBatch.
+            # This improves mixing without causing extremely random IO patterns.
+            try:
+                rows_per_rg = int(getattr(pf.metadata.row_group(0), "num_rows", 0) or 0)  # type: ignore[union-attr]
+            except Exception:
+                rows_per_rg = 0
+            if rows_per_rg <= 0:
+                rows_per_rg = max(1, int(getattr(pf.metadata, "num_rows", 0) or 0) // max(1, num_row_groups))  # type: ignore[union-attr]
+            block_size = max(1, int(batch_rows) // max(1, int(rows_per_rg)))
+        elif block_size <= 0:
+            # Default: fully shuffle row-groups.
+            block_size = 1
+
+        blocks = [list(range(i, min(i + block_size, num_row_groups))) for i in range(0, num_row_groups, block_size)]
+        random.Random(int(row_group_shuffle_seed) & 0xFFFFFFFF).shuffle(blocks)
+        row_groups = [rg for block in blocks for rg in block]
+
+    for batch in pf.iter_batches(batch_size=int(batch_rows), columns=columns, row_groups=row_groups):
         yield batch
 
 
@@ -148,11 +295,36 @@ def _iter_shard_record_batches(
     *,
     batch_rows: int,
     columns: list[str] | None,
+    row_group_shuffle: bool,
+    row_group_shuffle_block_size: int,
+    row_group_shuffle_seed: int,
 ):
-    for fp in files:
+    files2 = list(files)
+    if bool(row_group_shuffle) and len(files2) > 1:
+        random.Random(int(row_group_shuffle_seed) & 0xFFFFFFFF).shuffle(files2)
+
+    for fp in files2:
+        seed = int(row_group_shuffle_seed) ^ int(zlib.crc32(str(fp).encode("utf-8")) & 0xFFFFFFFF)
+        if isinstance(fp, str) and fp.startswith(("s3://", "tos://")):
+            yield from _iter_parquet_record_batches(
+                fp,
+                batch_rows=int(batch_rows),
+                columns=columns,
+                row_group_shuffle=bool(row_group_shuffle),
+                row_group_shuffle_block_size=int(row_group_shuffle_block_size),
+                row_group_shuffle_seed=int(seed),
+            )
+            continue
         if not os.path.isfile(fp):
             continue
-        yield from _iter_parquet_record_batches(fp, batch_rows=int(batch_rows), columns=columns)
+        yield from _iter_parquet_record_batches(
+            fp,
+            batch_rows=int(batch_rows),
+            columns=columns,
+            row_group_shuffle=bool(row_group_shuffle),
+            row_group_shuffle_block_size=int(row_group_shuffle_block_size),
+            row_group_shuffle_seed=int(seed),
+        )
 
 
 class _PrefetchIterator:
@@ -202,9 +374,10 @@ class _PrefetchIterator:
                 self._err = err
             finally:
                 # Always signal consumer termination.
+                sentinel_timeout_s = 5.0
                 while True:
                     try:
-                        self._q.put(self._sentinel, timeout=0.5)
+                        self._q.put(self._sentinel, timeout=sentinel_timeout_s)
                         break
                     except Full:
                         if self._stop.is_set():
@@ -280,6 +453,8 @@ class ShardedParquetIterableDataset(IterableDataset):
         seed: int,
         shuffle_shards: bool = True,
         row_shuffle_buffer: int = 0,
+        row_group_shuffle: bool = False,
+        row_group_shuffle_block_size: int = 0,
         parquet_batch_rows: int = 8192,
         prefetch_next_shard: bool = True,
         prefetch_queue_batches: int = 1,
@@ -297,6 +472,8 @@ class ShardedParquetIterableDataset(IterableDataset):
         self.seed = int(seed)
         self.shuffle_shards = bool(shuffle_shards)
         self.row_shuffle_buffer = int(row_shuffle_buffer or 0)
+        self.row_group_shuffle = bool(row_group_shuffle)
+        self.row_group_shuffle_block_size = int(row_group_shuffle_block_size or 0)
         self.parquet_batch_rows = int(parquet_batch_rows or 8192)
         self.prefetch_next_shard = bool(prefetch_next_shard)
         self.prefetch_queue_batches = int(prefetch_queue_batches or 0)
@@ -315,6 +492,8 @@ class ShardedParquetIterableDataset(IterableDataset):
             raise ValueError(f"Invalid parquet_batch_rows: {self.parquet_batch_rows}")
         if self.row_shuffle_buffer < 0:
             raise ValueError(f"Invalid row_shuffle_buffer: {self.row_shuffle_buffer}")
+        if self.row_group_shuffle_block_size < -1:
+            raise ValueError(f"Invalid row_group_shuffle_block_size: {self.row_group_shuffle_block_size}")
         if self.prefetch_queue_batches < 0:
             raise ValueError(f"Invalid prefetch_queue_batches: {self.prefetch_queue_batches}")
         if self.resume_mode not in ("off", "shard_boundary"):
@@ -324,6 +503,32 @@ class ShardedParquetIterableDataset(IterableDataset):
         base_dir, shards = load_shard_manifest(self.manifest_path)
         rank, world_size = _get_rank_world_size()
         worker_id, num_workers = _get_worker_info()
+
+        prefetch_log_ranks: set[int] = {0}
+        if self.prefetch_log:
+            raw = (os.environ.get("LLAMAFACTORY_SHARDED_PREFETCH_LOG_RANKS") or "").strip()
+            if raw:
+                if raw.lower() in ("all", "*"):
+                    prefetch_log_ranks = set(range(max(1, int(world_size))))
+                else:
+                    parsed: set[int] = set()
+                    for part in raw.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        try:
+                            parsed.add(int(part))
+                        except Exception:
+                            continue
+                    if parsed:
+                        prefetch_log_ranks = parsed
+        prefetch_log_this_rank = bool(self.prefetch_log) and (int(rank) in prefetch_log_ranks)
+
+        if self.row_group_shuffle:
+            logger.info_rank0(
+                "ShardedParquetIterableDataset: row-group shuffle enabled (block_size=%d).",
+                int(self.row_group_shuffle_block_size),
+            )
 
         # 1) Partition shards across ranks, then across dataloader workers.
         shards_sorted = sorted(shards, key=lambda s: int(s.shard_id))
@@ -519,23 +724,42 @@ class ShardedParquetIterableDataset(IterableDataset):
                 continue
 
             remaining_shards = max(0, len(shard_order) - start_pos)
-            prefetch_enabled = self.prefetch_next_shard and self.prefetch_queue_batches > 0 and remaining_shards > 1
+            # Prefetch can help even when resuming at the very last shard of a cycle:
+            # in that case, prefetch the next cycle's first shard to avoid a boundary stall.
+            prefetch_enabled = self.prefetch_next_shard and self.prefetch_queue_batches > 0 and (
+                remaining_shards > 1 or bool(shard_order_next)
+            )
 
             def _files_for(shard: ShardSpec) -> list[str]:
-                return [os.path.join(base_dir, fp) for fp in shard.files]
+                out: list[str] = []
+                for fp in shard.files:
+                    fp = str(fp)
+                    if fp.startswith(("s3://", "tos://")):
+                        out.append(fp)
+                    elif os.path.isabs(fp):
+                        out.append(fp)
+                    else:
+                        out.append(os.path.join(base_dir, fp))
+                return out
+
+            def _row_group_seed(shard: ShardSpec) -> int:
+                # Keep this independent of cycle_idx so prefetch-carry between cycles stays consistent.
+                return (
+                    int(self.seed) ^ (int(shard.shard_id) * 1000003) ^ (int(rank) * 9176) ^ int(worker_id)
+                ) & 0xFFFFFFFF
 
             def _make_row_it(shard: ShardSpec, batch_it) -> Iterator[dict[str, Any]]:
                 seen_batches = 0
 
                 def _on_batch(it, _batch) -> None:
                     nonlocal seen_batches
-                    if not self.prefetch_log:
+                    if not prefetch_log_this_rank:
                         return
                     if isinstance(it, _PrefetchIterator) and seen_batches == 0:
                         ready_s = None
                         if it.started_at is not None and it.first_put_at is not None:
                             ready_s = max(0.0, float(it.first_put_at - it.started_at))
-                        logger.info_rank0(
+                        logger.info(
                             "ShardedParquetIterableDataset: shard enter (rank=%d/%d worker=%d/%d cycle=%d shard=%d "
                             "prefetch_ready_s=%s first_get_wait_s=%.3f q_put=%d q_get=%d).",
                             rank,
@@ -551,7 +775,7 @@ class ShardedParquetIterableDataset(IterableDataset):
                         )
                     seen_batches += 1
 
-                row_it = _iter_rows_from_record_batches(batch_it, on_batch=_on_batch if self.prefetch_log else None)
+                row_it = _iter_rows_from_record_batches(batch_it, on_batch=_on_batch if prefetch_log_this_rank else None)
                 if self.row_shuffle_buffer > 1:
                     rng = random.Random((self.seed + cycle_idx) ^ (int(shard.shard_id) * 1000003))
                     row_it = _buffer_shuffle(row_it, buf_size=self.row_shuffle_buffer, rng=rng)
@@ -561,11 +785,18 @@ class ShardedParquetIterableDataset(IterableDataset):
                 if not prefetch_enabled or shard is None:
                     return None
                 name = f"rank{rank}-w{worker_id}-c{cycle_idx}-s{int(shard.shard_id)}"
-                it = _iter_shard_record_batches(_files_for(shard), batch_rows=self.parquet_batch_rows, columns=self.columns)
+                it = _iter_shard_record_batches(
+                    _files_for(shard),
+                    batch_rows=self.parquet_batch_rows,
+                    columns=self.columns,
+                    row_group_shuffle=bool(self.row_group_shuffle),
+                    row_group_shuffle_block_size=int(self.row_group_shuffle_block_size),
+                    row_group_shuffle_seed=int(_row_group_seed(shard)),
+                )
                 pre = _PrefetchIterator(it, maxsize=self.prefetch_queue_batches, name=name)
                 pre.start()
-                if self.prefetch_log:
-                    logger.info_rank0(
+                if prefetch_log_this_rank:
+                    logger.info(
                         "ShardedParquetIterableDataset: prefetch start (rank=%d/%d worker=%d/%d cycle=%d shard=%d q=%d).",
                         rank,
                         world_size,
@@ -581,8 +812,8 @@ class ShardedParquetIterableDataset(IterableDataset):
             first_shard = shard_order[start_pos]
             if start_pos == 0 and carry_prefetch is not None and carry_prefetch_shard_id == int(first_shard.shard_id):
                 current_batch_it = carry_prefetch
-                if self.prefetch_log:
-                    logger.info_rank0(
+                if prefetch_log_this_rank:
+                    logger.info(
                         "ShardedParquetIterableDataset: reuse prefetched first shard (rank=%d/%d worker=%d/%d cycle=%d shard=%d).",
                         rank,
                         world_size,
@@ -593,14 +824,23 @@ class ShardedParquetIterableDataset(IterableDataset):
                     )
             else:
                 current_batch_it = _iter_shard_record_batches(
-                    _files_for(first_shard), batch_rows=self.parquet_batch_rows, columns=self.columns
+                    _files_for(first_shard),
+                    batch_rows=self.parquet_batch_rows,
+                    columns=self.columns,
+                    row_group_shuffle=bool(self.row_group_shuffle),
+                    row_group_shuffle_block_size=int(self.row_group_shuffle_block_size),
+                    row_group_shuffle_seed=int(_row_group_seed(first_shard)),
                 )
             carry_prefetch = None
             carry_prefetch_shard_id = None
 
-            next_prefetch = _start_prefetch(
-                shard_order[start_pos + 1] if (start_pos + 1) < len(shard_order) else None
-            )
+            prefetch_seed_shard = None
+            if (start_pos + 1) < len(shard_order):
+                prefetch_seed_shard = shard_order[start_pos + 1]
+            elif shard_order_next:
+                prefetch_seed_shard = shard_order_next[0]
+
+            next_prefetch = _start_prefetch(prefetch_seed_shard)
 
             for pos in range(start_pos, len(shard_order)):
                 shard = shard_order[pos]
@@ -614,8 +854,8 @@ class ShardedParquetIterableDataset(IterableDataset):
                     next_shard_index = pos + 1
                     _save_resume_state(cycle_idx=cycle_idx, next_shard_index=next_shard_index, shard_order_ids=shard_order_ids)
 
-                if self.prefetch_log and next_prefetch is not None and next_prefetch.first_put_at is None:
-                    logger.warning_rank0(
+                if prefetch_log_this_rank and next_prefetch is not None and next_prefetch.first_put_at is None:
+                    logger.warning(
                         "ShardedParquetIterableDataset: next shard prefetch not ready at boundary "
                         "(rank=%d/%d worker=%d/%d cycle=%d shard=%d next_q=%d).",
                         rank,
@@ -652,7 +892,12 @@ class ShardedParquetIterableDataset(IterableDataset):
                     current_batch_it = next_prefetch
                 else:
                     current_batch_it = _iter_shard_record_batches(
-                        _files_for(next_shard), batch_rows=self.parquet_batch_rows, columns=self.columns
+                        _files_for(next_shard),
+                        batch_rows=self.parquet_batch_rows,
+                        columns=self.columns,
+                        row_group_shuffle=bool(self.row_group_shuffle),
+                        row_group_shuffle_block_size=int(self.row_group_shuffle_block_size),
+                        row_group_shuffle_seed=int(_row_group_seed(next_shard)),
                     )
 
                 # Prefetch lookahead: the shard after next, or next cycle's first shard.
@@ -671,6 +916,9 @@ def _iter_shard_rows(
     columns: list[str] | None,
 ) -> Iterator[dict[str, Any]]:
     for fp in files:
+        if isinstance(fp, str) and fp.startswith(("s3://", "tos://")):
+            yield from _iter_parquet_rows(fp, batch_rows=int(batch_rows), columns=columns)
+            continue
         if not os.path.isfile(fp):
             continue
         yield from _iter_parquet_rows(fp, batch_rows=int(batch_rows), columns=columns)

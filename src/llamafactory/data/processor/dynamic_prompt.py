@@ -32,6 +32,7 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
+from ...extras.misc import is_env_enabled
 from ..data_utils import Role
 from .processor_utils import DatasetProcessor, greedy_knapsack
 from .supervised import SupervisedDatasetProcessor
@@ -553,6 +554,29 @@ class DynamicPromptPackedBatchProcessor:
                 template=template, tokenizer=tokenizer, processor=processor, data_args=data_args
             )
 
+        self._last_perf_dp_encode_ms: float | None = None
+        self._last_perf_dp_pack_ms: float | None = None
+        self._last_perf_dp_total_ms: float | None = None
+
+    def _set_last_perf_dp(self, encode_ms: float | None, pack_ms: float | None, total_ms: float | None) -> None:
+        self._last_perf_dp_encode_ms = encode_ms
+        self._last_perf_dp_pack_ms = pack_ms
+        self._last_perf_dp_total_ms = total_ms
+
+    def _take_last_perf_dp_meta(self) -> dict[str, float] | None:
+        total = self._last_perf_dp_total_ms
+        if total is None:
+            return None
+
+        meta: dict[str, float] = {"perf_dp_total_ms": float(total)}
+        if self._last_perf_dp_encode_ms is not None:
+            meta["perf_dp_encode_ms"] = float(self._last_perf_dp_encode_ms)
+        if self._last_perf_dp_pack_ms is not None:
+            meta["perf_dp_pack_ms"] = float(self._last_perf_dp_pack_ms)
+
+        self._set_last_perf_dp(None, None, None)
+        return meta
+
     def _get_rng(self) -> random.Random:
         if self._rng is None:
             self._rng = random.Random()
@@ -880,6 +904,19 @@ class DynamicPromptPackedBatchProcessor:
         return item
 
     def __call__(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        dp_perf_enabled = is_env_enabled("LLAMAFACTORY_PERF_LOG") and is_env_enabled(
+            "LLAMAFACTORY_DYNAMIC_PACKING_PERF_META"
+        )
+        if dp_perf_enabled:
+            t0 = time.perf_counter()
+            items, lengths = self.encode_examples(examples)
+            t1 = time.perf_counter()
+            packed, _, _ = self.pack_encoded_items(items, lengths, carryover_packs=0)
+            t2 = time.perf_counter()
+            self._set_last_perf_dp((t1 - t0) * 1000.0, (t2 - t1) * 1000.0, (t2 - t0) * 1000.0)
+            return packed
+
+        self._set_last_perf_dp(None, None, None)
         items, lengths = self.encode_examples(examples)
         packed, _, _ = self.pack_encoded_items(items, lengths, carryover_packs=0)
         return packed
@@ -1482,7 +1519,7 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
         return examples, boundary_hit
 
     @staticmethod
-    def _yield_packed_examples(packed: dict[str, list[Any]]):
+    def _yield_packed_examples(packed: dict[str, list[Any]], meta: dict[str, Any] | None = None):
         if not packed:
             return
 
@@ -1504,7 +1541,10 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
                 )
 
         for i in range(n):
-            yield {k: packed[k][i] for k in keys}
+            ex = {k: packed[k][i] for k in keys}
+            if meta:
+                ex.update(meta)
+            yield ex
 
     @staticmethod
     def _queue_put(q: Queue, item: Any, stop: threading.Event, timeout_s: float = 0.5) -> bool:
@@ -1529,6 +1569,9 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
         error: list[BaseException] = []
 
         def producer():
+            dp_perf_enabled = is_env_enabled("LLAMAFACTORY_PERF_LOG") and is_env_enabled(
+                "LLAMAFACTORY_DYNAMIC_PACKING_PERF_META"
+            )
             try:
                 carry_items: list[dict[str, Any]] = []
                 carry_lengths: list[int] = []
@@ -1541,31 +1584,49 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
                                     carry_items, carry_lengths, carryover_packs=0
                                 )
                                 if packed:
-                                    self._queue_put(q, packed, stop)
+                                    self._queue_put(q, (packed, None), stop)
                             carry_items = []
                             carry_lengths = []
                             continue
                         break
 
                     if self.carryover_packs > 0:
-                        items, lengths = self.packer.encode_examples(examples)
+                        meta = None
+                        if dp_perf_enabled:
+                            t0 = time.perf_counter()
+                            items, lengths = self.packer.encode_examples(examples)
+                            t1 = time.perf_counter()
+                        else:
+                            items, lengths = self.packer.encode_examples(examples)
                         if items:
                             pool_items = carry_items + items
                             pool_lengths = carry_lengths + lengths
-                            packed, carry_items, carry_lengths = self.packer.pack_encoded_items(
-                                pool_items, pool_lengths, carryover_packs=self.carryover_packs
-                            )
+                            if dp_perf_enabled:
+                                packed, carry_items, carry_lengths = self.packer.pack_encoded_items(
+                                    pool_items, pool_lengths, carryover_packs=self.carryover_packs
+                                )
+                                t2 = time.perf_counter()
+                                meta = {
+                                    "perf_dp_encode_ms": (t1 - t0) * 1000.0,
+                                    "perf_dp_pack_ms": (t2 - t1) * 1000.0,
+                                    "perf_dp_total_ms": (t2 - t0) * 1000.0,
+                                }
+                            else:
+                                packed, carry_items, carry_lengths = self.packer.pack_encoded_items(
+                                    pool_items, pool_lengths, carryover_packs=self.carryover_packs
+                                )
                         else:
                             packed = {}
                     else:
                         packed = self.packer(examples)
+                        meta = self.packer._take_last_perf_dp_meta() if dp_perf_enabled else None
                     if not packed:
                         if boundary_hit:
                             carry_items = []
                             carry_lengths = []
                         continue
 
-                    if not self._queue_put(q, packed, stop):
+                    if not self._queue_put(q, (packed, meta), stop):
                         break
 
                     if boundary_hit and self.carryover_packs > 0:
@@ -1575,14 +1636,26 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
                                 carry_items, carry_lengths, carryover_packs=0
                             )
                             if packed2:
-                                self._queue_put(q, packed2, stop)
+                                self._queue_put(q, (packed2, None), stop)
                         carry_items = []
                         carry_lengths = []
 
                 if self.carryover_packs > 0 and carry_items and not stop.is_set():
-                    packed, _, _ = self.packer.pack_encoded_items(carry_items, carry_lengths, carryover_packs=0)
+                    meta = None
+                    if dp_perf_enabled:
+                        t0 = time.perf_counter()
+                        packed, _, _ = self.packer.pack_encoded_items(carry_items, carry_lengths, carryover_packs=0)
+                        t1 = time.perf_counter()
+                        if packed:
+                            meta = {
+                                "perf_dp_encode_ms": 0.0,
+                                "perf_dp_pack_ms": (t1 - t0) * 1000.0,
+                                "perf_dp_total_ms": (t1 - t0) * 1000.0,
+                            }
+                    else:
+                        packed, _, _ = self.packer.pack_encoded_items(carry_items, carry_lengths, carryover_packs=0)
                     if packed:
-                        self._queue_put(q, packed, stop)
+                        self._queue_put(q, (packed, meta), stop)
 
                 self._queue_put(q, sentinel, stop)
             except BaseException as err:  # pragma: no cover
@@ -1604,7 +1677,11 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
                 if buf is sentinel:
                     break
 
-                yield from self._yield_packed_examples(buf)
+                meta = None
+                packed = buf
+                if isinstance(buf, tuple) and len(buf) == 2:
+                    packed, meta = buf
+                yield from self._yield_packed_examples(packed, meta)
 
             if error:
                 raise error[0]

@@ -30,6 +30,7 @@ from transformers import DataCollatorForSeq2Seq
 
 from ..extras import logging
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
+from ..extras.misc import is_env_enabled
 from ..extras.packages import is_pillow_available
 
 
@@ -190,10 +191,46 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         return x.squeeze(0).cpu().numpy().astype(np.float32)
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
+        perf_enabled = is_env_enabled("LLAMAFACTORY_PERF_LOG")
+        dl_perf_enabled = perf_enabled and is_env_enabled("LLAMAFACTORY_DATALOADER_PERF_LOG")
+        preserve_audio_meta = is_env_enabled("LLAMAFACTORY_PRESERVE_AUDIO_META")
+
+        t_collate0 = time.perf_counter() if dl_perf_enabled else 0.0
+        perf_batch: dict[str, Any] = {}
+
+        dp_encode_sum = 0.0
+        dp_pack_sum = 0.0
+        dp_total_sum = 0.0
+        dp_encode_n = 0
+        dp_pack_n = 0
+        dp_total_n = 0
+
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
         batch_audio_durations: list[float] = []
         for feature in features:
+            v = feature.pop("perf_dp_encode_ms", None)
+            if v is not None:
+                try:
+                    dp_encode_sum += float(v)
+                    dp_encode_n += 1
+                except Exception:
+                    pass
+            v = feature.pop("perf_dp_pack_ms", None)
+            if v is not None:
+                try:
+                    dp_pack_sum += float(v)
+                    dp_pack_n += 1
+                except Exception:
+                    pass
+            v = feature.pop("perf_dp_total_ms", None)
+            if v is not None:
+                try:
+                    dp_total_sum += float(v)
+                    dp_total_n += 1
+                except Exception:
+                    pass
+
             d = feature.pop("audio_duration_sec", None)
             try:
                 batch_audio_durations.append(float(d) if d is not None else 0.0)
@@ -209,6 +246,17 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_vidlens.append(len(videos))
             batch_audlens.append(len(audios))
             batch_input_ids.append(feature["input_ids"])
+
+        if perf_enabled:
+            if dp_encode_n > 0:
+                perf_batch["perf_dl_dp_encode_ms"] = dp_encode_sum / float(dp_encode_n)
+                perf_batch["perf_dl_dp_encode_n"] = int(dp_encode_n)
+            if dp_pack_n > 0:
+                perf_batch["perf_dl_dp_pack_ms"] = dp_pack_sum / float(dp_pack_n)
+                perf_batch["perf_dl_dp_pack_n"] = int(dp_pack_n)
+            if dp_total_n > 0:
+                perf_batch["perf_dl_dp_total_ms"] = dp_total_sum / float(dp_total_n)
+                perf_batch["perf_dl_dp_total_n"] = int(dp_total_n)
 
         # NOTE:
         # Some workflows (e.g. prompt packing) pre-compute `position_ids` and produce fixed-length sequences.
@@ -281,6 +329,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_input_ids[0] = features[0]["input_ids"]
 
         if self.audio_specaugment and len(batch_audios) != 0:
+            t_spec0 = time.perf_counter() if dl_perf_enabled else 0.0
             if self.processor is None:
                 raise ValueError("Processor is required for audio SpecAugment.")
             if self.template is None:
@@ -298,7 +347,11 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 # Best-effort SpecAugment: if waveform loading fails, keep the original audio and let the
                 # model/plugin handle retries + loss masking later.
                 if isinstance(audio, np.ndarray):
-                    augmented_audios.append(self._apply_audio_specaugment(audio))
+                    augmented = self._apply_audio_specaugment(audio)
+                    if preserve_audio_meta:
+                        augmented_audios.append({"raw": audio, "array": augmented})
+                    else:
+                        augmented_audios.append(augmented)
                     continue
 
                 last_error: Exception | None = None
@@ -334,12 +387,20 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                         suppressed = True
                     continue
 
-                augmented_audios.append(self._apply_audio_specaugment(y))
+                augmented = self._apply_audio_specaugment(y)
+                if preserve_audio_meta:
+                    augmented_audios.append({"raw": audio, "array": augmented})
+                else:
+                    augmented_audios.append(augmented)
 
             setattr(self, "_audio_specaug_error_logged", logged)
             setattr(self, "_audio_specaug_error_suppressed", suppressed)
             batch_audios = augmented_audios
+            if dl_perf_enabled:
+                perf_batch["perf_dl_specaug_ms"] = (time.perf_counter() - t_spec0) * 1000.0
+                perf_batch["perf_dl_specaug_n"] = 1
 
+        t_mm0 = time.perf_counter() if dl_perf_enabled else 0.0
         mm_inputs = self.template.mm_plugin.get_mm_inputs(
             batch_images,
             batch_videos,
@@ -350,6 +411,25 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_input_ids,
             self.processor,
         )
+        if dl_perf_enabled:
+            perf_batch["perf_dl_mm_inputs_ms"] = (time.perf_counter() - t_mm0) * 1000.0
+            perf_batch["perf_dl_mm_inputs_n"] = 1
+
+        # Pull mm_plugin internal perf (if any) into collator-level metrics and ensure they won't reach model forward.
+        for perf_key, dl_key in (
+            ("perf_mm_audio_load_ms", "perf_dl_audio_load_ms"),
+            ("perf_mm_speech_tokenizer_ms", "perf_dl_speech_tokenizer_ms"),
+            ("perf_mm_feature_extractor_ms", "perf_dl_feature_extractor_ms"),
+        ):
+            v = mm_inputs.pop(perf_key, None)
+            if v is None:
+                continue
+            try:
+                perf_batch[dl_key] = float(v)
+                perf_batch[dl_key.replace("_ms", "_n")] = 1
+            except Exception:
+                continue
+
         audio_feature_load_fail = mm_inputs.pop("feature_load_fail_mask", None)
         if "token_type_ids" in mm_inputs:
             token_type_ids = mm_inputs.pop("token_type_ids")
@@ -536,10 +616,18 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             # NOTE: Keep audio_duration_sec at top-level so it won't be forwarded into the model by wrappers.
             if audio_duration_tensor is not None:
                 out["audio_duration_sec"] = audio_duration_tensor
+            if dl_perf_enabled:
+                perf_batch["perf_dl_collate_ms"] = (time.perf_counter() - t_collate0) * 1000.0
+                perf_batch["perf_dl_collate_n"] = 1
+            out.update(perf_batch)
             return out
 
         if audio_duration_tensor is not None:
             features["audio_duration_sec"] = audio_duration_tensor
+        if dl_perf_enabled:
+            perf_batch["perf_dl_collate_ms"] = (time.perf_counter() - t_collate0) * 1000.0
+            perf_batch["perf_dl_collate_n"] = 1
+        features.update(perf_batch)
         return features
 
 
