@@ -70,6 +70,14 @@ python scripts/eval_funaudiochat_s2t_promptpool.py \
   - `training_command.txt`（完整命令行）
   - `config_base.yaml`（启动时使用的基础 YAML 配置副本）
 
+### 超大数据集（Parquet shard）
+
+如果训练 JSONL 极大（例如 10 万+小时），建议启用 **sharded parquet backend**
+来避免构建全量 HF map-style JSONL 索引，并降低高 worker/prefetch 下的 OOM 风险。
+
+- 指南：`examples/funaudiochat/LARGE_SCALE_TRAINING.zh-CN.md`
+- 后端细节（跨 shard 预读 + shard-boundary resume）：`SHARDED_PARQUET_BACKEND.md`
+
 ### neat packing 参考命令
 
 ```bash

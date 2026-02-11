@@ -115,6 +115,14 @@ For long-running experiments, we recommend launching via the watchdog script:
   - `training_command.txt` (the exact command line)
   - `config_base.yaml` (a copy of the base YAML config file)
 
+### Large-scale datasets (Parquet shards)
+
+If your training JSONL is extremely large (e.g. 100k+ audio hours), consider the **sharded parquet backend**
+to avoid building a full HF map-style JSONL index and to reduce OOM risk with high dataloader workers/prefetch.
+
+- Guide: `examples/funaudiochat/LARGE_SCALE_TRAINING.md`
+- Backend details (cross-shard prefetch + shard-boundary resume): `SHARDED_PARQUET_BACKEND.md`
+
 ### Neat packing reference command
 
 ```bash
