@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from torch.utils.data import IterableDataset, get_worker_info
 
 from ..extras import logging
+from ..extras.storage_uri import maybe_map_mount_to_tos_uri
 
 
 logger = logging.get_logger(__name__)
@@ -119,40 +120,6 @@ def _env_first(*names: str, default: str | None = None) -> str | None:
     return default
 
 
-def _maybe_map_mount_to_tos_uri(path: str) -> str | None:
-    # Only map when explicitly enabled; otherwise treat mount paths as local FS.
-    raw_flag = (os.environ.get("LLAMAFACTORY_TOS_SDK_FOR_MOUNT") or "").strip().lower()
-    if raw_flag not in ("1", "true", "yes", "y", "on"):
-        return None
-
-    # Optional override: "mount_prefix:bucket,mount_prefix2:bucket2"
-    raw_map = (os.environ.get("LLAMAFACTORY_TOS_MOUNT_MAP") or "").strip()
-    if raw_map:
-        pairs: list[tuple[str, str]] = []
-        for part in raw_map.split(","):
-            part = part.strip()
-            if not part or ":" not in part:
-                continue
-            mp, bucket = part.split(":", 1)
-            mp = mp.strip()
-            bucket = bucket.strip()
-            if not mp or not bucket:
-                continue
-            pairs.append((os.path.normpath(mp), bucket))
-    else:
-        pairs = [
-            (os.path.normpath("/mnt/asr-audio-data"), "asr-audio-data"),
-            (os.path.normpath("/mnt/tts-data-tos"), "tts-data-tos"),
-        ]
-
-    p_norm = os.path.normpath(path)
-    for mp_norm, bucket in pairs:
-        if p_norm == mp_norm or p_norm.startswith(mp_norm + os.sep):
-            rel = p_norm[len(mp_norm) :].lstrip(os.sep).replace(os.sep, "/")
-            return f"tos://{bucket}/{rel}"
-    return None
-
-
 def _get_pyarrow_s3_filesystem(mode: str):
     mode = str(mode or "").strip().lower()
     if mode not in ("s3", "tos"):
@@ -237,7 +204,7 @@ def _iter_parquet_record_batches(
     import pyarrow.parquet as pq  # type: ignore
 
     if isinstance(path, str):
-        mapped = _maybe_map_mount_to_tos_uri(path)
+        mapped = maybe_map_mount_to_tos_uri(path)
         if mapped is not None:
             path = mapped
 
@@ -627,6 +594,26 @@ class ShardedParquetIterableDataset(IterableDataset):
                 ok = True
                 if str(st.get("manifest_path") or "") != manifest_abs:
                     ok = False
+                st_mtime = st.get("manifest_mtime_ns")
+                if st_mtime is not None and manifest_mtime_ns > 0:
+                    try:
+                        st_mtime_ns = int(st_mtime)
+                    except Exception:
+                        st_mtime_ns = 0
+                    if st_mtime_ns > 0 and int(st_mtime_ns) != int(manifest_mtime_ns):
+                        ok = False
+                        if self.resume_log:
+                            logger.warning_rank0(
+                                "ShardedParquetIterableDataset: manifest mtime mismatch; ignoring resume state "
+                                "(rank=%d/%d worker=%d/%d state=%d current=%d path=%s).",
+                                rank,
+                                world_size,
+                                worker_id,
+                                num_workers,
+                                int(st_mtime_ns),
+                                int(manifest_mtime_ns),
+                                manifest_abs,
+                            )
                 if int(st.get("seed") or 0) != int(self.seed):
                     ok = False
                 if bool(st.get("shuffle_shards", True)) != bool(self.shuffle_shards):

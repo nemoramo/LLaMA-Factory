@@ -43,6 +43,7 @@ from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDE
 from ..extras import logging
 from ..extras.misc import is_env_enabled
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
+from ..extras.storage_uri import maybe_map_mount_to_tos_uri
 
 
 # Optional S3/TOS support. Only used when audio paths start with s3:// or tos:// (or when mapping fuse mounts).
@@ -100,6 +101,36 @@ def _env_first(*names: str, default: str | None = None) -> str | None:
     return default
 
 
+def _parse_int_env(
+    name: str,
+    *,
+    default: int,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
+    raw = os.environ.get(str(name))
+    if raw is None:
+        v = int(default)
+    else:
+        s = str(raw).strip()
+        if s == "":
+            v = int(default)
+        else:
+            try:
+                v = int(s)
+            except Exception:
+                logger.warning_rank0("Invalid %s=%r (expected int); using default=%d.", str(name), raw, int(default))
+                v = int(default)
+
+    if min_value is not None and v < int(min_value):
+        logger.warning_rank0("%s=%d is too small; clamping to %d.", str(name), int(v), int(min_value))
+        v = int(min_value)
+    if max_value is not None and v > int(max_value):
+        logger.warning_rank0("%s=%d is too large; clamping to %d.", str(name), int(v), int(max_value))
+        v = int(max_value)
+    return int(v)
+
+
 def _ensure_http_scheme(endpoint: str) -> str:
     ep = (endpoint or "").strip()
     if ep.startswith("http://") or ep.startswith("https://"):
@@ -120,8 +151,13 @@ def _get_s3_client():
     cfg = None
     if _BotoConfig is not None:
         # Avoid a tiny default pool when many dataloader workers fetch in parallel.
-        max_conn = int(_env_first("LLAMAFACTORY_S3_MAX_POOL_CONNECTIONS", default="64") or "64")
-        cfg = _BotoConfig(max_pool_connections=max(8, max_conn))
+        max_conn = _parse_int_env(
+            "LLAMAFACTORY_S3_MAX_POOL_CONNECTIONS",
+            default=64,
+            min_value=8,
+            max_value=1024,
+        )
+        cfg = _BotoConfig(max_pool_connections=int(max_conn))
 
     client = boto3.client("s3", config=cfg) if cfg is not None else boto3.client("s3")
     _S3_CLIENT_CACHE = (pid, client)
@@ -157,11 +193,16 @@ def _get_tos_client():
 
     cfg = None
     if _BotoConfig is not None:
-        max_conn = int(_env_first("LLAMAFACTORY_TOS_MAX_POOL_CONNECTIONS", default="64") or "64")
+        max_conn = _parse_int_env(
+            "LLAMAFACTORY_TOS_MAX_POOL_CONNECTIONS",
+            default=64,
+            min_value=8,
+            max_value=1024,
+        )
         cfg = _BotoConfig(
             signature_version="s3v4",
             s3={"addressing_style": addressing_style},
-            max_pool_connections=max(8, max_conn),
+            max_pool_connections=int(max_conn),
         )
 
     sess = boto3.session.Session(
@@ -173,41 +214,6 @@ def _get_tos_client():
     client = sess.client("s3", endpoint_url=endpoint, config=cfg) if cfg is not None else sess.client("s3", endpoint_url=endpoint)
     _TOS_CLIENT_CACHE = (pid, client)
     return client
-
-
-def _maybe_map_mount_to_tos_uri(path: str) -> str | None:
-    # Only map when explicitly enabled; otherwise treat mount paths as local FS.
-    if not is_env_enabled("LLAMAFACTORY_TOS_SDK_FOR_MOUNT"):
-        return None
-
-    # Optional override: "mount_prefix:bucket,mount_prefix2:bucket2"
-    raw_map = (os.environ.get("LLAMAFACTORY_TOS_MOUNT_MAP") or "").strip()
-    if raw_map:
-        pairs: list[tuple[str, str]] = []
-        for part in raw_map.split(","):
-            part = part.strip()
-            if not part or ":" not in part:
-                continue
-            mp, bucket = part.split(":", 1)
-            mp = mp.strip()
-            bucket = bucket.strip()
-            if not mp or not bucket:
-                continue
-            pairs.append((os.path.normpath(mp), bucket))
-    else:
-        # Default known mounts from this environment.
-        pairs = [
-            (os.path.normpath("/mnt/asr-audio-data"), "asr-audio-data"),
-            (os.path.normpath("/mnt/tts-data-tos"), "tts-data-tos"),
-        ]
-
-    p_norm = os.path.normpath(path)
-    # Compare using normalized path; require a real path boundary to avoid false-prefix matches.
-    for mp_norm, bucket in pairs:
-        if p_norm == mp_norm or p_norm.startswith(mp_norm + os.sep):
-            rel = p_norm[len(mp_norm) :].lstrip(os.sep).replace(os.sep, "/")
-            return f"tos://{bucket}/{rel}"
-    return None
 
 
 if is_pillow_available():
@@ -624,7 +630,7 @@ class MMPluginMixin:
         # String or os.PathLike path / URI
         if isinstance(audio, (str, os.PathLike)):
             path = os.fspath(audio)
-            mapped = _maybe_map_mount_to_tos_uri(path)
+            mapped = maybe_map_mount_to_tos_uri(path)
             if mapped is not None:
                 path = mapped
 

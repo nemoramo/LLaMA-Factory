@@ -703,6 +703,15 @@ def get_dataset(
                 if resolved_state_dir:
                     os.environ.setdefault("LLAMAFACTORY_SHARDED_RESUME_STATE_DIR", resolved_state_dir)
 
+            try:
+                import pyarrow.parquet  # type: ignore  # noqa: F401
+            except Exception as err:  # noqa: BLE001
+                raise ImportError(
+                    "Sharded parquet backend requires `pyarrow`. "
+                    "Install it in the training environment (not user-site when PYTHONNOUSERSITE=1), e.g. "
+                    "`pip install pyarrow` or `conda install -c conda-forge pyarrow`."
+                ) from err
+
             raw_train_ds = ShardedParquetIterableDataset(
                 manifest_path=str(sharded_manifest_path),
                 seed=int(training_args.seed),

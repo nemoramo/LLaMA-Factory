@@ -906,6 +906,10 @@ def _cmd_build_chunked(args: argparse.Namespace, *, pl, inputs: list[str], out_d
     bytes_read = 0
     objs_seen = 0
     next_chunk_id = 0  # unique id for chunk/temp naming
+    executor: ProcessPoolExecutor | None = None
+    if num_workers > 1:
+        # Keep a single executor alive for the entire build to avoid repeatedly spawning processes.
+        executor = ProcessPoolExecutor(max_workers=num_workers)
 
     def emit_progress(tag: str) -> None:
         nonlocal last_progress
@@ -945,30 +949,28 @@ def _cmd_build_chunked(args: argparse.Namespace, *, pl, inputs: list[str], out_d
         assert num_workers > 1
         assert tmp_dir is not None
         assert shard_temp_files is not None
+        assert executor is not None
 
         work_args = [
             (idx, rows, num_shards, seed, id_col, compression, statistics, infer_len, schema, schema_cols, tmp_dir, None)
             for idx, rows in pending_chunks
         ]
-        future_rows = {}
         rows_in_batch = 0
         for arg in work_args:
             rows_in_batch += len(arg[1])
 
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(_partition_chunk_worker, arg) for arg in work_args]
-            for f in as_completed(futures):
-                # Each future corresponds to one work_arg; map by index in list.
-                # This avoids depending on out-of-band queues for progress.
-                try:
-                    result = f.result()
-                except Exception as e:
-                    raise RuntimeError(f"Chunk processing failed (num_workers={num_workers})") from e
-                for shard_id, files in result.items():
-                    shard_temp_files[shard_id].extend(files)
+        futures = [executor.submit(_partition_chunk_worker, arg) for arg in work_args]
+        for f in as_completed(futures):
+            try:
+                result = f.result()
+            except Exception as e:
+                raise RuntimeError(f"Chunk processing failed (num_workers={num_workers})") from e
+            for shard_id, files in result.items():
+                shard_temp_files[shard_id].extend(files)
 
         rows_total += rows_in_batch
         chunk_idx += len(pending_chunks)
+        pending_chunks.clear()
 
     print(
         "[INFO] shard_jsonl_to_parquet build(chunked):"
@@ -1255,6 +1257,10 @@ def _cmd_build_chunked(args: argparse.Namespace, *, pl, inputs: list[str], out_d
                 except Exception:
                     pass
             raise
+
+    if executor is not None:
+        executor.shutdown(wait=True, cancel_futures=True)
+        executor = None
 
     elapsed = time.time() - t0
     if not use_rich:

@@ -1621,7 +1621,19 @@ class _DynamicPromptPackedPrefetchDataset(IterableDataset):
                         packed = self.packer(examples)
                         meta = self.packer._take_last_perf_dp_meta() if dp_perf_enabled else None
                     if not packed:
-                        if boundary_hit:
+                        if boundary_hit and self.carryover_packs > 0:
+                            # Do not allow cross-shard carryover. Even if this buffer produced no packed outputs
+                            # (e.g., all examples dropped), we still must flush any existing carryover items;
+                            # otherwise they would be silently discarded at shard boundaries.
+                            if carry_items and not stop.is_set():
+                                packed2, _, _ = self.packer.pack_encoded_items(
+                                    carry_items, carry_lengths, carryover_packs=0
+                                )
+                                if packed2:
+                                    self._queue_put(q, (packed2, None), stop)
+                            carry_items = []
+                            carry_lengths = []
+                        elif boundary_hit:
                             carry_items = []
                             carry_lengths = []
                         continue

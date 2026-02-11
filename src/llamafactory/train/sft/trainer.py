@@ -146,6 +146,88 @@ class _PerfAccumulator:
         return out
 
 
+class _AudioLenAccumulator:
+    """Accumulate audio feature-length stats across micro-batches.
+
+    This is intended to diagnose DDP stragglers for speech models where compute scales with audio frames.
+    The accumulator is local to each rank and is reduced/gathered in `Trainer.log()` (synchronized).
+    """
+
+    def __init__(self) -> None:
+        self.sample_frames_sum = 0.0
+        self.sample_n = 0
+        self.sample_frames_max = 0.0
+
+        self.batch_frames_sum = 0.0
+        self.batch_n = 0
+        self.batch_frames_max = 0.0
+
+        self.segments_sum = 0.0
+        self.segments_n = 0
+
+    def add_feature_attention_mask(self, feature_attention_mask: Any) -> None:
+        if feature_attention_mask is None or not torch.is_tensor(feature_attention_mask):
+            return
+        if feature_attention_mask.numel() == 0:
+            return
+        if feature_attention_mask.dim() != 2:
+            return
+        try:
+            mask = feature_attention_mask
+            if mask.dtype == torch.bool:
+                lens = mask.to(dtype=torch.int64).sum(dim=1)
+            else:
+                lens = mask.sum(dim=1).to(dtype=torch.int64)
+        except Exception:
+            return
+
+        # lens: (num_audio_segments,)
+        try:
+            lens_f = lens.to(dtype=torch.float32)
+            valid = lens_f > 0
+            if bool(valid.any().item()):
+                lens_valid = lens_f[valid]
+                self.sample_frames_sum += float(lens_valid.sum().item())
+                self.sample_n += int(valid.sum().item())
+                self.sample_frames_max = max(self.sample_frames_max, float(lens_valid.max().item()))
+
+            batch_sum = float(lens_f.sum().item())
+            self.batch_frames_sum += batch_sum
+            self.batch_n += 1
+            self.batch_frames_max = max(self.batch_frames_max, batch_sum)
+
+            self.segments_sum += float(int(lens_f.numel()))
+            self.segments_n += 1
+        except Exception:
+            return
+
+    def snapshot_and_reset(self) -> dict[str, float | int]:
+        if self.sample_n <= 0 and self.batch_n <= 0:
+            return {}
+
+        out = {
+            "sample_frames_sum": float(self.sample_frames_sum),
+            "sample_n": int(self.sample_n),
+            "sample_frames_max": float(self.sample_frames_max),
+            "batch_frames_sum": float(self.batch_frames_sum),
+            "batch_n": int(self.batch_n),
+            "batch_frames_max": float(self.batch_frames_max),
+            "segments_sum": float(self.segments_sum),
+            "segments_n": int(self.segments_n),
+        }
+
+        self.sample_frames_sum = 0.0
+        self.sample_n = 0
+        self.sample_frames_max = 0.0
+        self.batch_frames_sum = 0.0
+        self.batch_n = 0
+        self.batch_frames_max = 0.0
+        self.segments_sum = 0.0
+        self.segments_n = 0
+
+        return out
+
+
 class _PerfDataLoader:
     def __init__(self, dataloader: Any, perf: _PerfAccumulator) -> None:
         self._dataloader = dataloader
@@ -310,6 +392,10 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._perf = _PerfAccumulator()
         self._perf_in_training_step = False
 
+        self._audio_len_stats_enabled = bool(getattr(training_args, "log_audio_len_stats", False))
+        self._audio_len_stats_rankwise = bool(getattr(training_args, "log_audio_len_stats_rankwise", True))
+        self._audio_len_stats = _AudioLenAccumulator()
+
         self.finetuning_args = finetuning_args
         self._default_gen_kwargs: dict[str, Any] = gen_kwargs.copy() if gen_kwargs is not None else {}
         if gen_kwargs is not None:
@@ -438,6 +524,109 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return perf
 
+    def _get_feature_attention_mask_from_inputs(self, inputs: Any) -> Any:
+        """Get `feature_attention_mask` from inputs (top-level or nested `data` dict)."""
+        if not isinstance(inputs, MutableMapping):
+            return None
+        v = inputs.get("feature_attention_mask")
+        if v is not None:
+            return v
+        data = inputs.get("data")
+        if isinstance(data, MutableMapping):
+            return data.get("feature_attention_mask")
+        return None
+
+    def _reduce_audio_len_snapshot(self, snap: dict[str, float | int]) -> dict[str, float | int]:
+        """Reduce/gather audio length stats across ranks (called inside synchronized `log()`)."""
+        # Local (per-rank, over the logging window)
+        sample_sum = float(snap.get("sample_frames_sum", 0.0) or 0.0)
+        sample_n = int(snap.get("sample_n", 0) or 0)
+        sample_max = float(snap.get("sample_frames_max", 0.0) or 0.0)
+
+        batch_sum = float(snap.get("batch_frames_sum", 0.0) or 0.0)
+        batch_n = int(snap.get("batch_n", 0) or 0)
+        batch_max = float(snap.get("batch_frames_max", 0.0) or 0.0)
+
+        seg_sum = float(snap.get("segments_sum", 0.0) or 0.0)
+        seg_n = int(snap.get("segments_n", 0) or 0)
+
+        def _safe_div(a: float, b: int) -> float:
+            if b <= 0:
+                return 0.0
+            return float(a) / float(b)
+
+        local_sample_mean = _safe_div(sample_sum, sample_n)
+        local_batch_mean = _safe_div(batch_sum, batch_n)
+        local_seg_mean = _safe_div(seg_sum, batch_n if batch_n > 0 else seg_n)
+
+        # Start with local values so single-GPU works and distributed failures degrade gracefully.
+        out: dict[str, float | int] = {
+            "audio_feat_len_frames_mean": float(local_sample_mean),
+            "audio_feat_len_frames_max": float(sample_max),
+            "audio_feat_len_frames_batch_sum_mean": float(local_batch_mean),
+            "audio_feat_len_frames_batch_sum_max": float(batch_max),
+            "audio_segments_per_batch_mean": float(local_seg_mean),
+            "audio_feat_len_obs_batches": int(batch_n),
+            "audio_feat_len_obs_segments": int(seg_sum),
+        }
+
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return out
+
+        device = getattr(self.args, "device", None) or torch.device("cpu")
+
+        t_sample_sum = torch.tensor(sample_sum, device=device, dtype=torch.float32)
+        t_sample_n = torch.tensor(float(sample_n), device=device, dtype=torch.float32)
+        t_sample_max = torch.tensor(sample_max, device=device, dtype=torch.float32)
+        t_batch_sum = torch.tensor(batch_sum, device=device, dtype=torch.float32)
+        t_batch_n = torch.tensor(float(batch_n), device=device, dtype=torch.float32)
+        t_batch_max = torch.tensor(batch_max, device=device, dtype=torch.float32)
+        t_seg_sum = torch.tensor(seg_sum, device=device, dtype=torch.float32)
+
+        torch.distributed.all_reduce(t_sample_sum, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(t_sample_n, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(t_batch_sum, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(t_batch_n, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(t_seg_sum, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(t_sample_max, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(t_batch_max, op=torch.distributed.ReduceOp.MAX)
+
+        sample_n_global = float(t_sample_n.item())
+        batch_n_global = float(t_batch_n.item())
+        out["audio_feat_len_frames_mean"] = float(t_sample_sum.item() / sample_n_global) if sample_n_global > 0 else 0.0
+        out["audio_feat_len_frames_max"] = float(t_sample_max.item())
+        out["audio_feat_len_frames_batch_sum_mean"] = (
+            float(t_batch_sum.item() / batch_n_global) if batch_n_global > 0 else 0.0
+        )
+        out["audio_feat_len_frames_batch_sum_max"] = float(t_batch_max.item())
+        out["audio_segments_per_batch_mean"] = float(t_seg_sum.item() / batch_n_global) if batch_n_global > 0 else 0.0
+        out["audio_feat_len_obs_batches"] = int(batch_n_global)
+        out["audio_feat_len_obs_segments"] = int(t_seg_sum.item())
+
+        if not self._audio_len_stats_rankwise:
+            return out
+
+        world_size = int(torch.distributed.get_world_size() or 1)
+
+        def _all_gather_scalar(x: float) -> list[float]:
+            t = torch.tensor(float(x), device=device, dtype=torch.float32)
+            gathered = [torch.zeros_like(t) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered, t)
+            return [float(g.item()) for g in gathered]
+
+        max_by_rank = _all_gather_scalar(sample_max)
+        batch_mean_by_rank = _all_gather_scalar(local_batch_mean)
+        seg_mean_by_rank = _all_gather_scalar(local_seg_mean)
+
+        for r, v in enumerate(max_by_rank):
+            out[f"audio_feat_len_frames_max_rank{r}"] = float(v)
+        for r, v in enumerate(batch_mean_by_rank):
+            out[f"audio_feat_len_frames_batch_sum_mean_rank{r}"] = float(v)
+        for r, v in enumerate(seg_mean_by_rank):
+            out[f"audio_segments_per_batch_mean_rank{r}"] = float(v)
+
+        return out
+
     @override
     def training_step(
         self, model: torch.nn.Module, inputs: dict[str, Any], num_items_in_batch: Optional[int] = None
@@ -482,6 +671,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 sec = float(t.item())
                 if sec > 0:
                     self._audio_consumed_duration_sec += sec
+
+        if self._audio_len_stats_enabled:
+            try:
+                self._audio_len_stats.add_feature_attention_mask(self._get_feature_attention_mask_from_inputs(inputs))
+            except Exception:
+                pass
 
         if not self._perf_enabled:
             return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
@@ -576,6 +771,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         logs = dict(logs)
 
         is_train_log = "loss" in logs or "learning_rate" in logs
+        if self._audio_len_stats_enabled and is_train_log:
+            snap = self._audio_len_stats.snapshot_and_reset()
+            if snap:
+                try:
+                    logs.update(self._reduce_audio_len_snapshot(snap))
+                except Exception:
+                    pass
         if self._perf_enabled and is_train_log:
             logs.update(self._perf.metrics_and_reset())
 

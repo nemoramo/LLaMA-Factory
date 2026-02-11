@@ -226,6 +226,8 @@ Optional mapping override (comma-separated `mount_prefix:bucket`):
 export LLAMAFACTORY_TOS_MOUNT_MAP="/mnt/asr-audio-data:asr-audio-data,/mnt/tts-data-tos:tts-data-tos"
 ```
 
+Implementation note: mount-path mapping is shared by both audio and parquet readers via `src/llamafactory/extras/storage_uri.py`.
+
 ### Connection pool tuning (optional)
 
 When using object-store reads at high concurrency, increase the per-process HTTP connection pools:
