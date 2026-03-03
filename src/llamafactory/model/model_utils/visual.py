@@ -417,6 +417,11 @@ def get_forbidden_modules(config: "PretrainedConfig", finetuning_args: "Finetuni
             logger.info_rank0(f"Set language model not trainable: {language_model_keys}.")
             forbidden_modules.update(language_model_keys)
 
+        if model_type == "funaudiochat" and getattr(finetuning_args, "funaudiochat_freeze_audio_tower", False):
+            audio_keys = ["continuous_audio_tower", "audio_tower", "audio_invert_tower"]
+            logger.info_rank0(f"FunAudioChat: set audio modules not trainable: {audio_keys}.")
+            forbidden_modules.update(audio_keys)
+
     return forbidden_modules
 
 

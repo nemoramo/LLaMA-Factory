@@ -548,6 +548,15 @@ class FinetuningArguments(
             )
         },
     )
+    funaudiochat_freeze_audio_tower: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether or not to freeze FunAudioChat audio modules (continuous_audio_tower/audio_tower/audio_invert_tower) "
+                "for LLM-only tuning."
+            )
+        },
+    )
     compute_accuracy: bool = field(
         default=False,
         metadata={"help": "Whether or not to compute the token-level accuracy at evaluation."},

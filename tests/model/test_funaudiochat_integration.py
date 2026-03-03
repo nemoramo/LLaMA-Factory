@@ -40,3 +40,23 @@ def test_funaudiochat_registration_template_plugin():
 
     plugin = get_mm_plugin(name="funaudiochat", audio_token="<|AUDIO|>")
     assert plugin.audio_token == "<|AUDIO|>"
+
+
+@pytest.mark.runs_on(["cpu"])
+def test_funaudiochat_freeze_audio_tower_forbidden_modules():
+    from transformers import AutoConfig
+
+    from llamafactory.hparams import FinetuningArguments
+    from llamafactory.model.funaudiochat.register import register_funaudiochat
+    from llamafactory.model.model_utils.visual import get_forbidden_modules
+
+    register_funaudiochat()
+
+    cfg = AutoConfig.for_model("funaudiochat")
+    args = FinetuningArguments()
+    args.funaudiochat_freeze_audio_tower = True
+    forbidden = get_forbidden_modules(cfg, args)
+
+    assert "continuous_audio_tower" in forbidden
+    assert "audio_tower" in forbidden
+    assert "audio_invert_tower" in forbidden
