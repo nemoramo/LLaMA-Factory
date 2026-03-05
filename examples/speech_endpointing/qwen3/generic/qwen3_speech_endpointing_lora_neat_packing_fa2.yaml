@@ -1,0 +1,116 @@
+### Qwen3 Speech Endpointing LoRA Training Config (Generic)
+### Supports: Qwen3-0.6B, Qwen3-1.7B
+### Features: Neat Packing + LoRA + FlashAttention-2
+
+### model
+# Choose one of the following:
+# - Qwen/Qwen3-0.6B
+# - Qwen/Qwen3-1.7B
+model_name_or_path: Qwen/Qwen3-0.6B
+
+template: qwen3_nothink
+trust_remote_code: true
+
+# Prefer FlashAttention-2 when available.
+flash_attn: fa2
+
+# Add 3 label tokens and resize embeddings (vocab expansion)
+# <EOU>: End of Utterance - user has finished speaking
+# <CONT_USER>: User likely to continue speaking
+# <UNADDRESSED>: Speech not addressed to the assistant
+add_special_tokens: "<EOU>,<CONT_USER>,<UNADDRESSED>"
+resize_vocab: true
+
+### method
+stage: sft
+do_train: true
+do_eval: true
+finetuning_type: lora
+
+# Evaluate as token-level accuracy (recommended: keep assistant output as single tag token)
+compute_accuracy: true
+predict_with_generate: false
+
+### lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+### dataset
+# Path to your dataset directory (containing dataset_info.json and data files)
+dataset_dir: /path/to/your/dataset_dir
+
+# Training dataset name (defined in dataset_info.json)
+dataset: speech_endpointing_train
+
+# Evaluation dataset name (defined in dataset_info.json)
+eval_dataset: speech_endpointing_eval
+
+cutoff_len: 512
+train_on_prompt: false
+
+# Enable packing + neat packing (no cross-sample loss contribution)
+# neat_packing ensures no loss is computed across sample boundaries
+packing: true
+neat_packing: true
+
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 4
+
+### output
+# Output directory for checkpoints and logs
+output_dir: /path/to/your/output_dir
+overwrite_output_dir: true
+report_to: tensorboard
+plot_loss: true
+logging_steps: 10
+
+save_steps: 200
+save_total_limit: 3
+
+eval_strategy: steps
+eval_steps: 200
+
+load_best_model_at_end: true
+metric_for_best_model: eval_accuracy
+greater_is_better: true
+
+### train
+# Batch size configuration (adjust based on GPU memory):
+# For Qwen3-0.6B (single GPU):
+#   per_device_train_batch_size: 32
+#   gradient_accumulation_steps: 2
+#   effective batch size = 32 * 2 = 64
+# For Qwen3-1.7B (single GPU):
+#   per_device_train_batch_size: 16
+#   gradient_accumulation_steps: 4
+#   effective batch size = 16 * 4 = 64
+per_device_train_batch_size: 32
+per_device_eval_batch_size: 16
+gradient_accumulation_steps: 2
+
+learning_rate: 2.0e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+max_grad_norm: 1.0
+num_train_epochs: 1.0
+
+bf16: true
+ddp_find_unused_parameters: false
+
+### inference (recommended for endpointing - greedy decoding)
+do_sample: false
+temperature: 0.0
+top_p: 1.0
+num_beams: 1
+max_new_tokens: 1

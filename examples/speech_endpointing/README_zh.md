@@ -2,7 +2,7 @@
 
 本目录提供多套 **Speech Endpointing / Turn-taking（三分类标签）** 的训练与导出配置（YAML），已按 **模型** 分组索引（见下）。
 
-这个 recipe 用 **LLaMA-Factory + LoRA(SFT)** 把“端点检测/轮次接续（turn-taking）”做成 **下一 token 三分类**：
+这个 recipe 用 **LLaMA-Factory + LoRA(SFT)** 把"端点检测/轮次接续（turn-taking）"做成 **下一 token 三分类**：
 模型对输入对话只输出 **一个标签 token**（`<EOU>` / `<CONT_USER>` / `<UNADDRESSED>`）。
 
 本方案使用 **新增 special tokens + resize vocab**（不复用 unused token），适合需要模型直接输出上述 3 个字符串标签的场景。
@@ -10,6 +10,12 @@
 ---
 
 ## 0. 配置索引（按模型）
+
+### Qwen3 (Instruct)
+
+- Qwen3-0.6B / Qwen3-1.7B
+  - 通用训练配置（neat packing + LoRA + FlashAttention-2）：`examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml`
+  - 通用导出配置（merge LoRA）：`examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_export.yaml`
 
 ### Qwen2.5 (Instruct)
 
@@ -20,20 +26,13 @@
   - 训练（neat packing）：`examples/speech_endpointing/qwen2_5/0_5b/qwen2_5_0_5b_speech_endpointing_lora_neat_packing.yaml`
   - 导出（merge LoRA）：`examples/speech_endpointing/qwen2_5/0_5b/qwen2_5_0_5b_speech_endpointing_lora_export.yaml`
 
-### Gemma3 (IT)
+### LFM2
 
-- Gemma3-270M
-  - 训练（packing；Gemma 不支持 neat packing）：`examples/speech_endpointing/gemma3/270m/gemma3_270m_speech_endpointing_lora_packing.yaml`
-  - 导出：`examples/speech_endpointing/gemma3/270m/gemma3_270m_speech_endpointing_lora_export.yaml`
-- Gemma3-1B
-  - 训练（packing，len=1024）：`examples/speech_endpointing/gemma3/1b/gemma3_1b_speech_endpointing_lora_packing_len1024.yaml`
-  - 导出：`examples/speech_endpointing/gemma3/1b/gemma3_1b_speech_endpointing_lora_export.yaml`
+- LFM2.5-1.2B
+  - 通用训练配置（neat packing + LoRA + FlashAttention-2）：`examples/speech_endpointing/lfm2/generic/lfm2_5_speech_endpointing_lora_neat_packing_fa2.yaml`
+  - 通用导出配置（merge LoRA）：`examples/speech_endpointing/lfm2/generic/lfm2_5_speech_endpointing_lora_export.yaml`
 
-### Gemma3n (E4B, 多模态)
-
-- Gemma3n-E4B
-  - 训练（冻结非文本塔，additional_target 训练新增 tokens）：`examples/speech_endpointing/gemma3n/e4b/gemma3n_e4b_speech_endpointing_lora_packing_len1024.yaml`
-  - 导出：`examples/speech_endpointing/gemma3n/e4b/gemma3n_e4b_speech_endpointing_lora_export.yaml`
+---
 
 ## 1. 核心思路
 
@@ -69,7 +68,7 @@
 ## 3. 从 TorchTune manifest 转换（可选）
 
 如果你当前数据是 TorchTune 的 `*.manifest`（JSONL），通常每行会带有 `label/context/messages/meta` 等字段。
-LLaMA-Factory 的 neat packing 不要求“预先 packing”，只要样本能被解析成 OpenAI messages 即可。
+LLaMA-Factory 的 neat packing 不要求"预先 packing"，只要样本能被解析成 OpenAI messages 即可。
 
 本目录提供一个 stdlib-only 的转换脚本：
 
@@ -138,9 +137,10 @@ python examples/speech_endpointing/convert_torchtune_manifest.py \
 
 ## 5. 训练（LoRA + resize vocab）
 
-编辑配置：`examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech_endpointing_lora_neat_packing.yaml`
+编辑配置：`examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml`
 
 你需要至少修改：
+- `model_name_or_path`: 选择 `Qwen/Qwen3-0.6B` 或 `Qwen/Qwen3-1.7B`
 - `dataset_dir`
 - `dataset` / `eval_dataset`
 - `output_dir`
@@ -148,7 +148,8 @@ python examples/speech_endpointing/convert_torchtune_manifest.py \
 启动训练（支持 Hydra overrides：在 YAML 路径后追加 `key=value` 覆盖配置）：
 
 ```bash
-llamafactory-cli train examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech_endpointing_lora_neat_packing.yaml \
+llamafactory-cli train examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
+  model_name_or_path=Qwen/Qwen3-0.6B \
   dataset_dir=/path/to/your/dataset_dir \
   output_dir=/path/to/output_dir
 ```
@@ -156,16 +157,18 @@ llamafactory-cli train examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech_
 也可以用本目录的统一入口脚本（单卡）：
 
 ```bash
-GPU_ID=0 CFG=examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech_endpointing_lora_neat_packing.yaml \
+GPU_ID=0 CFG=examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
   bash examples/speech_endpointing/run.sh train \
+    model_name_or_path=Qwen/Qwen3-0.6B \
     dataset_dir=/path/to/your/dataset_dir \
     output_dir=/path/to/output_dir
 ```
 
-例如：复现“单卡 + 频繁评估 + 训练 3 epoch（续训）”这类变体，不需要单独维护 YAML，只要覆盖少量字段：
+例如：复现"单卡 + 频繁评估 + 训练 3 epoch（续训）"这类变体，不需要单独维护 YAML，只要覆盖少量字段：
 
 ```bash
-llamafactory-cli train examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech_endpointing_lora_neat_packing.yaml \
+llamafactory-cli train examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
+  model_name_or_path=Qwen/Qwen3-0.6B \
   dataset_dir=/path/to/your/dataset_dir \
   output_dir=/path/to/output_dir \
   save_steps=200 eval_steps=200 \
@@ -176,17 +179,25 @@ llamafactory-cli train examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech_
 如需关闭 packing / neat packing（例如遇到版本兼容问题）：
 
 ```bash
-llamafactory-cli train examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech_endpointing_lora_neat_packing.yaml \
+llamafactory-cli train examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
   packing=false neat_packing=false
 ```
 
 导出（merge LoRA）同理，用 export 配置并覆盖输出路径即可：
 
 ```bash
-llamafactory-cli export examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech_endpointing_lora_export.yaml \
+llamafactory-cli export examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_export.yaml \
+  model_name_or_path=Qwen/Qwen3-0.6B \
   adapter_name_or_path=/path/to/lora_adapter_dir \
   export_dir=/path/to/export_dir
 ```
+
+### 不同模型大小的 batch size 配置
+
+| 模型 | per_device_train_batch_size | gradient_accumulation_steps | 有效 batch size |
+|------|----------------------------|----------------------------|----------------|
+| Qwen3-0.6B | 32 | 2 | 64 |
+| Qwen3-1.7B | 16 | 4 | 64 |
 
 ### 关于新增 token 的训练（重要）
 
@@ -197,14 +208,15 @@ llamafactory-cli export examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech
 
 ## 6. Neat Packing（LLaMA-Factory 内置）
 
-neat packing 是 LLaMA-Factory 在数据预处理阶段做的“无跨样本 attention 的 packing”，适合大量短样本（endpointing 很典型）。
+neat packing 是 LLaMA-Factory 在数据预处理阶段做的"无跨样本 attention 的 packing"，适合大量短样本（endpointing 很典型）。
 
 在训练配置里打开：
 
 - `packing: true`
 - `neat_packing: true`
 
-本目录提供一个已开启 neat packing 的配置示例：
+本目录提供已开启 neat packing 的配置示例：
+- `examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml`
 - `examples/speech_endpointing/qwen2_5/3b/qwen2_5_3b_speech_endpointing_lora_neat_packing.yaml`
 
 注意：
@@ -215,7 +227,7 @@ neat packing 是 LLaMA-Factory 在数据预处理阶段做的“无跨样本 att
 
 ## 7. 推理建议
 
-endpointing 需要“只生成 1 个标签”：
+endpointing 需要"只生成 1 个标签"：
 - `do_sample: false`
 - `temperature: 0.0`
 - `max_new_tokens: 1`

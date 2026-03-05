@@ -1,0 +1,26 @@
+### Qwen3 Speech Endpointing LoRA Export Config (Generic)
+### Merges LoRA adapters into base model for deployment
+### Note: DO NOT use quantized model or quantization_bit when merging LoRA adapters
+
+### model
+# Choose one of the following:
+# - Qwen/Qwen3-0.6B
+# - Qwen/Qwen3-1.7B
+model_name_or_path: Qwen/Qwen3-0.6B
+
+# Set to your trained LoRA checkpoint dir (e.g., checkpoint-1364)
+adapter_name_or_path: /path/to/your/lora_checkpoint
+
+template: qwen3_nothink
+trust_remote_code: true
+
+# Keep tokenizer/model vocab consistent with training
+# Must match the tokens added during training
+add_special_tokens: "<EOU>,<CONT_USER>,<UNADDRESSED>"
+resize_vocab: true
+
+### export
+export_dir: /path/to/exported_model
+export_size: 2
+export_device: cpu  # choices: [cpu, auto]
+export_legacy_format: false
