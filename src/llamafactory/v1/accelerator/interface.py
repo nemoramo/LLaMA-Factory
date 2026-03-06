@@ -28,12 +28,12 @@ And data parallelism types:
 
 from dataclasses import dataclass
 from datetime import timedelta
-from enum import StrEnum
 from typing import Any, Optional
 
 from torch.distributed import barrier, destroy_process_group, init_process_group
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
+from ...extras.compat import StrEnum
 from ..utils import logging
 from ..utils.types import DistributedConfig, ProcessGroup, TensorLike
 from . import helper

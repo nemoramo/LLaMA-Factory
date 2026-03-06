@@ -43,7 +43,10 @@
 - 训练周期: 2.0 epochs
 
 **评估设置:**
-- `compute_accuracy: true`: 计算 token 级别准确率
+- 旧配置里常见 `compute_accuracy: true`：只计算 token-level accuracy
+- 如果你使用当前仓库里的新 trainer 指标，建议改成 `compute_endpointing_metrics: true`
+- 同时把 `metric_for_best_model` 改为 `eval_label_acc`
+- 这样会额外输出 `label_*` 与 `merged_label_*` 指标，更适合 speech endpointing
 - `predict_with_generate: false`: 不使用生成模式评估
 - `max_new_tokens: 1`: 只生成一个 token (分类任务)
 

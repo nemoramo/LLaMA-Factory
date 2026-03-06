@@ -569,6 +569,15 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute the token-level accuracy at evaluation."},
     )
+    compute_endpointing_metrics: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether or not to compute speech endpointing label metrics on the first supervised tag token, "
+                "including merged metrics where `<UNADDRESSED>` is treated as `<EOU>`."
+            )
+        },
+    )
     compute_wer_cer: bool = field(
         default=False,
         metadata={"help": "Whether or not to compute WER and CER for generation-based evaluation."},

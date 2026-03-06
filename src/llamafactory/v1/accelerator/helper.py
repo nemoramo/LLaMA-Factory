@@ -27,7 +27,6 @@ Including:
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
-from enum import StrEnum, unique
 from functools import lru_cache, wraps
 from typing import Optional
 
@@ -35,6 +34,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from ...extras.compat import StrEnum, unique
 from ..utils.types import ProcessGroup, Tensor, TensorLike
 
 

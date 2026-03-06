@@ -11,11 +11,12 @@
 
 ## 0. 配置索引（按模型）
 
-### Qwen3 (Instruct)
+### Qwen3 / Qwen3.5
 
-- Qwen3-0.6B / Qwen3-1.7B
+- Qwen3-0.6B / Qwen3-1.7B / Qwen3.5-0.8B-Base
   - 通用训练配置（neat packing + LoRA + FlashAttention-2）：`examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml`
   - 通用导出配置（merge LoRA）：`examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_export.yaml`
+  - 使用 Qwen3.5-0.8B-Base 时，额外覆盖：`model_name_or_path=Qwen/Qwen3.5-0.8B-Base template=qwen3_5_nothink`
 
 ### Qwen2.5 (Instruct)
 
@@ -84,8 +85,8 @@ python examples/speech_endpointing/convert_torchtune_manifest.py \
 ```bash
 python examples/speech_endpointing/convert_torchtune_manifest.py \
   --input /path/to/test_set.manifest \
-  --output /path/to/speech_endpointing_eval.jsonl \
-  --print-dataset-info --dataset-key speech_endpointing_eval
+  --output /path/to/speech_endpointing_valid.jsonl \
+  --print-dataset-info --dataset-key speech_endpointing_valid
 ```
 
 > 常见文件名可能是 `train_set.manifest/test_set.manifest` 或 `trainset.manifest/testset.manifest`，按实际路径传入即可。
@@ -112,8 +113,8 @@ python examples/speech_endpointing/convert_torchtune_manifest.py \
       "function_tag": "function"
     }
   },
-  "speech_endpointing_eval": {
-    "file_name": "speech_endpointing_eval.jsonl",
+  "speech_endpointing_valid": {
+    "file_name": "speech_endpointing_valid.jsonl",
     "formatting": "openai",
     "columns": { "messages": "messages" },
     "tags": {
@@ -131,7 +132,7 @@ python examples/speech_endpointing/convert_torchtune_manifest.py \
 
 然后把你的训练/验证文件放到同目录下：
 - `${DATASET_DIR}/speech_endpointing_train.jsonl`
-- `${DATASET_DIR}/speech_endpointing_eval.jsonl`
+- `${DATASET_DIR}/speech_endpointing_valid.jsonl`
 
 ---
 
@@ -139,7 +140,11 @@ python examples/speech_endpointing/convert_torchtune_manifest.py \
 
 编辑配置：`examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml`
 
-你需要至少修改：
+推荐数据文件命名：
+- **训练集**: `${DATASET_DIR}/speech_endpointing_train.jsonl`
+- **验证集**: `${DATASET_DIR}/speech_endpointing_valid.jsonl`
+
+如需使用其他数据，修改：
 - `model_name_or_path`: 选择 `Qwen/Qwen3-0.6B` 或 `Qwen/Qwen3-1.7B`
 - `dataset_dir`
 - `dataset` / `eval_dataset`
@@ -163,6 +168,42 @@ GPU_ID=0 CFG=examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_
     dataset_dir=/path/to/your/dataset_dir \
     output_dir=/path/to/output_dir
 ```
+
+如果你要复现当前的 **Qwen3.5-0.8B-Base + no thinking + 0202 数据** 单卡实验，可以直接覆盖以下字段：
+
+```bash
+PROJECT_ROOT=/path/to/LLaMA-Factory \
+DATASET_DIR=/path/to/your/dataset_dir \
+OUTPUT_DIR=/path/to/output/qwen3_5_0_8b_base_lora_neatpacking \
+PYTHON_BIN=/path/to/your/python \
+HOME=/path/to/runtime_home \
+TMPDIR=/path/to/runtime_tmp \
+XDG_CACHE_HOME=/path/to/xdg_cache \
+HF_HOME=/path/to/hf_cache \
+HF_HUB_CACHE=/path/to/hf_cache/hub \
+TORCH_HOME=/path/to/torch_cache \
+TORCH_EXTENSIONS_DIR=/path/to/torch_extensions \
+CUDA_VISIBLE_DEVICES=5 \
+DISABLE_VERSION_CHECK=1 \
+ALLOW_TORCH_2_9_CONV3D=1 \
+PYTHONPATH=${PROJECT_ROOT}/src \
+${PYTHON_BIN} -m llamafactory.cli train \
+  ${PROJECT_ROOT}/examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
+  model_name_or_path=Qwen/Qwen3.5-0.8B-Base \
+  template=qwen3_5_nothink \
+  dataset_dir=${DATASET_DIR} \
+  dataset=speech_endpointing_train \
+  eval_dataset=speech_endpointing_valid \
+  output_dir=${OUTPUT_DIR} \
+  overwrite_output_dir=false \
+  report_to=none \
+  plot_loss=false
+```
+
+说明：
+- `report_to=none`：当前环境若未安装 `tensorboard`，需要关闭默认 TensorBoard callback。
+- `plot_loss=false`：当前环境若未安装 `matplotlib`，需要关闭 loss 曲线绘图。
+- `HOME/TMPDIR/HF_HOME/...`：把 cache、临时文件和 torch extensions 放到 `/data*`，避免实验产物写进 `home` 或 `/root`。
 
 例如：复现"单卡 + 频繁评估 + 训练 3 epoch（续训）"这类变体，不需要单独维护 YAML，只要覆盖少量字段：
 
@@ -236,8 +277,30 @@ endpointing 需要"只生成 1 个标签"：
 
 ---
 
-## 8. 常见坑
+## 8. 评估口径
+
+speech endpointing 目前有 3 套常用评估口径，含义不同：
+
+- **Trainer 内评估（推荐）**：开启 `compute_endpointing_metrics: true`
+  - 3-way 原始标签指标：`eval_label_acc`、`eval_label_macro_f1`、`eval_label_far_unad`、`eval_label_interrupt`、`eval_label_delay`、`eval_label_missed`
+  - 2-way merge 指标：`eval_merged_label_acc`、`eval_merged_label_macro_f1`、`eval_merged_label_interrupt`、`eval_merged_label_delay`
+  - 其中 `merged_label_*` 等价于 `treat_unaddressed_as_eou=true`
+  - 当前 generic Qwen3 recipe 默认用 `metric_for_best_model: eval_label_acc`
+
+- **`eval_hf_endpointing.py`**：直接对本地 HF / merged 模型做离线评估
+  - 默认只输出 merge 后的 2-way 指标
+  - `summary.json` 里的字段是 `metrics_merge_unaddressed_as_eou`
+  - 适合快速检查合并后模型的离线精度
+
+- **`eval_sglang_endpointing.py`**：对已部署的 OpenAI-compatible 服务做评估
+  - 同时输出 `tag_eval`（等价于 `treat_unaddressed_as_eou=false`）
+  - 以及 `tag_eval_merge_unad_as_eou`（等价于 `treat_unaddressed_as_eou=true`）
+  - 适合对齐线上服务逻辑与真实部署 KPI
+
+---
+
+## 9. 常见坑
 
 - **量化训练**：4/8bit 通常无法 resize embedding（会报错）；请先用 BF16/FP16 跑通。
 - **assistant 输出污染**：assistant 一旦输出了多余字符（比如 `"<EOU>\n"` 或 `" <EOU>"`），就不再是严格单 token 分类，评估会变得不稳定。
-- **评估指标**：本 recipe 用 `compute_accuracy`（token-level），前提是 assistant 段尽量只包含标签 token（推荐 `max_new_tokens=1` 推理时再做严格分类评估）。
+- **评估指标**：speech endpointing 推荐开启 `compute_endpointing_metrics`。它会以 assistant 监督段的第一个标签 token 作为分类目标，输出 `label_acc`、`label_macro_f1`、`label_far_unad`、`label_interrupt`、`label_delay`、`label_missed`，并额外输出 `merged_label_*`（等价于 `treat_unaddressed_as_eou=true`）。legacy `accuracy` 仍会保留为 token-level 对照指标。

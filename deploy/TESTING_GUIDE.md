@@ -2,6 +2,12 @@
 
 本文档介绍如何使用 vLLM 部署并测试训练完成的 Speech Endpointing 模型。
 
+默认假设：
+- 训练阶段用 `compute_endpointing_metrics: true`
+- best checkpoint 由 `eval_label_acc`（3-way label accuracy）选择
+- 部署后既关心 `treat_unaddressed_as_eou=false` 的 3-way 指标，也关心 `treat_unaddressed_as_eou=true` 的 2-way merge 指标
+- 文中的 `${PROJECT_ROOT}`、`${MODEL_DIR}` 等均为占位符，请替换成你的本地路径
+
 ## 测试流程概览
 
 ```
@@ -17,7 +23,7 @@
 ```bash
 # 导出 LoRA 模型（如果还没做）
 llamafactory-cli export examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_export.yaml \
-  model_name_or_path=Qwen/Qwen3-0.6B \
+  model_name_or_path=Qwen/Qwen3.5-0.8B-Base \
   adapter_name_or_path=/path/to/your/checkpoint-XXXX \
   export_dir=/path/to/exported_model
 ```
@@ -35,7 +41,7 @@ ls /path/to/exported_model/
 ### 2.1 进入部署目录
 
 ```bash
-cd /home/mayufeng/projects/LLaMA-Factory/deploy/vllm_endpointing_grpc/
+cd ${PROJECT_ROOT}/deploy/vllm_endpointing_grpc/
 ```
 
 ### 2.2 构建 Docker 镜像（首次）
@@ -87,7 +93,7 @@ INFO:     Uvicorn running on http://0.0.0.0:50051 (Press CTRL+C to quit)
 #### 3.1.1 进入 WebUI 目录
 
 ```bash
-cd /home/mayufeng/projects/LLaMA-Factory/deploy/endpointing_webui/
+cd ${PROJECT_ROOT}/deploy/endpointing_webui/
 ```
 
 #### 3.1.2 安装依赖
@@ -146,7 +152,7 @@ python app.py
 # apt install grpcurl   # Ubuntu
 
 # 测试单条
-cd /home/mayufeng/projects/LLaMA-Factory/deploy/vllm_endpointing_grpc/
+cd ${PROJECT_ROOT}/deploy/vllm_endpointing_grpc/
 
 grpcurl -plaintext \
   -proto endpointing.proto \
@@ -179,7 +185,7 @@ grpcurl -plaintext \
 #### 3.2.2 使用 Python 脚本
 
 ```bash
-cd /home/mayufeng/projects/LLaMA-Factory/deploy/vllm_endpointing_grpc/
+cd ${PROJECT_ROOT}/deploy/vllm_endpointing_grpc/
 
 python3 - <<'PY'
 import grpc
@@ -209,17 +215,62 @@ PY
 
 ---
 
-## 第四步：批量评估（离线）
+## 第四步：批量评估（离线 / 服务）
 
-使用提供的评估脚本对验证集进行批量评估：
+### 4.1 直接评估本地 HF / merged 模型
 
 ```bash
-cd /home/mayufeng/projects/LLaMA-Factory/examples/speech_endpointing/
+cd ${PROJECT_ROOT}/examples/speech_endpointing/
 
 python eval_hf_endpointing.py \
-  --model_path /path/to/your/exported_model \
-  --test_file /path/to/your/test.jsonl \
-  --output_file results.jsonl
+  --base-model /path/to/your/exported_model \
+  --dataset /path/to/your/test.jsonl \
+  --out-dir /path/to/eval_hf_out
+```
+
+输出：
+- `/path/to/eval_hf_out/pred.jsonl`
+- `/path/to/eval_hf_out/summary.json`
+
+说明：
+- `eval_hf_endpointing.py` 当前默认只统计 **merge 后** 的 2-way 指标
+- `summary.json` 里的关键字段是 `metrics_merge_unaddressed_as_eou`
+- 适合快速检查导出模型在 `treat_unaddressed_as_eou=true` 口径下的效果
+
+### 4.2 评估已部署的 OpenAI-compatible 服务
+
+如果你想同时拿到：
+- `treat_unaddressed_as_eou=false` 的 3-way tag KPI
+- `treat_unaddressed_as_eou=true` 的 merge KPI
+
+使用 `eval_sglang_endpointing.py` 对 vLLM HTTP 端口评估：
+
+```bash
+cd ${PROJECT_ROOT}/examples/speech_endpointing/
+
+python eval_sglang_endpointing.py \
+  --input /path/to/your/test.jsonl \
+  --base-url http://127.0.0.1:30000 \
+  --model endpointing-judge-v1 \
+  --out-dir /path/to/sglang_eval_out
+```
+
+输出：
+- `pred_<model>_<run_id>.jsonl`
+- `summary_<model>_<run_id>.json`
+
+其中 summary 里最重要的两个字段是：
+- `tag_eval`
+  - 等价于 `treat_unaddressed_as_eou=false`
+  - 包含 `accuracy`、`per_label`、`kpi.FAR_unad/Interrupt/Delay/Missed`
+- `tag_eval_merge_unad_as_eou`
+  - 等价于 `treat_unaddressed_as_eou=true`
+  - 包含 `accuracy`、`per_label`、`kpi.Interrupt/Delay`
+
+如果容器没有暴露 `30000`，记得在 `docker run` 时保留：
+
+```bash
+-p 30000:30000
 ```
 
 ---
@@ -241,6 +292,7 @@ python eval_hf_endpointing.py \
 | `eou_threshold` | EOU 决策阈值 | 0.5-0.7 |
 | `treat_unaddressed_as_eou` | 将 UNADDRESSED 视为 EOU | true（生产环境） |
 | `logit_bias` | 强制输出三个标签之一 | 100 |
+| `eval_label_acc` | 训练内 best checkpoint 指标 | 推荐 |
 
 ### 概率计算逻辑
 
@@ -251,6 +303,13 @@ python eval_hf_endpointing.py \
    - `P(UNADDRESSED) = 0`
    - 重新归一化
 4. 如果 `P(EOU) < eou_threshold`，返回 `<CONT_USER>`
+
+### 训练内指标 vs 部署指标
+
+- 训练内 `eval_label_acc`：3-way 标签精度，用于选 best checkpoint
+- 训练内 `eval_merged_label_acc`：把 `<UNADDRESSED>` 合并到 `<EOU>` 后的 2-way 精度
+- 部署时 `treat_unaddressed_as_eou=true`：更接近线上最终决策
+- 因此建议同时看 3-way 与 merge 两套结果，不要只看单一 accuracy
 
 ---
 
@@ -294,3 +353,4 @@ docker stop $(docker ps -q --filter ancestor=vllm-endpointing-grpc:latest)
 - `deploy/vllm_endpointing_grpc/README.md` - vLLM 服务详细文档
 - `deploy/endpointing_webui/README.md` - WebUI 详细文档
 - `examples/speech_endpointing/eval_hf_endpointing.py` - 批量评估脚本
+- `examples/speech_endpointing/eval_sglang_endpointing.py` - 服务评估脚本（同时输出 merge / unmerged KPI）

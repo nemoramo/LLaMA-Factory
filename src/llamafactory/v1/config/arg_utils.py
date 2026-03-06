@@ -17,8 +17,8 @@
 
 
 import json
-from enum import StrEnum, unique
 
+from ...extras.compat import StrEnum, unique
 
 class PluginConfig(dict):
     """Dictionary that allows attribute access."""

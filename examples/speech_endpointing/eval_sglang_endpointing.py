@@ -413,7 +413,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--input",
-        default="/data2/mayufeng/llama_data/speech_endpointing/speech_endpointing_eval.jsonl",
+        default=os.path.join(os.path.dirname(__file__), "speech_endpointing_sample.jsonl"),
         help="Eval JSONL in LLaMA-Factory OpenAI messages format.",
     )
     ap.add_argument(
@@ -428,7 +428,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--out-dir",
-        default="/data2/mayufeng/llama_output/speech_endpointing/sglang_eval",
+        default="./sglang_eval_out",
         help="Directory to write outputs.",
     )
     ap.add_argument("--max-workers", type=int, default=32)

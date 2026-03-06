@@ -33,7 +33,7 @@ from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push, create_ref_model
-from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
+from .metric import ComputeAccuracy, ComputeEndpointingMetrics, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
 
 
@@ -95,6 +95,8 @@ def run_sft(
     if model_args.use_kt:
         if training_args.predict_with_generate:
             raise NotImplementedError("`predict_with_generate` is not supported in KTransformers SFT yet.")
+        elif finetuning_args.compute_endpointing_metrics:
+            raise NotImplementedError("`compute_endpointing_metrics` is not supported in KTransformers SFT yet.")
         elif finetuning_args.compute_accuracy:
             raise NotImplementedError("`compute_accuracy` is not supported in KTransformers SFT yet.")
 
@@ -102,6 +104,9 @@ def run_sft(
         metric_module["compute_metrics"] = ComputeSimilarity(
             tokenizer=tokenizer, compute_wer_cer=finetuning_args.compute_wer_cer
         )
+    elif finetuning_args.compute_endpointing_metrics:
+        metric_module["compute_metrics"] = ComputeEndpointingMetrics(tokenizer=tokenizer)
+        metric_module["preprocess_logits_for_metrics"] = eval_logit_processor
     elif finetuning_args.compute_accuracy:
         metric_module["compute_metrics"] = ComputeAccuracy()
         metric_module["preprocess_logits_for_metrics"] = eval_logit_processor

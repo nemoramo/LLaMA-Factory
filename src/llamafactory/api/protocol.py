@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import time
-from enum import StrEnum, unique
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+from ..extras.compat import StrEnum, unique
 
 
 @unique

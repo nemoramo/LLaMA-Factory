@@ -2,7 +2,7 @@
 
 ## 概述
 
-本目录包含使用 Qwen3 (0.6B / 1.7B) 训练语音端点检测 (Speech Endpointing) 模型的通用 YAML 配置文件。
+本目录包含使用 Qwen3 (0.6B / 1.7B) 以及 `Qwen/Qwen3.5-0.8B-Base` 训练语音端点检测 (Speech Endpointing) 模型的通用 YAML 配置文件。
 
 ## 核心特性
 
@@ -17,8 +17,9 @@
 #### 关键参数说明
 
 **模型设置:**
-- `model_name_or_path`: 基础模型路径 (Qwen/Qwen3-0.6B 或 Qwen/Qwen3-1.7B)
-- `template`: qwen3_nothink - 使用 Qwen3 ChatML 格式，禁用思考模式
+- `model_name_or_path`: 基础模型路径 (`Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B` 或 `Qwen/Qwen3.5-0.8B-Base`)
+- `template`: 默认 `qwen3_nothink`
+- 如果底模换成 `Qwen/Qwen3.5-0.8B-Base`，需要额外覆盖 `template=qwen3_5_nothink`
 - `flash_attn: fa2`: 启用 FlashAttention-2
 - `add_special_tokens`: 添加 3 个端点检测标签 token
   - `<EOU>`: End of Utterance - 用户发言结束
@@ -54,7 +55,11 @@ gradient_accumulation_steps: 4
 ```
 
 **评估设置:**
-- `compute_accuracy: true`: 计算 token 级别准确率
+- `compute_endpointing_metrics: true`: 计算 endpointing 的 label-level 指标
+- 会额外输出 `label_acc`、`label_macro_f1`、`label_far_unad`、`label_interrupt`、`label_delay`、`label_missed`
+- 同时输出 `merged_label_*` 指标，对应 `treat_unaddressed_as_eou=true`
+- 仍会保留 legacy `accuracy`（token-level）供对照
+- `metric_for_best_model: eval_label_acc`: 用 3-way label accuracy 选择 best checkpoint
 - `predict_with_generate: false`: 不使用生成模式评估
 - `max_new_tokens: 1`: 只生成一个 token (分类任务)
 
@@ -105,6 +110,26 @@ llamafactory-cli train qwen3_speech_endpointing_lora_neat_packing_fa2.yaml
 
 # 导出
 llamafactory-cli export qwen3_speech_endpointing_lora_export.yaml
+```
+
+如果你要切到 `Qwen3.5-0.8B-Base`，推荐直接用 overrides：
+
+```bash
+llamafactory-cli train qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
+  model_name_or_path=Qwen/Qwen3.5-0.8B-Base \
+  template=qwen3_5_nothink \
+  dataset_dir=/path/to/your/dataset_dir \
+  dataset=speech_endpointing_train \
+  eval_dataset=speech_endpointing_valid \
+  output_dir=/path/to/output/qwen3_5_0_8b_base_lora_neatpacking \
+  overwrite_output_dir=false \
+  metric_for_best_model=eval_label_acc
+```
+
+如果当前环境缺 `tensorboard` 或 `matplotlib`，再额外覆盖：
+
+```bash
+report_to=none plot_loss=false
 ```
 
 ## 不同模型大小的配置差异

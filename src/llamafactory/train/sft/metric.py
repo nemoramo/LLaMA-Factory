@@ -52,6 +52,14 @@ if is_rouge_available():
 
 logger = logging.get_logger(__name__)
 
+ENDPOINTING_TAGS = ("<EOU>", "<CONT_USER>", "<UNADDRESSED>")
+MERGED_ENDPOINTING_TAGS = ("<EOU>", "<CONT_USER>")
+ENDPOINTING_TAG_NAME_MAP = {
+    "<EOU>": "eou",
+    "<CONT_USER>": "cont_user",
+    "<UNADDRESSED>": "unaddressed",
+}
+
 
 def eval_logit_processor(logits: "torch.Tensor", labels: "torch.Tensor") -> "torch.Tensor":
     r"""Compute the token with the largest likelihood to reduce memory footprint."""
@@ -89,6 +97,161 @@ class ComputeAccuracy:
             pred, label = preds[i, :-1], labels[i, 1:]
             label_mask = label != IGNORE_INDEX
             self.score_dict["accuracy"].append(np.mean(pred[label_mask] == label[label_mask]))
+
+        if compute_result:
+            return self._dump()
+
+
+def _safe_div(num: float, den: float) -> float:
+    return float(num) / float(den) if den else 0.0
+
+
+def _merge_unaddressed_as_eou(tag: str) -> str:
+    return "<EOU>" if tag == "<UNADDRESSED>" else tag
+
+
+def _init_confusion(tags: tuple[str, ...]) -> dict[str, dict[str, int]]:
+    return {gold: {pred: 0 for pred in tags} for gold in tags}
+
+
+def _summarize_confusion(
+    confusion: dict[str, dict[str, int]], row_totals: dict[str, int], tags: tuple[str, ...]
+) -> dict[str, dict[str, dict[str, float]] | float]:
+    total = sum(row_totals.values())
+    correct = sum(confusion[tag][tag] for tag in tags)
+    col_totals = {pred: sum(confusion[gold][pred] for gold in tags) for pred in tags}
+
+    per_label: dict[str, dict[str, float]] = {}
+    macro_f1 = 0.0
+    for tag in tags:
+        tp = confusion[tag][tag]
+        precision = _safe_div(tp, col_totals[tag])
+        recall = _safe_div(tp, row_totals[tag])
+        f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        per_label[tag] = {"precision": precision, "recall": recall, "f1": f1}
+        macro_f1 += f1
+
+    return {
+        "accuracy": _safe_div(correct, total),
+        "macro_f1": macro_f1 / float(len(tags)) if tags else 0.0,
+        "per_label": per_label,
+    }
+
+
+@dataclass
+class ComputeEndpointingMetrics:
+    r"""Compute endpointing label metrics on the first supervised tag token."""
+
+    tokenizer: "PreTrainedTokenizer"
+
+    def _dump(self) -> Optional[dict[str, float]]:
+        result = None
+        if hasattr(self, "token_accuracy"):
+            label_summary = _summarize_confusion(self.label_confusion, self.label_row_totals, ENDPOINTING_TAGS)
+            merged_summary = _summarize_confusion(
+                self.merged_label_confusion,
+                self.merged_label_row_totals,
+                MERGED_ENDPOINTING_TAGS,
+            )
+            result = {
+                "accuracy": float(np.mean(self.token_accuracy)) if self.token_accuracy else 0.0,
+                "label_acc": float(label_summary["accuracy"]),
+                "label_macro_f1": float(label_summary["macro_f1"]),
+                "label_valid_ratio": _safe_div(self.label_total - self.label_invalid_count, self.label_total),
+                "label_far_unad": _safe_div(
+                    self.label_row_totals["<UNADDRESSED>"] - self.label_confusion["<UNADDRESSED>"]["<UNADDRESSED>"],
+                    self.label_row_totals["<UNADDRESSED>"],
+                ),
+                "label_interrupt": _safe_div(
+                    self.label_confusion["<CONT_USER>"]["<EOU>"],
+                    self.label_row_totals["<CONT_USER>"],
+                ),
+                "label_delay": _safe_div(
+                    self.label_confusion["<EOU>"]["<CONT_USER>"],
+                    self.label_row_totals["<EOU>"],
+                ),
+                "label_missed": _safe_div(
+                    self.label_confusion["<EOU>"]["<UNADDRESSED>"],
+                    self.label_row_totals["<EOU>"],
+                ),
+                "merged_label_acc": float(merged_summary["accuracy"]),
+                "merged_label_macro_f1": float(merged_summary["macro_f1"]),
+                "merged_label_interrupt": _safe_div(
+                    self.merged_label_confusion["<CONT_USER>"]["<EOU>"],
+                    self.merged_label_row_totals["<CONT_USER>"],
+                ),
+                "merged_label_delay": _safe_div(
+                    self.merged_label_confusion["<EOU>"]["<CONT_USER>"],
+                    self.merged_label_row_totals["<EOU>"],
+                ),
+            }
+
+            for tag, short_name in ENDPOINTING_TAG_NAME_MAP.items():
+                per_label = label_summary["per_label"][tag]
+                result[f"label_precision_{short_name}"] = float(per_label["precision"])
+                result[f"label_recall_{short_name}"] = float(per_label["recall"])
+                result[f"label_f1_{short_name}"] = float(per_label["f1"])
+
+            for tag in MERGED_ENDPOINTING_TAGS:
+                short_name = ENDPOINTING_TAG_NAME_MAP[tag]
+                per_label = merged_summary["per_label"][tag]
+                result[f"merged_label_precision_{short_name}"] = float(per_label["precision"])
+                result[f"merged_label_recall_{short_name}"] = float(per_label["recall"])
+                result[f"merged_label_f1_{short_name}"] = float(per_label["f1"])
+
+        self.token_accuracy: list[float] = []
+        self.label_total = 0
+        self.label_invalid_count = 0
+        self.label_confusion = _init_confusion(ENDPOINTING_TAGS)
+        self.label_row_totals = {tag: 0 for tag in ENDPOINTING_TAGS}
+        self.merged_label_confusion = _init_confusion(MERGED_ENDPOINTING_TAGS)
+        self.merged_label_row_totals = {tag: 0 for tag in MERGED_ENDPOINTING_TAGS}
+        return result
+
+    def __post_init__(self):
+        self.tag_token_ids = {}
+        missing_tags = []
+        for tag in ENDPOINTING_TAGS:
+            token_id = self.tokenizer.convert_tokens_to_ids(tag)
+            round_trip = self.tokenizer.convert_ids_to_tokens(token_id) if token_id is not None else None
+            if token_id is None or int(token_id) < 0 or round_trip != tag:
+                missing_tags.append(tag)
+                continue
+            self.tag_token_ids[int(token_id)] = tag
+
+        if missing_tags:
+            raise ValueError(f"Endpointing metrics require tokenizer to contain tags: {', '.join(missing_tags)}.")
+
+        self._dump()
+
+    def __call__(self, eval_preds: "EvalPrediction", compute_result: bool = True) -> Optional[dict[str, float]]:
+        preds, labels = numpify(eval_preds.predictions), numpify(eval_preds.label_ids)
+        for i in range(len(preds)):
+            pred, label = preds[i, :-1], labels[i, 1:]
+            label_mask = label != IGNORE_INDEX
+            if not np.any(label_mask):
+                continue
+
+            self.token_accuracy.append(np.mean(pred[label_mask] == label[label_mask]))
+
+            first_label_pos = int(np.flatnonzero(label_mask)[0])
+            gold_tag = self.tag_token_ids.get(int(label[first_label_pos]))
+            if gold_tag not in ENDPOINTING_TAGS:
+                continue
+
+            pred_tag = self.tag_token_ids.get(int(pred[first_label_pos]), "OTHER")
+            self.label_total += 1
+            self.label_row_totals[gold_tag] += 1
+            if pred_tag in ENDPOINTING_TAGS:
+                self.label_confusion[gold_tag][pred_tag] += 1
+            else:
+                self.label_invalid_count += 1
+
+            merged_gold_tag = _merge_unaddressed_as_eou(gold_tag)
+            self.merged_label_row_totals[merged_gold_tag] += 1
+            if pred_tag in ENDPOINTING_TAGS:
+                merged_pred_tag = _merge_unaddressed_as_eou(pred_tag)
+                self.merged_label_confusion[merged_gold_tag][merged_pred_tag] += 1
 
         if compute_result:
             return self._dump()

@@ -29,7 +29,7 @@ from transformers import (
 from trl import AutoModelForCausalLMWithValueHead
 
 from ..extras import logging
-from ..extras.misc import count_parameters, skip_check_imports, try_download_model_from_other_hub
+from ..extras.misc import count_parameters, is_env_enabled, skip_check_imports, try_download_model_from_other_hub
 from ..extras.packages import is_torch_version_greater_than
 from .adapter import init_adapter
 from .model_utils.ktransformers import load_kt_pretrained_model
@@ -370,12 +370,20 @@ def load_model(
     # Conv3D is not recommended when using torch 2.9.x
     if is_torch_version_greater_than("2.9.0") and not is_torch_version_greater_than("2.10.0"):
         if any(isinstance(m, torch.nn.Conv3d) for m in model.modules()):
-            raise ValueError(
-                "Unsupported torch version detected: torch 2.9.x with Conv3D. "
-                "This combination is known to cause severe performance regression. "
-                "Please downgrade torch to <2.9 or remove Conv3D. "
-                "See https://github.com/pytorch/pytorch/issues/166122"
-            )
+            if is_env_enabled("ALLOW_TORCH_2_9_CONV3D"):
+                logger.warning_rank0(
+                    "Detected torch 2.9.x with Conv3D, but continuing because "
+                    "`ALLOW_TORCH_2_9_CONV3D=1` is set. This may trigger severe performance regression. "
+                    "See https://github.com/pytorch/pytorch/issues/166122"
+                )
+            else:
+                raise ValueError(
+                    "Unsupported torch version detected: torch 2.9.x with Conv3D. "
+                    "This combination is known to cause severe performance regression. "
+                    "Please downgrade torch to <2.9 or remove Conv3D. "
+                    "To override explicitly, set `ALLOW_TORCH_2_9_CONV3D=1`. "
+                    "See https://github.com/pytorch/pytorch/issues/166122"
+                )
 
     if not is_trainable:
         model.requires_grad_(False)
