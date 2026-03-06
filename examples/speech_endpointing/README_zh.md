@@ -217,6 +217,43 @@ llamafactory-cli train examples/speech_endpointing/qwen3/generic/qwen3_speech_en
   num_train_epochs=3.0
 ```
 
+### 训练过程中的指标查看
+
+不要只依赖 `tail -f` 训练日志。每次保存出来的 checkpoint 目录里都会有一个 `trainer_state.json`，里面会保留结构化的 eval 结果和 best-checkpoint 状态，例如：
+
+```text
+${OUTPUT_DIR}/checkpoint-200/trainer_state.json
+${OUTPUT_DIR}/checkpoint-400/trainer_state.json
+...
+```
+
+对于 speech endpointing，建议重点看：
+- `eval_label_acc`：3 类原始标签准确率，对应 `treat_unaddressed_as_eou=false`
+- `eval_merged_label_acc`：把 `<UNADDRESSED>` 合并到 `<EOU>` 后的准确率，对应 `treat_unaddressed_as_eou=true`
+- `eval_label_macro_f1`
+- `eval_label_far_unad`
+- `eval_label_interrupt`
+- `eval_label_delay`
+- `eval_label_missed`
+- `best_metric` / `best_model_checkpoint`
+
+例如：
+
+```bash
+python - <<'PY'
+import json
+p = "/path/to/output_dir/checkpoint-400/trainer_state.json"
+d = json.load(open(p))
+print("best_metric:", d.get("best_metric"))
+print("best_model_checkpoint:", d.get("best_model_checkpoint"))
+for item in d.get("log_history", []):
+    if "eval_label_acc" in item:
+        print(item["step"], item["eval_label_acc"], item["eval_merged_label_acc"], item["eval_label_far_unad"])
+PY
+```
+
+如果想持续看结构化训练日志，也可以直接看 `${OUTPUT_DIR}/trainer_log.jsonl`。
+
 如需关闭 packing / neat packing（例如遇到版本兼容问题）：
 
 ```bash

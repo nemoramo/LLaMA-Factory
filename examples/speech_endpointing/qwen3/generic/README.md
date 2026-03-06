@@ -132,6 +132,38 @@ llamafactory-cli train qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
 report_to=none plot_loss=false
 ```
 
+#### 训练产物里的指标查看
+
+训练过程中，每次保存的 checkpoint 目录下都会带一个 `trainer_state.json`，可以直接查看该次 eval 的结构化指标，而不必只盯着 `tail -f` 日志：
+
+```text
+${OUTPUT_DIR}/checkpoint-200/trainer_state.json
+${OUTPUT_DIR}/checkpoint-400/trainer_state.json
+...
+```
+
+其中：
+- `eval_label_acc`：3-way label accuracy，对应 `treat_unaddressed_as_eou=false`
+- `eval_merged_label_acc`：把 `<UNADDRESSED>` 合并到 `<EOU>` 后的 accuracy，对应 `treat_unaddressed_as_eou=true`
+- `best_metric` / `best_model_checkpoint`：当前 best checkpoint 的主指标和值
+
+例如：
+
+```bash
+python - <<'PY'
+import json
+p = "/path/to/output_dir/checkpoint-400/trainer_state.json"
+d = json.load(open(p))
+print("best_metric:", d.get("best_metric"))
+print("best_model_checkpoint:", d.get("best_model_checkpoint"))
+for item in d.get("log_history", []):
+    if "eval_label_acc" in item:
+        print(item["step"], item["eval_label_acc"], item["eval_merged_label_acc"], item["eval_loss"])
+PY
+```
+
+如果需要持续看结构化日志，也可以直接查看 `${OUTPUT_DIR}/trainer_log.jsonl`。
+
 ## 不同模型大小的配置差异
 
 | 参数 | 0.6B | 1.7B |
