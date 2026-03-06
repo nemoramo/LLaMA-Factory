@@ -12,28 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import gc
 import os
 
 import torch
 import torch.nn as nn
+from peft.tuners.lora import LoraLayer
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
     fully_shard,
 )
-from transformers import PreTrainedModel
 
 from ....accelerator.helper import get_current_accelerator
 from ....accelerator.interface import DistributedInterface
 from ....utils.logging import get_logger
+from ....utils.types import HFModel, Processor
 
 
 logger = get_logger(__name__)
 
 
-def get_transformer_layer_cls(model: PreTrainedModel) -> type[nn.Module] | None:
+def get_transformer_layer_cls(model: HFModel) -> type[nn.Module] | None:
     no_split_modules = getattr(model, "_no_split_modules", None)
     if no_split_modules:
         if isinstance(no_split_modules, (list, tuple)):
@@ -47,6 +49,20 @@ def get_transformer_layer_cls(model: PreTrainedModel) -> type[nn.Module] | None:
         return type(model.layers[0])
 
     return None
+
+
+def save_model(model: HFModel, output_dir: str, processor: Processor) -> None:
+    if DistributedInterface().get_rank() == 0:
+        logger.info("Gathering state dict for saving...")
+
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    state_dict = get_model_state_dict(model, options=options)
+
+    if DistributedInterface().get_rank() == 0:
+        model_to_save = model.module if hasattr(model, "module") else model
+        model_to_save.save_pretrained(output_dir, state_dict=state_dict, max_shard_size="4GB")
+        processor.save_pretrained(output_dir, max_shard_size="4GB")
+        logger.info(f"Model saved to {output_dir}")
 
 
 class FSDP2Engine:
@@ -94,7 +110,10 @@ class FSDP2Engine:
             cast_forward_inputs=True,
         )
 
-    def prepare_model(self, model: PreTrainedModel) -> PreTrainedModel:
+    def is_lora_module_wrap(self, model) -> bool:
+        return any(isinstance(module, LoraLayer) for module in model.modules())
+
+    def prepare_model(self, model: HFModel) -> HFModel:
         if self.fsdp_mesh is None:
             logger.warning("No FSDP Mesh available, skipping FSDP wrapping.")
             return model
@@ -110,6 +129,25 @@ class FSDP2Engine:
         else:
             logger.info(f"Applying per-layer FSDP to {layer_cls.__name__}")
             transformer_layer_cls_to_wrap = {layer_cls}
+
+        if self.is_lora_module_wrap(model):
+            lora_modules = []
+            for module in model.modules():
+                if len(list(module.children())) != 0:
+                    continue
+                if any(param.requires_grad for param in module.parameters(recurse=False)):
+                    lora_modules.append(module)
+
+            for module in lora_modules:
+                fully_shard(
+                    module,
+                    mesh=self.fsdp_mesh,
+                    reshard_after_forward=self.reshard_after_forward,
+                    mp_policy=mp_policy,
+                    offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
+                )
+
+            logger.info("Applying FSDP wrap for LoRA layer separately.")
 
         for name, module in model.named_modules():
             should_wrap = False
@@ -129,12 +167,11 @@ class FSDP2Engine:
                     offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
                 )
 
-        use_gradient_checkpointing = True  # Could be configurable
-        if use_gradient_checkpointing:
+        # BaseTrainer is the single source of truth for gradient checkpointing.
+        # FSDP2 only applies the input-grad compatibility hook when checkpointing is already enabled.
+        if getattr(model, "is_gradient_checkpointing", False):
             if self.rank == 0:
-                logger.info("Enabling gradient checkpointing (transformers native)...")
-
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                logger.info("Gradient checkpointing is enabled. Applying FSDP2 input grad preparation.")
 
             if hasattr(model, "enable_input_require_grads"):
                 model.enable_input_require_grads()
@@ -156,7 +193,7 @@ class FSDP2Engine:
         return model
 
     @torch.no_grad()
-    def materialize_and_load(self, model: PreTrainedModel, hf_model_path: str, dcp_path: str = None):
+    def materialize_and_load(self, model: HFModel, hf_model_path: str, dcp_path: str = None):
         if self.rank == 0:
             logger.info("Materializing sharded model params...")
 
@@ -176,15 +213,57 @@ class FSDP2Engine:
 
         return model
 
-    def shard_model(self, model: PreTrainedModel) -> PreTrainedModel:
+    def _save_non_persistent_buffers(self, model: HFModel) -> dict:
+        """Save non-persistent buffers, such as inv_freq."""
+        saved = {}
+        for mod_name, module in model.named_modules():
+            for buf_name in module._non_persistent_buffers_set:
+                fqn = f"{mod_name}.{buf_name}" if mod_name else buf_name
+                buf = getattr(module, buf_name, None)
+                if buf is not None:
+                    saved[fqn] = copy.deepcopy(buf)
+        if self.rank == 0 and saved:
+            logger.info(f"Saved {len(saved)} non-persistent buffers")
+        return saved
+
+    def _restore_non_persistent_buffers(self, model: HFModel, saved_buffers: dict):
+        """Register saved non-persistent buffers to model."""
+        if not saved_buffers:
+            return
+        device = get_current_accelerator()
+        for fqn, buf in saved_buffers.items():
+            buf = buf.to(device)
+            if "." in fqn:
+                parent_fqn, buf_name = fqn.rsplit(".", 1)
+                parent_module = model.get_submodule(parent_fqn)
+            else:
+                buf_name = fqn
+                parent_module = model
+            parent_module.register_buffer(buf_name, buf, persistent=False)
+        if self.rank == 0:
+            logger.info(f"Restored {len(saved_buffers)} non-persistent buffers")
+
+    def shard_model(self, model: HFModel) -> HFModel:
         if model.device.type == "meta":
+            non_persistent_buffers = self._save_non_persistent_buffers(model)
+
+            if getattr(model.config, "tie_word_embeddings", None):
+                model.tie_weights()
+
             model = self.prepare_model(model)
             model = self.materialize_and_load(model, hf_model_path=model.config.name_or_path, dcp_path=self.dcp_path)
+
+            # fix tied broken for no-fsdp-wrap case
+            if getattr(model.config, "tie_word_embeddings", None):
+                model.tie_weights()
+
+            self._restore_non_persistent_buffers(model, non_persistent_buffers)
+
         else:
             model = self.prepare_model(model)
         return model
 
-    def _load_from_dcp(self, model: PreTrainedModel, dcp_path: str):
+    def _load_from_dcp(self, model: HFModel, dcp_path: str):
         import torch.distributed.checkpoint as dcp
 
         try:
@@ -203,7 +282,7 @@ class FSDP2Engine:
             logger.error(f"Failed to load from DCP: {e}")
             raise e
 
-    def _load_weights_from_hf_checkpoint(self, model, hf_model_path):
+    def _load_weights_from_hf_checkpoint(self, model: HFModel, hf_model_path: str):
         import glob
         import json
 

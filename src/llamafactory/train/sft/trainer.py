@@ -20,7 +20,6 @@ import json
 import os
 import shutil
 import time
-from collections.abc import MutableMapping
 from contextlib import contextmanager
 from functools import partial
 from types import MethodType
@@ -372,6 +371,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         audio_total_duration_ready: bool | None = None,
         audio_duration_cache_path: str | None = None,
         audio_duration_expected_files: dict[str, tuple[int, int]] | None = None,
+        ref_model: Optional["torch.nn.Module"] = None,
         **kwargs,
     ) -> None:
         kwargs["processing_class"] = kwargs.pop("tokenizer")
@@ -429,14 +429,38 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         use_dft_loss = bool(getattr(finetuning_args, "use_dft_loss", False))
         use_chunked_ce_loss = bool(getattr(finetuning_args, "use_chunked_ce_loss", False))
+        use_asft_loss = bool(getattr(finetuning_args, "use_asft_loss", False))
         use_eaft_loss = bool(getattr(finetuning_args, "use_eaft_loss", False))
 
-        if use_dft_loss and use_chunked_ce_loss:
-            raise ValueError("`use_dft_loss` and `use_chunked_ce_loss` are mutually exclusive.")
-        if use_dft_loss and use_eaft_loss:
-            raise ValueError("`use_dft_loss` and `use_eaft_loss` are mutually exclusive.")
-        if use_chunked_ce_loss and use_eaft_loss:
-            raise ValueError("`use_chunked_ce_loss` and `use_eaft_loss` are mutually exclusive.")
+        enabled_loss_modes = sum(int(flag) for flag in [use_dft_loss, use_chunked_ce_loss, use_asft_loss, use_eaft_loss])
+        if enabled_loss_modes > 1:
+            raise ValueError(
+                "`use_dft_loss`, `use_chunked_ce_loss`, `use_asft_loss` and `use_eaft_loss` are mutually exclusive."
+            )
+
+        self.ref_model = ref_model
+
+        if ref_model is not None:
+            from trl.models.utils import prepare_deepspeed, prepare_fsdp
+
+            if getattr(self.accelerator.state, "deepspeed_plugin", None) is not None:
+                if not (
+                    getattr(ref_model, "is_loaded_in_8bit", False) or getattr(ref_model, "is_loaded_in_4bit", False)
+                ):  # quantized models are already set on the correct device
+                    self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+            elif getattr(self.accelerator.state, "fsdp_plugin", None) is not None:
+                if self.accelerator.is_fsdp2:
+                    from accelerate.utils.fsdp_utils import fsdp2_prepare_model
+
+                    self.ref_model = fsdp2_prepare_model(self.accelerator, self.ref_model)
+                else:
+                    self.ref_model = prepare_fsdp(self.ref_model, self.accelerator)
+            else:
+                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+                self.ref_model.eval()
+
+        if use_asft_loss and self.ref_model is None:
+            raise ValueError("`ref_model` is required when `use_asft_loss=True`.")
 
         if use_dft_loss:
             from ..trainer_utils import dft_loss_func
@@ -461,6 +485,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 num_output_chunks=int(getattr(finetuning_args, "chunked_ce_num_chunks", 8)),
                 upcast_logits=bool(getattr(finetuning_args, "chunked_ce_upcast_logits", True)),
                 shift_labels=shift_labels,
+            )
+        elif use_asft_loss:
+            from ..trainer_utils import asft_loss_func
+
+            self.compute_loss_func = partial(
+                asft_loss_func,
+                asft_alpha=finetuning_args.asft_alpha,
             )
 
         if bool(getattr(training_args, "fp8", False)) and hasattr(self, "accelerator"):  # verify FP8 status
@@ -980,7 +1011,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
             return (loss, outputs) if return_outputs else loss
 
-        if self.compute_loss_func is not None:
+        if self.finetuning_args.use_asft_loss:
+            if self.ref_model is None:
+                raise ValueError("`ref_model` is required when `use_asft_loss=True`.")
+
+            with torch.no_grad():
+                ref_outputs = self.ref_model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask", None),
+                )
+                ref_logits = ref_outputs.logits
+
+            loss = self.compute_loss_func(outputs, labels, ref_logits)
+        elif self.compute_loss_func is not None:
             loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
         else:
             # Label smoothing for decoder-only models: shift labels by 1 token.

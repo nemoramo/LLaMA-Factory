@@ -459,6 +459,18 @@ class ReasoningTemplate(Template):
         return [(encoded_messages[i], encoded_messages[i + 1]) for i in range(0, len(encoded_messages), 2)]
 
 
+@dataclass
+class Glm47ReasoningTemplate(ReasoningTemplate):
+    r"""GLM-4.7 uses only the closing </think> tag for empty thinking blocks."""
+
+    @override
+    def add_thought(self, content: str = "") -> str:
+        if not content:
+            return self.thought_words[1]
+
+        return self.thought_words[0] + content + self.thought_words[1]
+
+
 TEMPLATES: dict[str, "Template"] = {}
 
 
@@ -1053,6 +1065,39 @@ register_template(
     efficient_eos=True,
     mm_plugin=get_mm_plugin(name="glm4v", image_token="<|image|>", video_token="<|video|>"),
     template_class=ReasoningTemplate,
+)
+
+
+# copied from glm4 template
+register_template(
+    name="glm_ocr",
+    format_user=StringFormatter(slots=["<|user|>\n{{content}}<|assistant|>"]),
+    format_assistant=StringFormatter(slots=["\n{{content}}"]),
+    format_system=StringFormatter(slots=["<|system|>\n{{content}}"]),
+    format_function=FunctionFormatter(slots=["{{content}}"], tool_format="glm4"),
+    format_observation=StringFormatter(slots=["<|observation|>\n{{content}}<|assistant|>"]),
+    format_tools=ToolFormatter(tool_format="glm4"),
+    format_prefix=EmptyFormatter(slots=["[gMASK]<sop>"]),
+    stop_words=["<|user|>", "<|observation|>"],
+    efficient_eos=True,
+    mm_plugin=get_mm_plugin(name="glm4v", image_token="<|image|>", video_token="<|video|>"),
+)
+
+
+# copied from glm4_moe template
+register_template(
+    name="glm4_7",
+    format_user=StringFormatter(slots=["<|user|>\n{{content}}<|assistant|>"]),
+    format_assistant=StringFormatter(slots=["\n{{content}}"]),
+    format_system=StringFormatter(slots=["<|system|>\n{{content}}"]),
+    format_function=FunctionFormatter(slots=["{{content}}"], tool_format="glm4_moe"),
+    format_observation=StringFormatter(slots=["<|observation|>\n{{content}}<|assistant|>"]),
+    format_tools=ToolFormatter(tool_format="glm4_moe"),
+    format_prefix=EmptyFormatter(slots=["[gMASK]<sop>"]),
+    stop_words=["<|user|>", "<|observation|>"],
+    thought_words=("<think>", "</think>"),
+    efficient_eos=True,
+    template_class=Glm47ReasoningTemplate,
 )
 
 
@@ -2029,6 +2074,39 @@ register_template(
 
 
 register_template(
+    name="qwen3_5",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    format_function=FunctionFormatter(slots=["{{content}}<|im_end|>\n"], tool_format="qwen3_5"),
+    format_observation=StringFormatter(
+        slots=["<|im_start|>user\n<tool_response>\n{{content}}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"]
+    ),
+    format_tools=ToolFormatter(tool_format="qwen3_5"),
+    stop_words=["<|im_end|>"],
+    replace_eos=True,
+    mm_plugin=get_mm_plugin(name="qwen3_vl", image_token="<|image_pad|>", video_token="<|video_pad|>"),
+    template_class=ReasoningTemplate,
+)
+
+
+register_template(
+    name="qwen3_5_nothink",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    format_function=FunctionFormatter(slots=["{{content}}<|im_end|>\n"], tool_format="qwen3_5"),
+    format_observation=StringFormatter(
+        slots=["<|im_start|>user\n<tool_response>\n{{content}}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"]
+    ),
+    format_tools=ToolFormatter(tool_format="qwen3_5"),
+    stop_words=["<|im_end|>"],
+    replace_eos=True,
+    mm_plugin=get_mm_plugin(name="qwen3_vl", image_token="<|image_pad|>", video_token="<|video_pad|>"),
+)
+
+
+register_template(
     name="sailor",
     format_user=StringFormatter(slots=["<|im_start|>question\n{{content}}<|im_end|>\n<|im_start|>answer\n"]),
     format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
@@ -2191,6 +2269,19 @@ register_template(
 
 
 register_template(
+    name="youtu_vl",
+    format_user=StringFormatter(
+        slots=["<|begin_of_text|>user\n{{content}}<|end_of_text|>\n<|begin_of_text|>assistant\n"]
+    ),
+    format_assistant=StringFormatter(slots=["{{content}}<|end_of_text|>\n"]),
+    format_system=StringFormatter(slots=["<|begin_of_text|>system\n{{content}}<|end_of_text|>\n"]),
+    default_system="You are a helpful assistant.",
+    stop_words=["<|end_of_text|>"],
+    mm_plugin=get_mm_plugin(name="youtu_vl", image_token="<|image_pad|>", video_token="<|video_pad|>"),
+)
+
+
+register_template(
     name="yuan",
     format_user=StringFormatter(slots=["{{content}}", {"token": "<sep>"}]),
     format_assistant=StringFormatter(slots=["{{content}}<eod>\n"]),
@@ -2203,4 +2294,25 @@ register_template(
     format_user=StringFormatter(slots=["<|user|>\n{{content}}", {"eos_token"}, "<|assistant|>\n"]),
     format_system=StringFormatter(slots=["<|system|>\n{{content}}", {"eos_token"}]),
     default_system="You are Zephyr, a helpful assistant.",
+)
+
+
+# copied from glm4_7 template
+register_template(
+    name="aeva",
+    format_user=StringFormatter(slots=["<|user|>\n{{content}}<|assistant|>"]),
+    format_assistant=StringFormatter(slots=["\n{{content}}"]),
+    format_system=StringFormatter(slots=["<|system|>\n{{content}}"]),
+    format_function=FunctionFormatter(slots=["{{content}}"], tool_format="glm4_moe"),
+    format_observation=StringFormatter(slots=["<|observation|>\n{{content}}<|assistant|>"]),
+    format_tools=ToolFormatter(tool_format="glm4_moe"),
+    format_prefix=EmptyFormatter(slots=["[gMASK]<sop>"]),
+    default_system=(
+        "You are an AI assistant named Aeva created by Zongzhi Lou. "
+        "Your answer should be friendly, unbiased, faithful, informative and detailed."
+    ),
+    stop_words=["<|user|>", "<|observation|>"],
+    thought_words=("<think>", "</think>"),
+    efficient_eos=True,
+    template_class=Glm47ReasoningTemplate,
 )

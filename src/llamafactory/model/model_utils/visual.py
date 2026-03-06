@@ -499,6 +499,15 @@ _register_composite_model(
 
 
 _register_composite_model(
+    model_type="glm_ocr",
+    projector_key="visual.merger",
+    vision_model_keys=["visual.patch_embed", "visual.blocks"],
+    language_model_keys=["language_model", "lm_head"],
+    lora_conflict_keys=["patch_embed"],
+)
+
+
+_register_composite_model(
     model_type="internvl",
 )
 
@@ -615,7 +624,7 @@ _register_composite_model(
 _register_composite_model(
     model_type="qwen3_vl",
     projector_key="visual.merger",
-    vision_model_keys=["visual.patch_embed", "visual.blocks", "visual.deepstack_merger_list"],
+    vision_model_keys=["visual.pos_embed", "visual.patch_embed", "visual.blocks", "visual.deepstack_merger_list"],
     language_model_keys=["language_model", "lm_head"],
     lora_conflict_keys=["patch_embed"],
 )
@@ -624,7 +633,7 @@ _register_composite_model(
 _register_composite_model(
     model_type="qwen3_vl_moe",
     projector_key="visual.merger",
-    vision_model_keys=["visual.patch_embed", "visual.blocks", "visual.deepstack_merger_list"],
+    vision_model_keys=["visual.pos_embed", "visual.patch_embed", "visual.blocks", "visual.deepstack_merger_list"],
     language_model_keys=["language_model", "lm_head"],
     lora_conflict_keys=["patch_embed"],
 )
@@ -633,8 +642,32 @@ _register_composite_model(
 _register_composite_model(
     model_type="qwen3_omni_moe_thinker",
     projector_key="visual.merger",
-    vision_model_keys=["visual.patch_embed", "visual.blocks", "visual.deepstack_merger_list", "audio_tower"],
-    language_model_keys=["model", "lm_head"],
+    vision_model_keys=[
+        "visual.pos_embed",
+        "visual.patch_embed",
+        "visual.blocks",
+        "visual.deepstack_merger_list",
+        "audio_tower",
+    ],
+    language_model_keys=["language_model", "lm_head"],
+    lora_conflict_keys=["patch_embed"],
+)
+
+
+_register_composite_model(
+    model_type="qwen3_5",
+    projector_key="model.visual.merger",
+    vision_model_keys=["visual.pos_embed", "visual.patch_embed", "visual.blocks"],
+    language_model_keys=["language_model", "lm_head"],
+    lora_conflict_keys=["patch_embed"],
+)
+
+
+_register_composite_model(
+    model_type="qwen3_5_moe",
+    projector_key="model.visual.merger",
+    vision_model_keys=["visual.pos_embed", "visual.patch_embed", "visual.blocks"],
+    language_model_keys=["language_model", "lm_head"],
     lora_conflict_keys=["patch_embed"],
 )
 

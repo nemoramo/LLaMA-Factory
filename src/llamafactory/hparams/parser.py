@@ -100,6 +100,52 @@ def _parse_args(
     return tuple(parsed_args)
 
 
+def _verify_trackio_args(training_args: "TrainingArguments") -> None:
+    """Validates Trackio-specific arguments.
+
+    Args:
+        training_args: TrainingArguments instance (not a dictionary)
+    """
+    report_to = training_args.report_to
+    if not report_to:
+        return
+
+    if isinstance(report_to, str):
+        report_to = [report_to]
+
+    if "trackio" not in report_to:
+        return
+
+    # --- Enforce project (required by Trackio) ---
+    if not training_args.project:
+        raise ValueError("`--project` must be specified when using Trackio.")
+
+    # --- Validate trackio_space_id format ---
+    space_id = training_args.trackio_space_id
+    if space_id:
+        if space_id != "trackio" and "/" not in space_id:
+            logger.warning(
+                f"trackio_space_id '{space_id}' should typically be in format "
+                "'org/space' for Hugging Face Spaces deployment."
+            )
+
+    # --- Inform about default project usage ---
+    if training_args.project == "huggingface":
+        logger.info(
+            "Using default project name 'huggingface'. "
+            "Consider setting a custom project name with --project "
+            "for better organization."
+        )
+
+    # --- Validate hub repo privacy flag ---
+    if training_args.hub_private_repo:
+        logger.info("Repository will be created as private on Hugging Face Hub.")
+
+    # --- Recommend run_name for experiment clarity ---
+    if not training_args.run_name:
+        logger.warning("Consider setting --run_name for better experiment tracking clarity.")
+
+
 def _set_transformers_logging() -> None:
     if os.getenv("LLAMAFACTORY_VERBOSITY", "INFO") in ["DEBUG", "INFO"]:
         transformers.utils.logging.set_verbosity_info()
@@ -138,10 +184,6 @@ def _verify_model_args(
 
         if model_args.adapter_name_or_path is not None and len(model_args.adapter_name_or_path) != 1:
             raise ValueError("Quantized model only accepts a single adapter. Merge them first.")
-
-    if data_args.template == "yi" and model_args.use_fast_tokenizer:
-        logger.warning_rank0("We should use slow tokenizer for the Yi models. Change `use_fast_tokenizer` to False.")
-        model_args.use_fast_tokenizer = False
 
 
 def _check_extra_dependencies(
@@ -188,9 +230,7 @@ def _check_extra_dependencies(
 
     if training_args is not None:
         if training_args.deepspeed:
-            # pin deepspeed version < 0.17 because of https://github.com/deepspeedai/DeepSpeed/issues/7347
             check_version("deepspeed", mandatory=True)
-            check_version("deepspeed>=0.10.0,<=0.16.9")
 
         if training_args.predict_with_generate:
             check_version("jieba", mandatory=True)
@@ -284,8 +324,10 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         if finetuning_args.reward_model_type == "lora" and model_args.use_unsloth:
             raise ValueError("Unsloth does not support lora reward model.")
 
-        if training_args.report_to and training_args.report_to[0] not in ["wandb", "tensorboard"]:
-            raise ValueError("PPO only accepts wandb or tensorboard logger.")
+        if training_args.report_to and any(
+            logger not in ("wandb", "tensorboard", "trackio", "none") for logger in training_args.report_to
+        ):
+            raise ValueError("PPO only accepts wandb, tensorboard, or trackio logger.")
 
     if not model_args.use_kt and training_args.parallel_mode == ParallelMode.NOT_DISTRIBUTED:
         raise ValueError("Please launch distributed training with `llamafactory-cli` or `torchrun`.")
@@ -359,6 +401,7 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
     _set_env_vars()
     _verify_model_args(model_args, data_args, finetuning_args)
     _check_extra_dependencies(model_args, finetuning_args, training_args)
+    _verify_trackio_args(training_args)
 
     if not finetuning_args.use_mca and training_args.fp8_enable_fsdp_float8_all_gather and not training_args.fp8:
         logger.warning_rank0("fp8_enable_fsdp_float8_all_gather requires fp8=True. Setting fp8=True.")
