@@ -1,0 +1,8 @@
+# Audio helpers required by the FunAudioChat and Qwen3-ASR data pipelines.
+# `ffmpeg` / `ffprobe` are installed at the OS layer in the speech Dockerfile.
+audioread>=3.0.1
+jiwer>=3.0.5
+librosa>=0.10.2.post1,<0.12
+pydub>=0.25.1
+soundfile>=0.12.1
+soxr>=0.5.0

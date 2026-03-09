@@ -315,8 +315,6 @@ def load_model(
         else:
             if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
-            elif type(config) in AutoModelForVision2Seq._model_mapping.keys():  # image-text
-                load_class = AutoModelForVision2Seq
             elif isinstance(getattr(config, "model_type", None), str) and getattr(config, "model_type").startswith(
                 "qwen3_asr"
             ):
