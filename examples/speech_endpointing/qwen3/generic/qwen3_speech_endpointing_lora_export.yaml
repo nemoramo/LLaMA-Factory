@@ -11,6 +11,8 @@ model_name_or_path: Qwen/Qwen3-0.6B
 # Set to your trained LoRA checkpoint dir (e.g., checkpoint-1364)
 adapter_name_or_path: /path/to/your/lora_checkpoint
 
+# Default for Qwen3-0.6B / Qwen3-1.7B.
+# Override to `template=qwen3_5_nothink` when exporting Qwen/Qwen3.5-0.8B-Base.
 template: qwen3_nothink
 trust_remote_code: true
 

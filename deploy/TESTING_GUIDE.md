@@ -24,9 +24,12 @@
 # 导出 LoRA 模型（如果还没做）
 llamafactory-cli export examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_export.yaml \
   model_name_or_path=Qwen/Qwen3.5-0.8B-Base \
+  template=qwen3_5_nothink \
   adapter_name_or_path=/path/to/your/checkpoint-XXXX \
   export_dir=/path/to/exported_model
 ```
+
+对于 `Qwen/Qwen3.5-0.8B-Base`，这里必须显式覆盖 `template=qwen3_5_nothink`，否则会沿用通用 export YAML 里的 `qwen3_nothink`。
 
 **检查模型文件：**
 ```bash
@@ -233,9 +236,14 @@ python eval_hf_endpointing.py \
 - `/path/to/eval_hf_out/summary.json`
 
 说明：
-- `eval_hf_endpointing.py` 当前默认只统计 **merge 后** 的 2-way 指标
-- `summary.json` 里的关键字段是 `metrics_merge_unaddressed_as_eou`
-- 适合快速检查导出模型在 `treat_unaddressed_as_eou=true` 口径下的效果
+- `summary.json` 会同时输出：
+  - `tag_eval`：3-way 指标（等价于 `treat_unaddressed_as_eou=false`）
+  - `tag_eval_merge_unad_as_eou`：2-way merge 指标（等价于 `treat_unaddressed_as_eou=true`）
+  - `export_prompt_probe`：导出模型健康检查
+- `export_prompt_probe` 会对一个固定 endpointing prompt 做 next-token probe：
+  - 正常情况下 `<EOU>` / `<CONT_USER>` / `<UNADDRESSED>` 应该占据 full-vocab top3
+  - 如果没有进入 top3，脚本会提示 `export/template/add_special_tokens/prompt` 可能不一致
+- 适合快速检查导出模型是否还能保持“单标签 token 分类”行为
 
 ### 4.2 评估已部署的 OpenAI-compatible 服务
 

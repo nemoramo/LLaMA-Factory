@@ -325,9 +325,10 @@ speech endpointing 目前有 3 套常用评估口径，含义不同：
   - 当前 generic Qwen3 recipe 默认用 `metric_for_best_model: eval_label_acc`
 
 - **`eval_hf_endpointing.py`**：直接对本地 HF / merged 模型做离线评估
-  - 默认只输出 merge 后的 2-way 指标
-  - `summary.json` 里的字段是 `metrics_merge_unaddressed_as_eou`
-  - 适合快速检查合并后模型的离线精度
+  - 会同时输出 `tag_eval`（3-way）和 `tag_eval_merge_unad_as_eou`（2-way merge）
+  - 还会输出 `export_prompt_probe`
+  - 这个 probe 会拿固定 endpointing prompt 做 next-token 检查：如果 `<EOU>` / `<CONT_USER>` / `<UNADDRESSED>` 没有占据 full-vocab top3，通常说明 export、template 覆盖、special token resize 或 prompt 格式可能不一致
+  - 适合快速检查合并后模型的离线精度和导出健康状态
 
 - **`eval_sglang_endpointing.py`**：对已部署的 OpenAI-compatible 服务做评估
   - 同时输出 `tag_eval`（等价于 `treat_unaddressed_as_eou=false`）
