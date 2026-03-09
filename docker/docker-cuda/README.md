@@ -2,6 +2,8 @@
 
 This directory contains Docker configuration files for running LLaMA Factory with NVIDIA GPU support.
 
+中文说明见：[README_zh.md](./README_zh.md)
+
 ## Prerequisites
 
 ### Linux-specific Requirements
@@ -95,6 +97,15 @@ docker build -f ./docker/docker-cuda/Dockerfile.speech \
     -t llamafactory:speech .
 ```
 
+If you want to build the speech image with a fresh FlashAttention-2 wheel:
+
+```bash
+docker build -f ./docker/docker-cuda/Dockerfile.speech \
+    --build-arg PIP_INDEX=https://pypi.org/simple \
+    --build-arg INSTALL_FLASHATTN=true \
+    -t llamafactory:speech-fa2 .
+```
+
 Smoke test it on a single GPU:
 
 ```bash
@@ -124,6 +135,8 @@ Notes:
 3. Replace `HF_CACHE`, `LOCAL_MODELS`, and `LOCAL_ADAPTERS` with paths that match your environment.
 4. `Dockerfile.speech` keeps the image focused on single-node speech workflows and does not preinstall `deepspeed`.
    If you need it, install `requirements/deepspeed.txt` inside the container after build.
+5. If your Docker daemon requires elevated privileges, prepend `sudo` to the `docker build` and `docker run`
+   commands above.
 
 ## Troubleshooting
 
