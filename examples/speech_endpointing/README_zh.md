@@ -327,7 +327,8 @@ speech endpointing 目前有 3 套常用评估口径，含义不同：
 - **`eval_hf_endpointing.py`**：直接对本地 HF / merged 模型做离线评估
   - 会同时输出 `tag_eval`（3-way）和 `tag_eval_merge_unad_as_eou`（2-way merge）
   - 还会输出 `export_prompt_probe`
-  - 这个 probe 会拿固定 endpointing prompt 做 next-token 检查：如果 `<EOU>` / `<CONT_USER>` / `<UNADDRESSED>` 没有占据 full-vocab top3，通常说明 export、template 覆盖、special token resize 或 prompt 格式可能不一致
+  - 这个 probe 会拿固定 endpointing prompt 做 next-token 检查：如果 `<EOU>` / `<CONT_USER>` / `<UNADDRESSED>` 没有占据 full-vocab top3，默认先排查 export
+  - 优先检查 `llamafactory-cli export` 的 `template` 是否正确、是否保留了 `add_special_tokens` / `resize_vocab`、当前评估目录是否真的是 merged 导出目录，以及评估 prompt 是否和训练 / 部署一致
   - 适合快速检查合并后模型的离线精度和导出健康状态
 
 - **`eval_sglang_endpointing.py`**：对已部署的 OpenAI-compatible 服务做评估
