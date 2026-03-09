@@ -243,10 +243,12 @@ python eval_hf_endpointing.py \
 - `export_prompt_probe` 会对一个固定 endpointing prompt 做 next-token probe：
   - 正常情况下 `<EOU>` / `<CONT_USER>` / `<UNADDRESSED>` 应该占据 full-vocab top3
   - 如果没有进入 top3，先优先排查 export 链路，而不是先怀疑模型效果：
-    - `llamafactory-cli export` 是否用了正确 `template`
-    - 导出时是否保留了 `add_special_tokens` 和 `resize_vocab`
-    - 当前评估目录是否真的是刚导出的 merged model
-    - 评估时 prompt 格式是否和训练 / 部署保持一致
+    - 先检查导出后的 `config.json` 里 `tie_word_embeddings` 是否和实际权重一致，尤其是 Qwen3 / Qwen3.5
+    - 检查 `embed_tokens` 和 `lm_head` 在 merge 后是否仍然保持了正确的 tied-embedding 关系
+    - 再检查 `llamafactory-cli export` 是否用了正确 `template`
+    - 再检查导出时是否保留了 `add_special_tokens` 和 `resize_vocab`
+    - 确认当前评估目录是否真的是刚导出的 merged model
+    - 确认评估时 prompt 格式是否和训练 / 部署保持一致
 - 适合快速检查导出模型是否还能保持“单标签 token 分类”行为
 
 ### 4.2 评估已部署的 OpenAI-compatible 服务

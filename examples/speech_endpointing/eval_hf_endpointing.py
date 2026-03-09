@@ -474,8 +474,9 @@ def _run_export_prompt_probe(
     if not passed:
         warning = (
             "Export prompt probe failed: the three endpointing label tokens are not the full-vocab top-3 next-token "
-            "candidates for the canonical endpointing prompt. This usually means the export, template override, "
-            "special-token resize, or prompt format is inconsistent."
+            "candidates for the canonical endpointing prompt. First check whether export preserved the correct "
+            "tie_word_embeddings / embed_tokens<->lm_head relationship; then verify template override, "
+            "special-token resize, and prompt format."
         )
 
     return {
