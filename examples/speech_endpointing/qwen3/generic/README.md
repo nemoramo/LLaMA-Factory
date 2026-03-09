@@ -161,6 +161,17 @@ llamafactory-cli export examples/speech_endpointing/qwen3/generic/qwen3_speech_e
   export_dir=/path/to/exported/qwen3_5_0_8b_base_endpointing
 ```
 
+#### 离线评估时 `--base-model` / `--adapter` 怎么传
+
+- 如果你已经按上面的 export 命令导出了 merged 模型，推荐直接评估导出目录：
+  - `--base-model /path/to/exported/...`
+  - 不需要再传 `--adapter`
+- 如果你想直接评估 “底模 + LoRA checkpoint”：
+  - `--base-model` 传底模
+  - `--adapter` 传完整 checkpoint 目录，例如 `/path/to/output/.../checkpoint-1364`
+- `--adapter` 不要传成单个 `adapter_model.safetensors`
+- 当前 `eval_hf_endpointing.py` 默认优先从 `--adapter` 目录读取 tokenizer 和 chat template，因此这里最好传本仓库训练脚本保存出来的完整 checkpoint 目录
+
 #### 训练产物里的指标查看
 
 训练过程中，每次保存的 checkpoint 目录下都会带一个 `trainer_state.json`，可以直接查看该次 eval 的结构化指标，而不必只盯着 `tail -f` 日志：

@@ -231,6 +231,23 @@ python eval_hf_endpointing.py \
   --out-dir /path/to/eval_hf_out
 ```
 
+如果你是按上面的 export 流程导出的 merged 模型，推荐就用这种方式评估，不需要再传 `--adapter`。
+
+如果你想直接评估 “底模 + LoRA checkpoint” 组合，则写成：
+
+```bash
+python eval_hf_endpointing.py \
+  --base-model Qwen/Qwen3-0.6B \
+  --adapter /path/to/output/checkpoint-1364 \
+  --dataset /path/to/your/test.jsonl \
+  --out-dir /path/to/eval_hf_out
+```
+
+注意：
+- `--adapter` 传的是完整 checkpoint 目录，例如 `checkpoint-1364`
+- 不要传单个 `adapter_model.safetensors`
+- 当前脚本默认优先从 `--adapter` 目录读取 tokenizer / chat template，因此这里最好传本仓库训练产物里保存出来的完整 checkpoint 目录
+
 输出：
 - `/path/to/eval_hf_out/pred.jsonl`
 - `/path/to/eval_hf_out/summary.json`

@@ -325,6 +325,9 @@ speech endpointing 目前有 3 套常用评估口径，含义不同：
   - 当前 generic Qwen3 recipe 默认用 `metric_for_best_model: eval_label_acc`
 
 - **`eval_hf_endpointing.py`**：直接对本地 HF / merged 模型做离线评估
+  - 如果你已经按 README 的 export 流程导出了 merged 模型，推荐直接传 `--base-model /path/to/exported_model`，不需要再传 `--adapter`
+  - `--adapter` 只用于“底模 + LoRA checkpoint 目录”联合评估；这里传的是完整 checkpoint 目录，例如 `/path/to/output/checkpoint-1364`，不是单个 `adapter_model.safetensors`
+  - 当前脚本默认优先从 `--adapter` 目录读取 tokenizer / chat template，所以这里最好传本仓库训练产物里保存出来的完整 checkpoint 目录
   - 会同时输出 `tag_eval`（3-way）和 `tag_eval_merge_unad_as_eou`（2-way merge）
   - 还会输出 `export_prompt_probe`
   - 这个 probe 会拿固定 endpointing prompt 做 next-token 检查：如果 `<EOU>` / `<CONT_USER>` / `<UNADDRESSED>` 没有占据 full-vocab top3，默认先排查 export
