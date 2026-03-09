@@ -84,6 +84,47 @@ docker run -dit --ipc=host --gpus=all \
 docker exec -it llamafactory bash
 ```
 
+### Speech Workloads: Qwen3-ASR, Qwen3.5 Endpointing, FunAudioChat
+
+For speech training stacks that need `ffmpeg` / `ffprobe`, `libsndfile`, and the Python audio helpers used by
+`qwen3_asr` and `funaudiochat`, build the speech-focused image instead:
+
+```bash
+docker build -f ./docker/docker-cuda/Dockerfile.speech \
+    --build-arg PIP_INDEX=https://pypi.org/simple \
+    -t llamafactory:speech .
+```
+
+Smoke test it on a single GPU:
+
+```bash
+export GPU_ID=0
+export HF_CACHE=/path/to/huggingface_cache
+export LOCAL_MODELS=/path/to/local_models
+export LOCAL_ADAPTERS=/path/to/local_adapters
+
+docker run --rm --ipc=host --gpus "\"device=${GPU_ID}\"" \
+    -v "${HF_CACHE}:/root/.cache/huggingface" \
+    -v "${LOCAL_MODELS}:/models" \
+    -v "${LOCAL_ADAPTERS}:/adapters" \
+    llamafactory:speech \
+    python scripts/docker/smoke_test_speech_stack.py \
+      --require-cuda \
+      --require-fa2 \
+      --qwen3-asr-model /models/qwen3-asr/checkpoint \
+      --funaudiochat-model /models/funaudiochat \
+      --qwen3-5-endpointing-adapter /adapters/qwen3_5_endpointing
+```
+
+Notes:
+
+1. `--gpus "\"device=${GPU_ID}\""` exposes only the selected physical GPU to the container, and it will appear as `cuda:0` inside.
+2. The smoke test checks CUDA visibility, FlashAttention-2 availability, audio dependencies, `qwen3_asr` /
+   `funaudiochat` registration, and the shipped Qwen3.5 speech-endpointing config.
+3. Replace `HF_CACHE`, `LOCAL_MODELS`, and `LOCAL_ADAPTERS` with paths that match your environment.
+4. `Dockerfile.speech` keeps the image focused on single-node speech workflows and does not preinstall `deepspeed`.
+   If you need it, install `requirements/deepspeed.txt` inside the container after build.
+
 ## Troubleshooting
 
 ### GPU Not Detected

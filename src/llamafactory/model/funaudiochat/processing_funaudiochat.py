@@ -374,7 +374,7 @@ class FunAudioChatProcessor(ProcessorMixin):
         return self.tokenizer.decode(*args, **kwargs)
 
     @classmethod
-    def _get_arguments_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+    def _get_arguments_from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         """Identify and instantiate the subcomponents of Processor classes, like image processors and tokenizers.
 
         This method uses the Processor attributes like `tokenizer_class` to figure out what class those
