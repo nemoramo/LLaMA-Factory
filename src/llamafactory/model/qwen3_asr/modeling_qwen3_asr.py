@@ -893,7 +893,15 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS.get(self.rope_type, _compute_default_rope_parameters)
+        if self.rope_type == "default":
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS.get("default", _compute_default_rope_parameters)
+        elif self.rope_type in ROPE_INIT_FUNCTIONS:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        else:
+            raise ValueError(
+                "Unsupported rope_type for Qwen3-ASR thinker config: "
+                f"{self.rope_type}. Supported rope types: default, {', '.join(sorted(ROPE_INIT_FUNCTIONS.keys()))}."
+            )
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)

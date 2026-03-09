@@ -76,6 +76,27 @@ def test_qwen3_asr_default_rope_type_supported():
 
 
 @pytest.mark.runs_on(["cpu"])
+def test_qwen3_asr_unknown_rope_type_raises():
+    from llamafactory.model.qwen3_asr.configuration_qwen3_asr import Qwen3ASRTextConfig
+    from llamafactory.model.qwen3_asr.modeling_qwen3_asr import Qwen3ASRThinkerTextRotaryEmbedding
+
+    cfg = Qwen3ASRTextConfig(
+        hidden_size=96,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        head_dim=12,
+        max_position_embeddings=128,
+        rope_theta=1000000,
+        rope_scaling={"rope_type": "definitely_not_supported", "mrope_section": [2, 2, 2]},
+    )
+
+    with pytest.raises(ValueError, match="Unsupported rope_type"):
+        Qwen3ASRThinkerTextRotaryEmbedding(cfg)
+
+
+@pytest.mark.runs_on(["cpu"])
 def test_qwen3_asr_thinker_config_inherits_pad_token_id():
     from llamafactory.model.qwen3_asr.configuration_qwen3_asr import Qwen3ASRTextConfig, Qwen3ASRThinkerConfig
 
