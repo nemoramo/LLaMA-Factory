@@ -14,6 +14,10 @@
 
 ### 1. 训练配置: `qwen3_speech_endpointing_lora_neat_packing_fa2.yaml`
 
+当前 Git 默认跟踪的 Qwen3 配置只有 `generic` 目录。
+因此 `Qwen/Qwen3-0.6B`、`Qwen/Qwen3-1.7B` 和 `Qwen/Qwen3.5-0.8B-Base`
+都统一基于这个通用 YAML，通过 overrides 覆盖模型相关字段。
+
 #### 关键参数说明
 
 **模型设置:**
@@ -102,34 +106,59 @@ register_template(
 }
 ```
 
-### 3. 训练执行
+### 3. 训练与导出参考命令
+
+以下命令默认在仓库根目录执行。
+
+#### 通用训练命令（Qwen3-0.6B / Qwen3-1.7B）
 
 ```bash
-# 训练
-llamafactory-cli train qwen3_speech_endpointing_lora_neat_packing_fa2.yaml
-
-# 导出
-llamafactory-cli export qwen3_speech_endpointing_lora_export.yaml
+llamafactory-cli train examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
+  model_name_or_path=Qwen/Qwen3-0.6B \
+  dataset_dir=/path/to/your/dataset_dir \
+  dataset=speech_endpointing_train \
+  eval_dataset=speech_endpointing_valid \
+  output_dir=/path/to/output/qwen3_0_6b_lora_neatpacking
 ```
 
-如果你要切到 `Qwen3.5-0.8B-Base`，推荐直接用 overrides：
+#### Qwen3.5-0.8B-Base 训练参考命令（generic YAML + overrides）
 
 ```bash
-llamafactory-cli train qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
+llamafactory-cli train examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_neat_packing_fa2.yaml \
   model_name_or_path=Qwen/Qwen3.5-0.8B-Base \
   template=qwen3_5_nothink \
   dataset_dir=/path/to/your/dataset_dir \
   dataset=speech_endpointing_train \
   eval_dataset=speech_endpointing_valid \
   output_dir=/path/to/output/qwen3_5_0_8b_base_lora_neatpacking \
-  overwrite_output_dir=false \
-  metric_for_best_model=eval_label_acc
+  overwrite_output_dir=false
 ```
 
-如果当前环境缺 `tensorboard` 或 `matplotlib`，再额外覆盖：
+如果当前环境缺 `tensorboard` 或 `matplotlib`，在训练命令后追加：
 
 ```bash
 report_to=none plot_loss=false
+```
+
+#### Qwen3-0.6B 导出参考命令
+
+```bash
+llamafactory-cli export examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_export.yaml \
+  model_name_or_path=Qwen/Qwen3-0.6B \
+  adapter_name_or_path=/path/to/output/qwen3_0_6b_lora_neatpacking/checkpoint-xxx \
+  export_dir=/path/to/exported/qwen3_0_6b_endpointing
+```
+
+#### Qwen3.5-0.8B-Base 导出参考命令
+
+当前导出继续复用通用 export YAML，并覆盖底模与模板：
+
+```bash
+llamafactory-cli export examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_export.yaml \
+  model_name_or_path=Qwen/Qwen3.5-0.8B-Base \
+  template=qwen3_5_nothink \
+  adapter_name_or_path=/path/to/output/qwen3_5_0_8b_base_lora_neatpacking/checkpoint-xxx \
+  export_dir=/path/to/exported/qwen3_5_0_8b_base_endpointing
 ```
 
 #### 训练产物里的指标查看
