@@ -47,3 +47,40 @@ def test_qwen3_5_template_registered():
     from llamafactory.data.template import TEMPLATES
 
     assert "qwen3_5_nothink" in TEMPLATES
+
+
+@pytest.mark.runs_on(["cpu"])
+def test_qwen3_asr_default_rope_type_supported():
+    import torch
+
+    from llamafactory.model.qwen3_asr.configuration_qwen3_asr import Qwen3ASRTextConfig
+    from llamafactory.model.qwen3_asr.modeling_qwen3_asr import Qwen3ASRThinkerTextRotaryEmbedding
+
+    cfg = Qwen3ASRTextConfig(
+        hidden_size=96,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        head_dim=12,
+        max_position_embeddings=128,
+        rope_theta=1000000,
+        rope_scaling={"rope_type": "default", "type": "default", "mrope_section": [2, 2, 2]},
+    )
+
+    rotary = Qwen3ASRThinkerTextRotaryEmbedding(cfg)
+    cos, sin = rotary(torch.zeros(1, 2, 12), torch.arange(2).unsqueeze(0))
+
+    assert rotary.rope_type == "default"
+    assert cos.shape == sin.shape == (1, 2, 12)
+
+
+@pytest.mark.runs_on(["cpu"])
+def test_qwen3_asr_thinker_config_inherits_pad_token_id():
+    from llamafactory.model.qwen3_asr.configuration_qwen3_asr import Qwen3ASRTextConfig, Qwen3ASRThinkerConfig
+
+    text_config = Qwen3ASRTextConfig(pad_token_id=151643)
+    thinker_config = Qwen3ASRThinkerConfig(text_config=text_config)
+
+    assert thinker_config.pad_token_id == 151643
+    assert thinker_config.text_config.pad_token_id == 151643

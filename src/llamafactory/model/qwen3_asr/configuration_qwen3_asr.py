@@ -362,6 +362,7 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
             text_config = Qwen3ASRTextConfig()
         self.text_config = text_config
         self.audio_token_id = audio_token_id
+        self.pad_token_id = getattr(text_config, "pad_token_id", None)
 
 
 class Qwen3ASRConfig(PretrainedConfig):

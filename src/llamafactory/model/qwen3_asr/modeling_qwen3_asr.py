@@ -46,6 +46,7 @@ from .configuration_qwen3_asr import (
     Qwen3ASRAudioEncoderConfig,
     Qwen3ASRConfig,
     Qwen3ASRThinkerConfig,
+    Qwen3ASRTextConfig,
 )
 
 logger = get_logger(__name__)
@@ -62,6 +63,24 @@ else:
         _check_model_inputs = check_model_inputs()
     except TypeError:
         _check_model_inputs = check_model_inputs
+
+
+def _compute_default_rope_parameters(
+    config: "Qwen3ASRTextConfig",
+    device: Optional["torch.device"] = None,
+) -> tuple["torch.Tensor", float]:
+    """Compute plain RoPE parameters for checkpoints that serialize `rope_type=default`.
+
+    transformers>=5.2 removed the `"default"` entry from `ROPE_INIT_FUNCTIONS`, while Qwen3-ASR checkpoints still
+    store plain MRoPE metadata under `rope_scaling={"rope_type": "default", ...}`.
+    """
+
+    base = getattr(config, "rope_theta", 10000.0)
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    dim = int(head_dim * partial_rotary_factor)
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
+    return inv_freq, 1.0
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -857,23 +876,30 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
 class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
 
-    def __init__(self, config: Qwen3ASRConfig, device=None):
+    @staticmethod
+    def compute_default_rope_parameters(
+        config: "Qwen3ASRTextConfig",
+        device: Optional["torch.device"] = None,
+        seq_len: int | None = None,
+    ) -> tuple["torch.Tensor", float]:
+        del seq_len  # Unused for plain RoPE, kept for transformers>=5.2 compatibility.
+        return _compute_default_rope_parameters(config, device)
+
+    def __init__(self, config: Qwen3ASRTextConfig, device=None):
         super().__init__()
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", "default")
-        else:
-            self.rope_type = "default"
+        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        self.rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS.get(self.rope_type, _compute_default_rope_parameters)
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
-        self.mrope_section = config.rope_scaling.get("mrope_section", [24, 20, 20])
+        self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
         """Apply interleaved MRoPE to 3D rotary embeddings.
@@ -1158,7 +1184,10 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             self.lm_head = nn.Linear(config.text_config.hidden_size, config.classify_num, bias=False)
         else:
             self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        pad_token_id = getattr(self.config, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(config.text_config, "pad_token_id", None)
+        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
         self.rope_deltas = None
         self.post_init()
 
