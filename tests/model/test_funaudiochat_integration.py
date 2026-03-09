@@ -60,3 +60,75 @@ def test_funaudiochat_freeze_audio_tower_forbidden_modules():
     assert "continuous_audio_tower" in forbidden
     assert "audio_tower" in forbidden
     assert "audio_invert_tower" in forbidden
+
+
+@pytest.mark.runs_on(["cpu"])
+def test_funaudiochat_tie_weights_accepts_recompute_mapping():
+    from types import SimpleNamespace
+
+    from llamafactory.model.funaudiochat.modeling_funaudiochat import FunAudioChatForConditionalGeneration
+
+    tie_calls = []
+
+    class DummyLegacyLanguageModel:
+        def tie_weights(self):
+            tie_calls.append(("legacy", (), {}))
+            return "legacy-ok"
+
+    fake_model = SimpleNamespace(
+        audio_invert_tower=None,
+        audio_tower=SimpleNamespace(embed_tokens="embed"),
+        language_model=DummyLegacyLanguageModel(),
+        _tie_or_clone_weights=lambda *args: None,
+    )
+
+    result = FunAudioChatForConditionalGeneration.tie_weights(fake_model, recompute_mapping=False)
+
+    assert result == "legacy-ok"
+    assert tie_calls == [("legacy", (), {})]
+
+
+@pytest.mark.runs_on(["cpu"])
+def test_funaudiochat_tie_or_clone_weights_compat():
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from llamafactory.model.funaudiochat.modeling_funaudiochat import FunAudioChatPreTrainedModel
+
+    fake_model = SimpleNamespace(config=SimpleNamespace(torchscript=False))
+    output_embeddings = nn.Linear(4, 3, bias=True)
+    input_embeddings = nn.Embedding(3, 4)
+
+    FunAudioChatPreTrainedModel._tie_or_clone_weights(fake_model, output_embeddings, input_embeddings)
+
+    assert output_embeddings.weight is input_embeddings.weight
+    assert output_embeddings.out_features == input_embeddings.num_embeddings
+
+
+@pytest.mark.runs_on(["cpu"])
+def test_funaudiochat_tie_weights_forwards_supported_kwargs():
+    from types import SimpleNamespace
+
+    from llamafactory.model.funaudiochat.modeling_funaudiochat import FunAudioChatForConditionalGeneration
+
+    tied_modules = []
+    tie_calls = []
+
+    class DummyModernLanguageModel:
+        def tie_weights(self, *args, **kwargs):
+            tie_calls.append((args, kwargs))
+            return "modern-ok"
+
+    fake_model = SimpleNamespace(
+        audio_invert_tower=SimpleNamespace(lm_head="lm_head"),
+        audio_tower=SimpleNamespace(embed_tokens="embed"),
+        language_model=DummyModernLanguageModel(),
+        _tie_or_clone_weights=lambda *args: tied_modules.append(args),
+    )
+
+    result = FunAudioChatForConditionalGeneration.tie_weights(fake_model, recompute_mapping=False)
+
+    assert result == "modern-ok"
+    assert tied_modules == [("lm_head", "embed")]
+    assert tie_calls == [((), {"recompute_mapping": False})]

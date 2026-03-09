@@ -121,6 +121,28 @@ class FunAudioChatPreTrainedModel(PreTrainedModel):
             if module.bias is not None:
                 module.bias.data.zero_()
 
+    def _tie_or_clone_weights(self, output_embeddings: nn.Module, input_embeddings: nn.Module) -> None:
+        # transformers>=5.2 removes this helper from PreTrainedModel, but FunAudioChat still uses it
+        # for tying the audio decoder head to the discrete audio token embeddings.
+        if getattr(self.config, "torchscript", False):
+            output_embeddings.weight = nn.Parameter(input_embeddings.weight.clone())
+        else:
+            output_embeddings.weight = input_embeddings.weight
+
+        if getattr(output_embeddings, "bias", None) is not None:
+            bias_len = output_embeddings.bias.shape[0]
+            target_len = output_embeddings.weight.shape[0]
+            if bias_len != target_len:
+                output_embeddings.bias.data = nn.functional.pad(
+                    output_embeddings.bias.data,
+                    (0, target_len - bias_len),
+                    "constant",
+                    0,
+                )
+
+        if hasattr(output_embeddings, "out_features") and hasattr(input_embeddings, "num_embeddings"):
+            output_embeddings.out_features = input_embeddings.num_embeddings
+
 
 def eager_attention_forward(
     module: nn.Module,
@@ -869,11 +891,20 @@ class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, Generati
     def get_decoder(self):
         return self.language_model.get_decoder()
 
-    def tie_weights(self):
+    def tie_weights(self, *args, **kwargs):
         # audio tie weights
         if self.audio_invert_tower is not None:
             self._tie_or_clone_weights(self.audio_invert_tower.lm_head, self.audio_tower.embed_tokens)
-        return self.language_model.tie_weights()
+
+        try:
+            return self.language_model.tie_weights(*args, **kwargs)
+        except TypeError as exc:
+            # transformers>=5.2 passes recompute_mapping, while older causal LM implementations still
+            # expose the legacy no-arg tie_weights() signature.
+            if "recompute_mapping" in kwargs and "recompute_mapping" in str(exc):
+                return self.language_model.tie_weights(*args)
+
+            raise
 
     def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
         model_embeds = self.language_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
