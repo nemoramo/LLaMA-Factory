@@ -7,6 +7,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -343,6 +344,81 @@ def _dtype_from_str(dtype_name: str) -> torch.dtype:
     raise ValueError(f"Unknown dtype: {dtype_name}")
 
 
+def _get_model_vocab_size(model: Any) -> int:
+    input_embeddings = model.get_input_embeddings()
+    if input_embeddings is None or not hasattr(input_embeddings, "weight"):
+        raise ValueError("Model does not expose input embedding weights.")
+
+    return int(input_embeddings.weight.size(0))
+
+
+def _infer_adapter_embedding_size(adapter_path: str) -> Optional[int]:
+    adapter_dir = Path(adapter_path)
+    if not adapter_dir.exists():
+        return None
+
+    safetensors_path = adapter_dir / "adapter_model.safetensors"
+    if safetensors_path.is_file():
+        try:
+            from safetensors import safe_open
+
+            target_size = 0
+            with safe_open(str(safetensors_path), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key.endswith("embed_tokens.weight") or key.endswith("lm_head.weight"):
+                        target_size = max(target_size, int(f.get_slice(key).get_shape()[0]))
+            return target_size or None
+        except Exception:
+            pass
+
+    bin_path = adapter_dir / "adapter_model.bin"
+    if bin_path.is_file():
+        try:
+            state_dict = torch.load(str(bin_path), map_location="cpu")
+            if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
+                state_dict = state_dict["state_dict"]
+
+            target_size = 0
+            if isinstance(state_dict, dict):
+                for key, value in state_dict.items():
+                    if (
+                        isinstance(key, str)
+                        and (key.endswith("embed_tokens.weight") or key.endswith("lm_head.weight"))
+                        and hasattr(value, "shape")
+                        and len(value.shape) > 0
+                    ):
+                        target_size = max(target_size, int(value.shape[0]))
+            return target_size or None
+        except Exception:
+            pass
+
+    return None
+
+
+def _maybe_resize_base_model_for_adapter(model: Any, tokenizer: Any, adapter_path: Optional[str]) -> None:
+    current_vocab_size = _get_model_vocab_size(model)
+    tokenizer_vocab_size = len(tokenizer)
+    adapter_vocab_size = _infer_adapter_embedding_size(adapter_path) if adapter_path else None
+    target_vocab_size = max(current_vocab_size, tokenizer_vocab_size, adapter_vocab_size or 0)
+    if target_vocab_size <= current_vocab_size:
+        return
+
+    resize_kwargs: dict[str, Any] = {}
+    if adapter_vocab_size is None or target_vocab_size > adapter_vocab_size:
+        resize_kwargs["pad_to_multiple_of"] = 64
+
+    print(
+        "Resizing base model embeddings before loading adapter: "
+        f"{current_vocab_size} -> {target_vocab_size} "
+        f"(tokenizer={tokenizer_vocab_size}, adapter={adapter_vocab_size})"
+    )
+    try:
+        model.resize_token_embeddings(target_vocab_size, **resize_kwargs)
+    except TypeError:
+        resize_kwargs.pop("pad_to_multiple_of", None)
+        model.resize_token_embeddings(target_vocab_size, **resize_kwargs)
+
+
 def _load_model_and_tokenizer(
     base_model: str, adapter_path: Optional[str], *, dtype: torch.dtype, attn_impl: str
 ) -> tuple[Any, Any]:
@@ -374,6 +450,7 @@ def _load_model_and_tokenizer(
         model = AutoModelForCausalLM.from_pretrained(base_model, **load_kwargs)
 
     if adapter_path:
+        _maybe_resize_base_model_for_adapter(model, tokenizer, adapter_path)
         model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
     return tokenizer, model
@@ -395,6 +472,18 @@ def _resolve_tag_token_ids(tokenizer: Any) -> dict[str, int]:
         raise ValueError(f"Tokenizer is missing endpointing label tokens: {', '.join(missing_tags)}")
 
     return tag_token_ids
+
+
+def _validate_tag_token_ids_fit_model(model: Any, tag_token_ids: dict[str, int]) -> None:
+    model_vocab_size = _get_model_vocab_size(model)
+    max_tag_token_id = max(tag_token_ids.values())
+    if max_tag_token_id >= model_vocab_size:
+        raise ValueError(
+            "Tokenizer label token ids exceed model vocab size after loading. "
+            f"max_tag_token_id={max_tag_token_id}, model_vocab_size={model_vocab_size}. "
+            "When evaluating an adapter checkpoint, ensure the base model embeddings are resized to match the "
+            "adapter/tokenizer vocab before attaching LoRA weights."
+        )
 
 
 def _iter_batches(items: list[Any], batch_size: int) -> list[list[Any]]:
@@ -528,6 +617,7 @@ def main() -> None:
     dtype = _dtype_from_str(args.dtype)
     tokenizer, model = _load_model_and_tokenizer(args.base_model, args.adapter, dtype=dtype, attn_impl=args.attn_impl)
     tag_token_ids = _resolve_tag_token_ids(tokenizer)
+    _validate_tag_token_ids_fit_model(model, tag_token_ids)
     print(f"Resolved tag token ids: {tag_token_ids}")
 
     export_probe = None
