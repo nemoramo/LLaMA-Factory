@@ -486,6 +486,15 @@ def _validate_tag_token_ids_fit_model(model: Any, tag_token_ids: dict[str, int])
         )
 
 
+def _gather_tag_logits(next_logits: torch.Tensor, tag_token_ids: dict[str, int]) -> torch.Tensor:
+    tag_index = torch.tensor(
+        [tag_token_ids[tag] for tag in TAGS],
+        device=next_logits.device,
+        dtype=torch.long,
+    )
+    return next_logits.index_select(dim=1, index=tag_index)
+
+
 def _iter_batches(items: list[Any], batch_size: int) -> list[list[Any]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
@@ -641,7 +650,6 @@ def main() -> None:
             print("[OK] The three endpointing label tokens occupy the full-vocab top-3 positions.")
 
     device = _device_of(model)
-    tag_id_tensor = torch.tensor([tag_token_ids[tag] for tag in TAGS], device=device, dtype=torch.long)
 
     results: list[dict[str, Any]] = []
     t0 = time.time()
@@ -660,7 +668,7 @@ def main() -> None:
         with torch.inference_mode():
             next_logits = model(**enc).logits[:, -1, :].float()
 
-        tag_logits = next_logits.index_select(dim=1, index=tag_id_tensor)
+        tag_logits = _gather_tag_logits(next_logits, tag_token_ids)
         tag_probs = torch.softmax(tag_logits, dim=-1)
         topk_scores, topk_ids = torch.topk(next_logits, k=min(args.topk, int(next_logits.shape[-1])), dim=-1)
         pred_indices = torch.argmax(tag_logits, dim=-1)

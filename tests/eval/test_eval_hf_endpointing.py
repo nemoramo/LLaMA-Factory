@@ -88,3 +88,14 @@ def test_validate_tag_token_ids_fit_model_raises_for_out_of_range_ids() -> None:
 
     with pytest.raises(ValueError, match="Tokenizer label token ids exceed model vocab size"):
         MODULE._validate_tag_token_ids_fit_model(model, {"<EOU>": 100, "<CONT_USER>": 101, "<UNADDRESSED>": 102})
+
+
+def test_gather_tag_logits_uses_logits_device_and_tag_order() -> None:
+    next_logits = torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5]], dtype=torch.float32)
+    tag_logits = MODULE._gather_tag_logits(
+        next_logits,
+        {"<EOU>": 4, "<CONT_USER>": 1, "<UNADDRESSED>": 3},
+    )
+
+    assert tag_logits.device == next_logits.device
+    assert torch.allclose(tag_logits, torch.tensor([[0.5, 0.2, 0.4]], dtype=torch.float32))
