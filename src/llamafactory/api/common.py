@@ -16,15 +16,11 @@ import ipaddress
 import json
 import os
 import socket
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import urlparse
 
 from ..extras.misc import is_env_enabled
 from ..extras.packages import is_fastapi_available
-
-
-if is_fastapi_available():
-    from fastapi import HTTPException, status
 
 
 if TYPE_CHECKING:
@@ -33,6 +29,24 @@ if TYPE_CHECKING:
 
 SAFE_MEDIA_PATH = os.environ.get("SAFE_MEDIA_PATH", os.path.join(os.path.dirname(__file__), "safe_media"))
 ALLOW_LOCAL_FILES = is_env_enabled("ALLOW_LOCAL_FILES", "1")
+
+
+def raise_http_error(status_code: int, detail: str) -> NoReturn:
+    if not is_fastapi_available():
+        raise ImportError("Install `fastapi` to use the API module.")
+
+    from fastapi import HTTPException
+
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+def _is_http_exception(exc: Exception) -> bool:
+    if not is_fastapi_available():
+        return False
+
+    from fastapi import HTTPException
+
+    return isinstance(exc, HTTPException)
 
 
 def dictify(data: "BaseModel") -> dict[str, Any]:
@@ -52,7 +66,7 @@ def jsonify(data: "BaseModel") -> str:
 def check_lfi_path(path: str) -> None:
     """Checks if a given path is vulnerable to LFI. Raises HTTPException if unsafe."""
     if not ALLOW_LOCAL_FILES:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Local file access is disabled.")
+        raise_http_error(403, "Local file access is disabled.")
 
     try:
         os.makedirs(SAFE_MEDIA_PATH, exist_ok=True)
@@ -60,37 +74,36 @@ def check_lfi_path(path: str) -> None:
         safe_path = os.path.realpath(SAFE_MEDIA_PATH)
 
         if not real_path.startswith(safe_path):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, detail="File access is restricted to the safe media directory."
-            )
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or inaccessible file path.")
+            raise_http_error(403, "File access is restricted to the safe media directory.")
+    except Exception as e:
+        if _is_http_exception(e):
+            raise
+
+        raise_http_error(400, "Invalid or inaccessible file path.")
 
 
 def check_ssrf_url(url: str) -> None:
     """Checks if a given URL is vulnerable to SSRF. Raises HTTPException if unsafe."""
+    parsed_url = urlparse(url)
     try:
-        parsed_url = urlparse(url)
         if parsed_url.scheme not in ["http", "https"]:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only HTTP/HTTPS URLs are allowed.")
+            raise_http_error(400, "Only HTTP/HTTPS URLs are allowed.")
 
         hostname = parsed_url.hostname
         if not hostname:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid URL hostname.")
+            raise_http_error(400, "Invalid URL hostname.")
 
         ip_info = socket.getaddrinfo(hostname, parsed_url.port)
         ip_address_str = ip_info[0][4][0]
         ip = ipaddress.ip_address(ip_address_str)
 
         if not ip.is_global:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access to private or reserved IP addresses is not allowed.",
-            )
+            raise_http_error(403, "Access to private or reserved IP addresses is not allowed.")
 
     except socket.gaierror:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not resolve hostname: {parsed_url.hostname}"
-        )
+        raise_http_error(400, f"Could not resolve hostname: {parsed_url.hostname}")
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid URL: {e}")
+        if _is_http_exception(e):
+            raise
+
+        raise_http_error(400, f"Invalid URL: {e}")

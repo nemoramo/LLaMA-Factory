@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import inspect
+import importlib
 import json
 import math
 import os
@@ -27,7 +28,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, Optional, Sequence, TypeGuard, TypedDict, Union, cast
 from urllib.parse import urlparse
 
 import numpy as np
@@ -216,20 +217,39 @@ def _get_tos_client():
     return client
 
 
+class _MissingPILImage:
+    pass
+
+
+Image: Any | None = None
+ImageObject = _MissingPILImage
 if is_pillow_available():
     from PIL import Image
     from PIL.Image import Image as ImageObject
 
-
+av = None
 if is_pyav_available():
     import av
 
 
-if is_transformers_version_greater_than("4.52.0"):
-    from transformers.image_utils import make_flat_list_of_images
-    from transformers.video_utils import make_batched_videos
-else:
-    from transformers.image_utils import make_batched_videos, make_flat_list_of_images
+from transformers.image_utils import make_flat_list_of_images
+
+
+def _load_make_batched_videos():
+    for module_name in ("transformers.video_utils", "transformers.image_utils"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+
+        func = getattr(module, "make_batched_videos", None)
+        if callable(func):
+            return func
+
+    raise ImportError("Cannot find `make_batched_videos` in transformers.video_utils or transformers.image_utils.")
+
+
+make_batched_videos = _load_make_batched_videos()
 
 
 if TYPE_CHECKING:
@@ -244,15 +264,15 @@ if TYPE_CHECKING:
         path: str | None
         bytes: bytes | None
 
-    ImageInput = Union[str, bytes, EncodedImage, BinaryIO, ImageObject]
+    ImageInput = Union[str, bytes, EncodedImage, BinaryIO, Any]
     VideoInput = Union[str, BinaryIO, list[list[ImageInput]]]
     AudioInput = Union[str, BinaryIO, NDArray, dict[str, Any]]
 
     class RegularizedImageOutput(TypedDict):
-        images: list[ImageObject]
+        images: list[Any]
 
     class RegularizedVideoOutput(TypedDict):
-        videos: list[list[ImageObject]]
+        videos: list[list[Any]]
         durations: list[float]
         fps_per_video: NotRequired[list[float]]
 
@@ -268,7 +288,7 @@ if TYPE_CHECKING:
         vision_feature_select_strategy: Literal["default", "full"]
 
         def _get_number_of_features(self, orig_height: int, orig_width: int, height: int, width: int) -> int:
-            pass
+            ...
 
 
 logger = logging.get_logger(__name__)
@@ -309,19 +329,64 @@ def _get_gemma3_token_type_ids(batch_ids: list[list[int]], processor: MMProcesso
     return batch_token_type_ids
 
 
-def _make_batched_images(images: list[ImageObject], imglens: list[int]) -> list[list[ImageObject]]:
+def _make_batched_images(images: Sequence[Any], imglens: list[int]) -> list[list[Any]]:
     r"""Make nested list of images."""
+    remaining_images = list(images)
     batch_images = []
     for imglen in imglens:
-        batch_images.append(images[:imglen])
-        images = images[imglen:]
+        batch_images.append(remaining_images[:imglen])
+        remaining_images = remaining_images[imglen:]
 
     return batch_images
 
 
 def _check_video_is_nested_images(video: VideoInput) -> bool:
     r"""Check if the video is nested images."""
-    return isinstance(video, list) and all(isinstance(frame, (str, BinaryIO, dict, ImageObject)) for frame in video)
+    return isinstance(video, list) and all(
+        _is_path_like(frame) or isinstance(frame, (bytes, dict, ImageObject)) or _is_file_like(frame) for frame in video
+    )
+
+
+def _is_file_like(obj: object) -> TypeGuard[BinaryIO]:
+    return callable(getattr(obj, "read", None))
+
+
+def _is_path_like(obj: object) -> TypeGuard[str | os.PathLike[str]]:
+    return isinstance(obj, (str, os.PathLike))
+
+
+def _seek_to_start(obj: object) -> None:
+    seek = getattr(obj, "seek", None)
+    if not callable(seek):
+        return
+
+    try:
+        seek(0, 0)
+    except TypeError:
+        try:
+            seek(0)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _require_pillow() -> None:
+    if Image is None:
+        raise ImportError("Image processing requires Pillow. Please install it in your environment.")
+
+
+def _require_pyav() -> None:
+    if av is None:
+        raise ImportError("Video processing requires PyAV. Please install it in your environment.")
+
+
+def _decode_video_frame(frame: object) -> Any:
+    to_image = getattr(frame, "to_image", None)
+    if not callable(to_image):
+        raise TypeError(f"Invalid video frame type: {type(frame)}")
+
+    return to_image()
 
 
 @dataclass
@@ -410,8 +475,8 @@ class MMPluginMixin:
             )
 
     def _preprocess_image(
-        self, image: ImageObject, image_max_pixels: int, image_min_pixels: int, **kwargs
-    ) -> ImageObject:
+        self, image: Any, image_max_pixels: int, image_min_pixels: int, **kwargs
+    ) -> Any:
         r"""Pre-process a single image."""
         if (image.width * image.height) > image_max_pixels:
             resize_factor = math.sqrt(image_max_pixels / (image.width * image.height))
@@ -434,17 +499,28 @@ class MMPluginMixin:
         r"""Compute video sample indices according to fps."""
         total_frames = video_stream.frames
         if total_frames == 0:  # infinite video
-            return np.linspace(0, video_maxlen - 1, video_maxlen).astype(np.int32)
+            return [int(idx) for idx in np.asarray(np.linspace(0, video_maxlen - 1, video_maxlen).astype(np.int32)).reshape(-1)]
 
-        sample_frames = max(1, math.floor(float(video_stream.duration * video_stream.time_base) * video_fps))
+        duration = video_stream.duration
+        time_base = video_stream.time_base
+        if duration is None or time_base is None:
+            sample_frames = min(total_frames, video_maxlen)
+        else:
+            sample_frames = max(1, math.floor(float(duration * time_base) * video_fps))
+
         sample_frames = min(total_frames, video_maxlen, sample_frames)
-        return np.linspace(0, total_frames - 1, sample_frames).astype(np.int32)
+        return [int(idx) for idx in np.asarray(np.linspace(0, total_frames - 1, sample_frames).astype(np.int32)).reshape(-1)]
 
-    def _regularize_images(self, images: list[ImageInput], **kwargs) -> RegularizedImageOutput:
+    def _regularize_images(self, images: Sequence[Any], **kwargs) -> RegularizedImageOutput:
         r"""Regularize images to avoid error. Including reading and pre-processing."""
-        results = []
+        _require_pillow()
+        assert Image is not None
+        results: list[Any] = []
         for image in images:
-            if isinstance(image, (str, BinaryIO)):
+            if _is_path_like(image):
+                image = Image.open(image)
+            elif _is_file_like(image):
+                _seek_to_start(image)
                 image = Image.open(image)
             elif isinstance(image, bytes):
                 image = Image.open(BytesIO(image))
@@ -452,7 +528,10 @@ class MMPluginMixin:
                 if image["bytes"] is not None:
                     image = Image.open(BytesIO(image["bytes"]))
                 else:
-                    image = Image.open(image["path"])
+                    image_path = image["path"]
+                    if image_path is None:
+                        raise ValueError("Encoded image input must contain either `bytes` or `path`.")
+                    image = Image.open(image_path)
 
             if not isinstance(image, ImageObject):
                 raise ValueError(f"Expect input is a list of images, but got {type(image)}.")
@@ -463,31 +542,42 @@ class MMPluginMixin:
 
     def _regularize_videos(self, videos: list[VideoInput], **kwargs) -> RegularizedVideoOutput:
         r"""Regularizes videos to avoid error. Including reading, resizing and converting."""
-        results = []
-        durations = []
+        results: list[list[Any]] = []
+        durations: list[float] = []
         for video in videos:
-            frames: list[ImageObject] = []
+            frames: list[Any] = []
             if _check_video_is_nested_images(video):
+                assert isinstance(video, list)
                 for frame in video:
-                    if not is_valid_image(frame) and not isinstance(frame, dict) and not os.path.exists(frame):
+                    if not is_valid_image(frame) and not isinstance(frame, dict) and not (
+                        (_is_path_like(frame) and os.path.exists(frame)) or _is_file_like(frame)
+                    ):
                         raise ValueError("Invalid image found in video frames.")
-                frames = video
+                frame_inputs = cast(list[Any], video)
+                frames = self._regularize_images(frame_inputs, **kwargs)["images"]
                 durations.append(len(frames) / kwargs.get("video_fps", 2.0))
             else:
+                _require_pyav()
+                assert av is not None
                 container = av.open(video, "r")
                 video_stream = next(stream for stream in container.streams if stream.type == "video")
                 sample_indices = self._get_video_sample_indices(video_stream, **kwargs)
                 container.seek(0)
                 for frame_idx, frame in enumerate(container.decode(video_stream)):
                     if frame_idx in sample_indices:
-                        frames.append(frame.to_image())
+                        frames.append(_decode_video_frame(frame))
 
                 if video_stream.duration is None:
                     durations.append(len(frames) / kwargs.get("video_fps", 2.0))
                 else:
-                    durations.append(float(video_stream.duration * video_stream.time_base))
+                    time_base = video_stream.time_base
+                    if time_base is None:
+                        durations.append(len(frames) / kwargs.get("video_fps", 2.0))
+                    else:
+                        durations.append(float(video_stream.duration * time_base))
 
-            frames = self._regularize_images(frames, **kwargs)["images"]
+                frames = self._regularize_images(frames, **kwargs)["images"]
+
             results.append(frames)
 
         return {"videos": results, "durations": durations}
@@ -503,11 +593,8 @@ class MMPluginMixin:
                 "Loading audio requires `pydub`. Please install it in your environment, e.g. `pip install pydub`."
             )
 
-        if isinstance(src, (BytesIO, BinaryIO)) or hasattr(src, "read"):
-            try:
-                src.seek(0)
-            except Exception:  # noqa: BLE001
-                pass
+        if isinstance(src, BytesIO) or _is_file_like(src):
+            _seek_to_start(src)
 
         segment = AudioSegment.from_file(src)
 
@@ -593,7 +680,7 @@ class MMPluginMixin:
             else:
                 path = audio.get("path") or audio.get("wav_path") or audio.get("audio_path") or audio.get("uri")
                 if isinstance(path, (str, os.PathLike)) and os.fspath(path):
-                    audio = path
+                    audio = os.fsdecode(path)
                 else:
                     raw = audio.get("raw")
                     if raw is not None:
@@ -604,20 +691,14 @@ class MMPluginMixin:
             return audio, sampling_rate
 
         # Binary/file-like
-        if isinstance(audio, BytesIO) or hasattr(audio, "read"):
-            try:
-                audio.seek(0, 0)
-            except (AttributeError, OSError):
-                pass
+        if isinstance(audio, BytesIO) or _is_file_like(audio):
+            _seek_to_start(audio)
 
             if AudioSegment is not None:
                 try:
                     return self._load_audio_with_pydub(audio, sampling_rate)
                 except Exception:  # noqa: BLE001
-                    try:
-                        audio.seek(0, 0)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    _seek_to_start(audio)
 
             if librosa is not None:
                 y, sr = librosa.load(audio, sr=sampling_rate)
@@ -630,7 +711,7 @@ class MMPluginMixin:
 
         # String or os.PathLike path / URI
         if isinstance(audio, (str, os.PathLike)):
-            path = os.fspath(audio)
+            path = os.fsdecode(audio)
             mapped = maybe_map_mount_to_tos_uri(path)
             if mapped is not None:
                 path = mapped
@@ -650,10 +731,7 @@ class MMPluginMixin:
                     try:
                         return self._load_audio_with_pydub(bio, sampling_rate)
                     except Exception:  # noqa: BLE001
-                        try:
-                            bio.seek(0)
-                        except Exception:  # noqa: BLE001
-                            pass
+                        _seek_to_start(bio)
 
                 if librosa is not None:
                     y, sr = librosa.load(bio, sr=sampling_rate)
@@ -670,7 +748,8 @@ class MMPluginMixin:
                     data, sr = soundfile.read(path, dtype="float32", always_2d=True)
                     if not isinstance(sr, (int, float)) or sr <= 0:
                         raise ValueError(f"Invalid sampling rate from soundfile: {sr!r}")
-                    waveform = data.mean(axis=1).astype(np.float32) if data.shape[1] > 1 else data[:, 0].astype(np.float32)
+                    num_channels = int(data.shape[-1]) if data.ndim > 1 else 1
+                    waveform = data.mean(axis=1).astype(np.float32) if num_channels > 1 else data[:, 0].astype(np.float32)
                     target_sr = int(sampling_rate) if sampling_rate is not None else int(sr)
                     if int(sr) != int(target_sr):
                         if librosa is None:
@@ -3038,37 +3117,51 @@ class Qwen2VLPlugin(BasePlugin):
 
     @override
     def _regularize_videos(self, videos: list[VideoInput], **kwargs) -> RegularizedVideoOutput:
-        results, fps_per_video, durations = [], [], []
+        results: list[list[Any]] = []
+        fps_per_video: list[float] = []
+        durations: list[float] = []
         for video in videos:
-            frames: list[ImageObject] = []
+            frames: list[Any] = []
             if _check_video_is_nested_images(video):
+                assert isinstance(video, list)
                 for frame in video:
-                    if not is_valid_image(frame) and not isinstance(frame, dict) and not os.path.exists(frame):
+                    if not is_valid_image(frame) and not isinstance(frame, dict) and not (
+                        (_is_path_like(frame) and os.path.exists(frame)) or _is_file_like(frame)
+                    ):
                         raise ValueError("Invalid image found in video frames.")
 
-                frames = video
+                frame_inputs = cast(list[Any], video)
+                frames = self._regularize_images(frame_inputs, **kwargs)["images"]
                 fps_per_video.append(kwargs.get("video_fps", 2.0))
                 durations.append(len(frames) / kwargs.get("video_fps", 2.0))
             else:
+                _require_pyav()
+                assert av is not None
                 container = av.open(video, "r")
                 video_stream = next(stream for stream in container.streams if stream.type == "video")
                 sample_indices = self._get_video_sample_indices(video_stream, **kwargs)
                 container.seek(0)
                 for frame_idx, frame in enumerate(container.decode(video_stream)):
                     if frame_idx in sample_indices:
-                        frames.append(frame.to_image())
+                        frames.append(_decode_video_frame(frame))
 
                 if video_stream.duration is None:
                     fps_per_video.append(kwargs.get("video_fps", 2.0))
                     durations.append(len(frames) / kwargs.get("video_fps", 2.0))
                 else:
-                    fps_per_video.append(len(sample_indices) / float(video_stream.duration * video_stream.time_base))
-                    durations.append(float(video_stream.duration * video_stream.time_base))
+                    time_base = video_stream.time_base
+                    if time_base is None:
+                        fps_per_video.append(kwargs.get("video_fps", 2.0))
+                        durations.append(len(frames) / kwargs.get("video_fps", 2.0))
+                    else:
+                        fps_per_video.append(len(sample_indices) / float(video_stream.duration * time_base))
+                        durations.append(float(video_stream.duration * time_base))
+
+                frames = self._regularize_images(frames, **kwargs)["images"]
 
             if len(frames) % 2 != 0:
                 frames.append(frames[-1])
 
-            frames = self._regularize_images(frames, **kwargs)["images"]
             results.append(frames)
 
         return {"videos": results, "fps_per_video": fps_per_video, "durations": durations}

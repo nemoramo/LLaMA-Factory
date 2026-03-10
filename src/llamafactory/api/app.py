@@ -16,12 +16,13 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from functools import partial
-from typing import Annotated
+from typing import TYPE_CHECKING
 
 from ..chat import ChatModel
 from ..extras.constants import EngineName
 from ..extras.misc import torch_gc
 from ..extras.packages import is_fastapi_available, is_starlette_available, is_uvicorn_available
+from .common import raise_http_error
 from .chat import (
     create_chat_completion_response,
     create_score_evaluation_response,
@@ -37,18 +38,38 @@ from .protocol import (
 )
 
 
-if is_fastapi_available():
-    from fastapi import Depends, FastAPI, HTTPException, status
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+    from fastapi.security.http import HTTPAuthorizationCredentials
+
+
+def _require_fastapi_components():
+    if not is_fastapi_available():
+        raise ImportError("Install `fastapi` to use the API server.")
+
+    from fastapi import Depends, FastAPI
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 
+    return Depends, FastAPI, CORSMiddleware, HTTPAuthorizationCredentials, HTTPBearer
 
-if is_starlette_available():
+
+def _require_event_source_response():
+    if not is_starlette_available():
+        raise ImportError("Install `sse-starlette` to stream chat completions.")
+
     from sse_starlette import EventSourceResponse
 
+    return EventSourceResponse
 
-if is_uvicorn_available():
+
+def _require_uvicorn():
+    if not is_uvicorn_available():
+        raise ImportError("Install `uvicorn` to run the API server.")
+
     import uvicorn
+
+    return uvicorn
 
 
 async def sweeper() -> None:
@@ -67,6 +88,7 @@ async def lifespan(app: "FastAPI", chat_model: "ChatModel"):  # collects GPU mem
 
 
 def create_app(chat_model: "ChatModel") -> "FastAPI":
+    Depends, FastAPI, CORSMiddleware, HTTPAuthorizationCredentials, HTTPBearer = _require_fastapi_components()
     root_path = os.getenv("FASTAPI_ROOT_PATH", "")
     app = FastAPI(lifespan=partial(lifespan, chat_model=chat_model), root_path=root_path)
     app.add_middleware(
@@ -79,14 +101,14 @@ def create_app(chat_model: "ChatModel") -> "FastAPI":
     api_key = os.getenv("API_KEY")
     security = HTTPBearer(auto_error=False)
 
-    async def verify_api_key(auth: Annotated[HTTPAuthorizationCredentials | None, Depends(security)]):
+    async def verify_api_key(auth: "HTTPAuthorizationCredentials | None" = Depends(security)):
         if api_key and (auth is None or auth.credentials != api_key):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key.")
+            raise_http_error(401, "Invalid API key.")
 
     @app.get(
         "/v1/models",
         response_model=ModelList,
-        status_code=status.HTTP_200_OK,
+        status_code=200,
         dependencies=[Depends(verify_api_key)],
     )
     async def list_models():
@@ -96,14 +118,15 @@ def create_app(chat_model: "ChatModel") -> "FastAPI":
     @app.post(
         "/v1/chat/completions",
         response_model=ChatCompletionResponse,
-        status_code=status.HTTP_200_OK,
+        status_code=200,
         dependencies=[Depends(verify_api_key)],
     )
     async def create_chat_completion(request: ChatCompletionRequest):
         if not chat_model.engine.can_generate:
-            raise HTTPException(status_code=status.HTTP_405_METHOD_NOT_ALLOWED, detail="Not allowed")
+            raise_http_error(405, "Not allowed")
 
         if request.stream:
+            EventSourceResponse = _require_event_source_response()
             generate = create_stream_chat_completion_response(request, chat_model)
             return EventSourceResponse(generate, media_type="text/event-stream", sep="\n")
         else:
@@ -112,12 +135,12 @@ def create_app(chat_model: "ChatModel") -> "FastAPI":
     @app.post(
         "/v1/score/evaluation",
         response_model=ScoreEvaluationResponse,
-        status_code=status.HTTP_200_OK,
+        status_code=200,
         dependencies=[Depends(verify_api_key)],
     )
     async def create_score_evaluation(request: ScoreEvaluationRequest):
         if chat_model.engine.can_generate:
-            raise HTTPException(status_code=status.HTTP_405_METHOD_NOT_ALLOWED, detail="Not allowed")
+            raise_http_error(405, "Not allowed")
 
         return await create_score_evaluation_response(request, chat_model)
 
@@ -130,4 +153,5 @@ def run_api() -> None:
     api_host = os.getenv("API_HOST", "0.0.0.0")
     api_port = int(os.getenv("API_PORT", "8000"))
     print(f"Visit http://localhost:{api_port}/docs for API document.")
+    uvicorn = _require_uvicorn()
     uvicorn.run(app, host=api_host, port=api_port)

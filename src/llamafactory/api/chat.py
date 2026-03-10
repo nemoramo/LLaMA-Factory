@@ -19,14 +19,14 @@ import os
 import re
 import uuid
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from ..data import Role as DataRole
 from ..extras import logging
 from ..extras.constants import AUDIO_PLACEHOLDER, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
 from ..extras.misc import is_env_enabled
 from ..extras.packages import is_fastapi_available, is_pillow_available, is_requests_available
-from .common import check_lfi_path, check_ssrf_url, dictify, jsonify
+from .common import check_lfi_path, check_ssrf_url, dictify, jsonify, raise_http_error
 from .protocol import (
     ChatCompletionMessage,
     ChatCompletionResponse,
@@ -42,22 +42,43 @@ from .protocol import (
 )
 
 
-if is_fastapi_available():
-    from fastapi import HTTPException, status
-
-
-if is_pillow_available():
-    from PIL import Image
-
-
-if is_requests_available():
-    import requests
-
-
 if TYPE_CHECKING:
     from ..chat import ChatModel
     from ..data.mm_plugin import AudioInput, ImageInput, VideoInput
     from .protocol import ChatCompletionRequest, ScoreEvaluationRequest
+
+
+def _require_requests():
+    if not is_requests_available():
+        raise ImportError("Install `requests` to fetch remote media in the API.")
+
+    import requests
+
+    return requests
+
+
+def _require_image_module():
+    if not is_pillow_available():
+        raise ImportError("Install `Pillow` to process image inputs in the API.")
+
+    from PIL import Image
+
+    return Image
+
+
+def _require_text_content(text: str | None) -> str:
+    if text is None:
+        raise_http_error(400, "Invalid text input.")
+
+    return text
+
+
+def _require_media_url(url_obj: Any, field_name: str) -> str:
+    url = getattr(url_obj, "url", None)
+    if not isinstance(url, str) or len(url) == 0:
+        raise_http_error(400, f"Invalid {field_name}.")
+
+    return url
 
 
 logger = logging.get_logger(__name__)
@@ -84,7 +105,7 @@ def _process_request(
         logger.info_rank0(f"==== request ====\n{json.dumps(dictify(request), indent=2, ensure_ascii=False)}")
 
     if len(request.messages) == 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid length")
+        raise_http_error(400, "Invalid length")
 
     if request.messages[0].role == Role.SYSTEM:
         content = request.messages.pop(0).content
@@ -93,15 +114,15 @@ def _process_request(
         system = None
 
     if len(request.messages) % 2 == 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only supports u/a/u/a/u...")
+        raise_http_error(400, "Only supports u/a/u/a/u...")
 
     input_messages = []
     images, videos, audios = [], [], []
     for i, message in enumerate(request.messages):
         if i % 2 == 0 and message.role not in [Role.USER, Role.TOOL]:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
+            raise_http_error(400, "Invalid role")
         elif i % 2 == 1 and message.role not in [Role.ASSISTANT, Role.FUNCTION]:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
+            raise_http_error(400, "Invalid role")
 
         if message.role == Role.ASSISTANT and isinstance(message.tool_calls, list) and len(message.tool_calls):
             tool_calls = [
@@ -114,10 +135,10 @@ def _process_request(
             text_content = ""
             for input_item in message.content:
                 if input_item.type == "text":
-                    text_content += input_item.text
+                    text_content += _require_text_content(input_item.text)
                 elif input_item.type == "image_url":
                     text_content += IMAGE_PLACEHOLDER
-                    image_url = input_item.image_url.url
+                    image_url = _require_media_url(input_item.image_url, "image_url")
                     if re.match(r"^data:image\/(png|jpg|jpeg|gif|bmp);base64,(.+)$", image_url):  # base64 image
                         image_stream = io.BytesIO(base64.b64decode(image_url.split(",", maxsplit=1)[1]))
                     elif os.path.isfile(image_url):  # local file
@@ -125,12 +146,14 @@ def _process_request(
                         image_stream = open(image_url, "rb")
                     else:  # web uri
                         check_ssrf_url(image_url)
+                        requests = _require_requests()
                         image_stream = requests.get(image_url, stream=True).raw
 
-                    images.append(Image.open(image_stream).convert("RGB"))
+                    Image = _require_image_module()
+                    images.append(Image.open(cast(Any, image_stream)).convert("RGB"))
                 elif input_item.type == "video_url":
                     text_content += VIDEO_PLACEHOLDER
-                    video_url = input_item.video_url.url
+                    video_url = _require_media_url(input_item.video_url, "video_url")
                     if re.match(r"^data:video\/(mp4|mkv|avi|mov);base64,(.+)$", video_url):  # base64 video
                         video_stream = io.BytesIO(base64.b64decode(video_url.split(",", maxsplit=1)[1]))
                     elif os.path.isfile(video_url):  # local file
@@ -138,12 +161,13 @@ def _process_request(
                         video_stream = video_url
                     else:  # web uri
                         check_ssrf_url(video_url)
+                        requests = _require_requests()
                         video_stream = requests.get(video_url, stream=True).raw
 
                     videos.append(video_stream)
                 elif input_item.type == "audio_url":
                     text_content += AUDIO_PLACEHOLDER
-                    audio_url = input_item.audio_url.url
+                    audio_url = _require_media_url(input_item.audio_url, "audio_url")
                     if re.match(r"^data:audio\/(mpeg|mp3|wav|ogg);base64,(.+)$", audio_url):  # base64 audio
                         audio_stream = io.BytesIO(base64.b64decode(audio_url.split(",", maxsplit=1)[1]))
                     elif os.path.isfile(audio_url):  # local file
@@ -151,24 +175,33 @@ def _process_request(
                         audio_stream = audio_url
                     else:  # web uri
                         check_ssrf_url(audio_url)
+                        requests = _require_requests()
                         audio_stream = requests.get(audio_url, stream=True).raw
 
                     audios.append(audio_stream)
                 else:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid input type {input_item.type}."
-                    )
+                    raise_http_error(400, f"Invalid input type {input_item.type}.")
 
             input_messages.append({"role": ROLE_MAPPING[message.role], "content": text_content})
         else:
+            if not isinstance(message.content, str):
+                raise_http_error(400, "Invalid message content.")
+
             input_messages.append({"role": ROLE_MAPPING[message.role], "content": message.content})
 
     tool_list = request.tools
     if isinstance(tool_list, list) and len(tool_list):
         try:
-            tools = json.dumps([dictify(tool.function) for tool in tool_list], ensure_ascii=False)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid tools")
+            tool_defs = []
+            for tool in tool_list:
+                if tool.function is None:
+                    raise_http_error(400, "Invalid tools")
+
+                tool_defs.append(dictify(tool.function))
+
+            tools = json.dumps(tool_defs, ensure_ascii=False)
+        except (TypeError, ValueError):
+            raise_http_error(400, "Invalid tools")
     else:
         tools = None
 
@@ -179,7 +212,7 @@ def _create_stream_chat_completion_chunk(
     completion_id: str,
     model: str,
     delta: "ChatCompletionMessage",
-    index: Optional[int] = 0,
+    index: int = 0,
     finish_reason: Optional["Finish"] = None,
 ) -> str:
     choice_data = ChatCompletionStreamResponseChoice(index=index, delta=delta, finish_reason=finish_reason)
@@ -247,10 +280,10 @@ async def create_stream_chat_completion_response(
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     input_messages, system, tools, images, videos, audios = _process_request(request)
     if tools:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot stream function calls.")
+        raise_http_error(400, "Cannot stream function calls.")
 
     if request.n > 1:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot stream multiple responses.")
+        raise_http_error(400, "Cannot stream multiple responses.")
 
     yield _create_stream_chat_completion_chunk(
         completion_id=completion_id, model=request.model, delta=ChatCompletionMessage(role=Role.ASSISTANT, content="")
@@ -285,7 +318,7 @@ async def create_score_evaluation_response(
 ) -> "ScoreEvaluationResponse":
     score_id = f"scoreval-{uuid.uuid4().hex}"
     if len(request.messages) == 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid request")
+        raise_http_error(400, "Invalid request")
 
     scores = await chat_model.aget_scores(request.messages, max_length=request.max_length)
     return ScoreEvaluationResponse(id=score_id, model=request.model, scores=scores)
