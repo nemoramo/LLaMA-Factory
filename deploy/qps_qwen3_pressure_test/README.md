@@ -305,7 +305,8 @@ Best (p99<=60.0ms): scenario=sweep_c32_r500.json, req/s=498.7, p99=58.3ms, goodp
 - `DATASET`
 - `RESULTS_DIR`
 - `TOKENIZER_PATH`，默认跟随 `MODEL_PATH`
-- `BENCH_HOST`，默认 `127.0.0.1`
+- `BENCH_HOST`，本地模式默认 `127.0.0.1`；`RUN_ENV=sagemaker` 时默认改为服务容器名 `vllm-endpointing`
+- `SERVER_CONTAINER_NAME`，用于 bench 容器在 `RUN_ENV=sagemaker` 下解析 vLLM 服务，默认 `vllm-endpointing`
 - `BENCH_PORT`，默认 `8000`
 - `REQUEST_RATE`
 - `MAX_CONCURRENCY`
@@ -352,6 +353,8 @@ export RUN_ENV=sagemaker
 
 - `build_bench_image.sh` 默认使用 `--network sagemaker`
 - `run_server.sh` 和 `run_bench.sh` 默认使用 `--network sagemaker`
+- `run_bench.sh` 默认会把请求发到同网络中的 `vllm-endpointing:8000`
+- `run_server.sh health` / `wait-ready` 会自动探测 `vllm-endpointing` 在 `sagemaker` 网络内的容器 IP
 - 你仍然需要自行满足 SageMaker 对 Docker 路径、网络和权限的约束
 
 推荐同时显式传这些路径，而不是依赖默认值：

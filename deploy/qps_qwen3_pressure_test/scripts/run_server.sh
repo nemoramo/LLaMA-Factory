@@ -47,6 +47,13 @@ resolve_existing_dir() {
   (cd "${value}" && pwd)
 }
 
+require_container_exists() {
+  if ! docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
+    echo "Container not found: ${CONTAINER_NAME}"
+    exit 1
+  fi
+}
+
 require_model_path() {
   if [ -z "${MODEL_PATH}" ]; then
     echo "MODEL_PATH is required for ${ACTION}."
@@ -56,6 +63,42 @@ require_model_path() {
     echo "MODEL_PATH does not exist or is not a directory: ${MODEL_PATH}"
     exit 1
   fi
+}
+
+resolve_container_network_ip() {
+  local container_ip
+
+  require_container_exists
+  container_ip="$(
+    docker inspect \
+      --format "{{with index .NetworkSettings.Networks \"${NETWORK_NAME}\"}}{{.IPAddress}}{{end}}" \
+      "${CONTAINER_NAME}" 2>/dev/null || true
+  )"
+  if [ -z "${container_ip}" ]; then
+    echo "Container ${CONTAINER_NAME} is not attached to Docker network ${NETWORK_NAME}."
+    exit 1
+  fi
+
+  printf '%s\n' "${container_ip}"
+}
+
+resolve_health_url() {
+  local health_host
+
+  case "${RUN_ENV}" in
+    local)
+      health_host="127.0.0.1"
+      ;;
+    sagemaker)
+      health_host="$(resolve_container_network_ip)"
+      ;;
+    *)
+      echo "Unsupported RUN_ENV: ${RUN_ENV} (expected local or sagemaker)"
+      exit 1
+      ;;
+  esac
+
+  printf 'http://%s:%s/health\n' "${health_host}" "${VLLM_PORT}"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -166,16 +209,22 @@ logs() {
 }
 
 health() {
-  code="$(curl -s -o /tmp/vllm_health.out -w '%{http_code}' "http://127.0.0.1:${VLLM_PORT}/health" || true)"
-  echo "health_url=http://127.0.0.1:${VLLM_PORT}/health"
+  local health_url
+  local code
+
+  health_url="$(resolve_health_url)"
+  code="$(curl -s -o /tmp/vllm_health.out -w '%{http_code}' "${health_url}" || true)"
+  echo "health_url=${health_url}"
   echo "health_code=${code}"
 }
 
 wait_ready() {
   local attempt=0
   local max_attempts
+  local health_url
   local code=""
 
+  health_url="$(resolve_health_url)"
   max_attempts=$(( (READY_TIMEOUT_SEC + READY_POLL_INTERVAL_SEC - 1) / READY_POLL_INTERVAL_SEC ))
   if [ "${max_attempts}" -le 0 ]; then
     echo "READY_TIMEOUT_SEC must be positive."
@@ -184,8 +233,8 @@ wait_ready() {
 
   while [ "${attempt}" -lt "${max_attempts}" ]; do
     attempt=$((attempt + 1))
-    code="$(curl -s -o /tmp/vllm_health.out -w '%{http_code}' "http://127.0.0.1:${VLLM_PORT}/health" || true)"
-    echo "health_url=http://127.0.0.1:${VLLM_PORT}/health"
+    code="$(curl -s -o /tmp/vllm_health.out -w '%{http_code}' "${health_url}" || true)"
+    echo "health_url=${health_url}"
     echo "health_attempt=${attempt}"
     echo "health_code=${code}"
     if [ "${code}" = "200" ]; then

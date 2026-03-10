@@ -19,7 +19,8 @@ RESULTS_DIR="${RESULTS_DIR:-${ROOT_DIR}/results}"
 MODEL_PATH="${MODEL_PATH:-}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_PATH}}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-endpointing-qwen3-0.6b-ft}"
-BENCH_HOST="${BENCH_HOST:-127.0.0.1}"
+SERVER_CONTAINER_NAME="${SERVER_CONTAINER_NAME:-${CONTAINER_NAME:-vllm-endpointing}}"
+BENCH_HOST="${BENCH_HOST:-}"
 BENCH_PORT="${BENCH_PORT:-8000}"
 RATES="${RATES:-200,250,300,350,400,500}"
 REQUEST_RATE="${REQUEST_RATE:-}"
@@ -39,6 +40,7 @@ Options:
   --model-path PATH
   --tokenizer-path PATH
   --served-model-name NAME
+  --server-container-name NAME
   --host HOST
   --port PORT
   --request-rate N
@@ -74,6 +76,26 @@ value_or_default() {
   fi
 }
 
+resolve_bench_host() {
+  if [ -n "${BENCH_HOST}" ]; then
+    printf '%s\n' "${BENCH_HOST}"
+    return
+  fi
+
+  case "${RUN_ENV}" in
+    local)
+      printf '127.0.0.1\n'
+      ;;
+    sagemaker)
+      printf '%s\n' "${SERVER_CONTAINER_NAME}"
+      ;;
+    *)
+      echo "Unsupported RUN_ENV: ${RUN_ENV} (expected local or sagemaker)"
+      exit 1
+      ;;
+  esac
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dataset)
@@ -94,6 +116,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --served-model-name)
       SERVED_MODEL_NAME="$2"
+      shift 2
+      ;;
+    --server-container-name)
+      SERVER_CONTAINER_NAME="$2"
       shift 2
       ;;
     --host)
@@ -180,6 +206,7 @@ fi
 DATASET="$(resolve_existing_file "${DATASET}")"
 DATASET_DIR="$(dirname "${DATASET}")"
 DATASET_FILE="$(basename "${DATASET}")"
+BENCH_HOST="$(resolve_bench_host)"
 
 run_bench_once() {
   local result_file="$1"
