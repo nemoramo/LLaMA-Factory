@@ -20,6 +20,8 @@ Main areas:
   - validation and guardrails for FunAudioChat GRPO.
 - `examples/funaudiochat/*.yaml`
   - LoRA and full-LLM GRPO examples used during bring-up.
+- `scripts/repro_funaudiochat_vllm_generate.py`
+  - non-GRPO reproduction path for isolating `vLLM.generate()` with FunAudioChat audio requests.
 
 ## What works
 
@@ -28,6 +30,8 @@ Main areas:
 - Rule-based ASR reward is wired into rollout.
 - vLLM colocate rollout works for smoke tests.
 - Full-LLM + colocate + TP>1 can start and train for a while with the current branch plus the local vLLM modifications described below.
+- The parser now fail-fast blocks the known-unsafe `full + colocate + TP>1` FunAudioChat path unless the user sets
+  `grpo_allow_experimental_funaudiochat_colocate_tp: true`.
 
 ## Local vLLM dependency outside this branch
 

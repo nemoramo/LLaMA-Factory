@@ -55,6 +55,8 @@
   `funaudiochat_freeze_audio_tower: true`
 - 也支持 full-parameter LLM GRPO；如果只想放开语言模型，通常保持
   `funaudiochat_freeze_audio_tower: true` 且 `freeze_multi_modal_projector: true`
+- `full + colocate vLLM + grpo_vllm_tensor_parallel_size > 1` 仍然是实验路径，默认会 fail-fast；
+  只有显式设置 `grpo_allow_experimental_funaudiochat_colocate_tp: true` 才允许启动
 
 ### vLLM rollout engine
 
@@ -89,6 +91,18 @@ python ~/projects/vllm/examples/offline_inference/funaudiochat_audio_batch_repro
   --debug
 ```
 
+如果你要复现后续那个 `vLLM.generate()` 挂住问题、并且**不走 GRPO trainer**，可直接用：
+
+```bash
+python scripts/repro_funaudiochat_vllm_generate.py \
+  --model /path/to/Fun-Audio-Chat-8B \
+  --dataset funaudiochat_asr_hausa_youtube_test_norm_text_promptpool \
+  --dataset-dir /data2/mayufeng/manifests/llama_data \
+  --tensor-parallel-size 2 \
+  --input-mode audio \
+  --batch-mode auto
+```
+
 ### Full-parameter LLM GRPO
 
 参考 `examples/funaudiochat/funaudiochat_grpo_asr_full_llm.yaml`。
@@ -100,6 +114,8 @@ python ~/projects/vllm/examples/offline_inference/funaudiochat_audio_batch_repro
 - 保持 `funaudiochat_freeze_audio_tower: true`
 - 如果只想放开 LLM，保持 `freeze_multi_modal_projector: true`
 - 后续如果补上带在线权重同步的 rollout server，再考虑 server-mode 的 full-parameter GRPO
+- 如果仍要在 colocate 下使用 `grpo_vllm_tensor_parallel_size > 1`，必须同时设置
+  `grpo_allow_experimental_funaudiochat_colocate_tp: true`；这条路径目前只建议用于定位问题，不建议当稳定训练配置
 
 ## 批量评测（prompt_pool + normalized WER/WERE）
 

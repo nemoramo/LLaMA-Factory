@@ -366,6 +366,17 @@ class RLHFArguments:
         default=1,
         metadata={"help": "vLLM tensor parallel size used by GRPO in colocate mode."},
     )
+    grpo_allow_experimental_funaudiochat_colocate_tp: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Allow the experimental FunAudioChat GRPO path that combines "
+                "`finetuning_type=full`, `grpo_use_vllm=true`, `grpo_vllm_mode=colocate`, and "
+                "`grpo_vllm_tensor_parallel_size>1`. This path is fail-fast by default because it "
+                "still depends on external vLLM fixes and has unresolved hang reports."
+            )
+        },
+    )
     grpo_vllm_enable_sleep_mode: bool = field(
         default=False,
         metadata={"help": "Whether GRPO should enable vLLM sleep mode in colocate mode."},

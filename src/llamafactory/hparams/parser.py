@@ -348,6 +348,21 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         if finetuning_args.grpo_use_vllm and finetuning_args.grpo_vllm_mode != "colocate":
             raise ValueError("FunAudioChat GRPO currently only supports `grpo_vllm_mode=colocate`.")
 
+        if (
+            data_args.template == "funaudiochat"
+            and finetuning_args.grpo_use_vllm
+            and finetuning_args.grpo_vllm_mode == "colocate"
+            and finetuning_args.finetuning_type == "full"
+            and finetuning_args.grpo_vllm_tensor_parallel_size > 1
+            and not finetuning_args.grpo_allow_experimental_funaudiochat_colocate_tp
+        ):
+            raise ValueError(
+                "FunAudioChat GRPO with `finetuning_type=full`, colocated vLLM, and "
+                "`grpo_vllm_tensor_parallel_size>1` is still experimental and may hang in vLLM rollout. "
+                "Use `grpo_allow_experimental_funaudiochat_colocate_tp=true` only if you intentionally want "
+                "to debug this path and have the required external vLLM fixes."
+            )
+
     if not model_args.use_kt and training_args.parallel_mode == ParallelMode.NOT_DISTRIBUTED:
         raise ValueError("Please launch distributed training with `llamafactory-cli` or `torchrun`.")
 

@@ -55,6 +55,8 @@ Current constraints:
   `funaudiochat_freeze_audio_tower: true`.
 - Full-parameter LLM GRPO is also supported. In that setup, keep `funaudiochat_freeze_audio_tower: true` and usually
   `freeze_multi_modal_projector: true` if you only want to open the language model.
+- Full-parameter + colocated vLLM + `grpo_vllm_tensor_parallel_size > 1` is still experimental. It is fail-fast by
+  default and requires `grpo_allow_experimental_funaudiochat_colocate_tp: true` to opt in.
 
 ### vLLM rollout engine
 
@@ -89,6 +91,18 @@ python ~/projects/vllm/examples/offline_inference/funaudiochat_audio_batch_repro
   --debug
 ```
 
+If you want to reproduce the later `vLLM.generate()` hang without involving GRPO, use:
+
+```bash
+python scripts/repro_funaudiochat_vllm_generate.py \
+  --model /path/to/Fun-Audio-Chat-8B \
+  --dataset funaudiochat_asr_hausa_youtube_test_norm_text_promptpool \
+  --dataset-dir /data2/mayufeng/manifests/llama_data \
+  --tensor-parallel-size 2 \
+  --input-mode audio \
+  --batch-mode auto
+```
+
 ### Full-parameter LLM GRPO
 
 See `examples/funaudiochat/funaudiochat_grpo_asr_full_llm.yaml`.
@@ -101,6 +115,8 @@ Practical notes:
 - Keep `funaudiochat_freeze_audio_tower: true`.
 - If you only want to open the LLM, keep `freeze_multi_modal_projector: true`.
 - If you later add a dedicated rollout server with online weight sync, you can revisit server-mode full-parameter GRPO.
+- If you insist on `grpo_vllm_tensor_parallel_size > 1` in colocate mode, you must also set
+  `grpo_allow_experimental_funaudiochat_colocate_tp: true`. This path is for debugging, not stable training.
 
 ## Mixed tuning: LLM LoRA + full audio encoder/adapter
 

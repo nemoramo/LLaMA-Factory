@@ -63,3 +63,34 @@ def test_grpo_rejects_tokenized_path():
 def test_grpo_rejects_packing():
     with pytest.raises(ValueError, match="does not support packing"):
         get_train_args({**TRAIN_ARGS, "packing": True})
+
+
+def test_grpo_rejects_experimental_funaudiochat_full_colocate_tp():
+    with pytest.raises(ValueError, match="still experimental"):
+        get_train_args(
+            {
+                **TRAIN_ARGS,
+                "template": "funaudiochat",
+                "finetuning_type": "full",
+                "grpo_use_vllm": True,
+                "grpo_vllm_mode": "colocate",
+                "grpo_vllm_tensor_parallel_size": 2,
+            }
+        )
+
+
+def test_grpo_allows_experimental_funaudiochat_full_colocate_tp_with_override():
+    _, data_args, _, finetuning_args, _ = get_train_args(
+        {
+            **TRAIN_ARGS,
+            "template": "funaudiochat",
+            "finetuning_type": "full",
+            "grpo_use_vllm": True,
+            "grpo_vllm_mode": "colocate",
+            "grpo_vllm_tensor_parallel_size": 2,
+            "grpo_allow_experimental_funaudiochat_colocate_tp": True,
+        }
+    )
+
+    assert data_args.template == "funaudiochat"
+    assert finetuning_args.grpo_allow_experimental_funaudiochat_colocate_tp is True
