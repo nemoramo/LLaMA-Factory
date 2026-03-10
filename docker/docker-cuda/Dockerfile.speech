@@ -6,6 +6,7 @@ FROM ${BASE_IMAGE}
 ARG PIP_INDEX=https://pypi.org/simple
 ARG INSTALL_FLASHATTN=false
 ARG FLASH_ATTN_VERSION=2.8.3
+ARG TRANSFORMERS_VERSION=5.2.0
 ARG UBUNTU_MIRROR=https://mirrors.ustc.edu.cn/ubuntu/
 ARG HTTP_PROXY=""
 
@@ -47,6 +48,7 @@ COPY . /app
 
 RUN pip install --no-cache-dir --no-build-isolation -e . && \
     pip install --no-cache-dir --no-build-isolation \
+        "transformers==${TRANSFORMERS_VERSION}" \
         -r requirements/metrics.txt \
         -r requirements/speech.txt
 

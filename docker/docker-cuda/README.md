@@ -94,6 +94,7 @@ For speech training stacks that need `ffmpeg` / `ffprobe`, `libsndfile`, and the
 ```bash
 docker build -f ./docker/docker-cuda/Dockerfile.speech \
     --build-arg PIP_INDEX=https://pypi.org/simple \
+    --build-arg TRANSFORMERS_VERSION=5.2.0 \
     -t llamafactory:speech .
 ```
 
@@ -102,6 +103,7 @@ If you want to build the speech image with a fresh FlashAttention-2 wheel:
 ```bash
 docker build -f ./docker/docker-cuda/Dockerfile.speech \
     --build-arg PIP_INDEX=https://pypi.org/simple \
+    --build-arg TRANSFORMERS_VERSION=5.2.0 \
     --build-arg INSTALL_FLASHATTN=true \
     -t llamafactory:speech-fa2 .
 ```
@@ -130,13 +132,45 @@ docker run --rm --ipc=host --gpus "\"device=${GPU_ID}\"" \
 Notes:
 
 1. `--gpus "\"device=${GPU_ID}\""` exposes only the selected physical GPU to the container, and it will appear as `cuda:0` inside.
-2. The smoke test checks CUDA visibility, FlashAttention-2 availability, audio dependencies, `qwen3_asr` /
+2. `Dockerfile.speech` explicitly pins `transformers==5.2.0` by default via `TRANSFORMERS_VERSION=5.2.0`. This is
+   the currently validated speech stack version for `Qwen3-ASR`, `Qwen3` / `Qwen3.5` speech endpointing, and
+   `FunAudioChat`.
+3. If you need newer model support later, bump `TRANSFORMERS_VERSION`, rebuild the image, and rerun the smoke tests
+   plus `eval_hf_endpointing.py` before treating the upgrade as safe.
+4. The smoke test checks CUDA visibility, FlashAttention-2 availability, audio dependencies, `qwen3_asr` /
    `funaudiochat` registration, and the shipped Qwen3.5 speech-endpointing config.
-3. Replace `HF_CACHE`, `LOCAL_MODELS`, and `LOCAL_ADAPTERS` with paths that match your environment.
-4. `Dockerfile.speech` keeps the image focused on single-node speech workflows and does not preinstall `deepspeed`.
+5. Replace `HF_CACHE`, `LOCAL_MODELS`, and `LOCAL_ADAPTERS` with paths that match your environment.
+6. `Dockerfile.speech` keeps the image focused on single-node speech workflows and does not preinstall `deepspeed`.
    If you need it, install `requirements/deepspeed.txt` inside the container after build.
-5. If your Docker daemon requires elevated privileges, prepend `sudo` to the `docker build` and `docker run`
+7. If your Docker daemon requires elevated privileges, prepend `sudo` to the `docker build` and `docker run`
    commands above.
+
+### HF endpointing eval in Docker
+
+`examples/speech_endpointing/eval_hf_endpointing.py` has been smoke-tested inside `llamafactory:speech-fa2-20260309`
+with a local merged Qwen3 endpointing export. The canonical `export_prompt_probe` passed with:
+
+- top1 `<EOU>`
+- top2 `<CONT_USER>`
+- top3 `<UNADDRESSED>`
+
+Recommended merged-model invocation:
+
+```bash
+docker run --rm --ipc=host --gpus "\"device=${GPU_ID}\"" \
+    -v /path/to/exported_model:/smoke/model:ro \
+    -v /path/to/eval_jsonl_dir:/smoke/data:ro \
+    -v /path/to/output:/smoke/output \
+    llamafactory:speech-fa2 \
+    python /app/examples/speech_endpointing/eval_hf_endpointing.py \
+      --base-model /smoke/model \
+      --dataset /smoke/data/eval.jsonl \
+      --out-dir /smoke/output \
+      --export-prompt-probe
+```
+
+If the three special tags do not occupy the full-vocab top-3 positions, first inspect the export, especially
+`tie_word_embeddings`, before trusting the eval result.
 
 ### One-click Qwen3-ASR 20-step smoke
 

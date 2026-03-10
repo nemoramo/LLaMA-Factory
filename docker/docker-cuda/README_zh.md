@@ -94,6 +94,7 @@ docker exec -it llamafactory bash
 ```bash
 docker build -f ./docker/docker-cuda/Dockerfile.speech \
     --build-arg PIP_INDEX=https://pypi.org/simple \
+    --build-arg TRANSFORMERS_VERSION=5.2.0 \
     -t llamafactory:speech .
 ```
 
@@ -102,6 +103,7 @@ docker build -f ./docker/docker-cuda/Dockerfile.speech \
 ```bash
 docker build -f ./docker/docker-cuda/Dockerfile.speech \
     --build-arg PIP_INDEX=https://pypi.org/simple \
+    --build-arg TRANSFORMERS_VERSION=5.2.0 \
     --build-arg INSTALL_FLASHATTN=true \
     -t llamafactory:speech-fa2 .
 ```
@@ -130,10 +132,38 @@ docker run --rm --ipc=host --gpus "\"device=${GPU_ID}\"" \
 说明：
 
 1. `--gpus "\"device=${GPU_ID}\""` 只会把指定物理卡暴露给容器，容器内会显示为 `cuda:0`。
-2. smoke test 会检查 CUDA、FlashAttention-2、音频依赖、`qwen3_asr` / `funaudiochat` 注册，以及 Qwen3.5 endpointing 配置。
-3. 请把 `HF_CACHE`、`LOCAL_MODELS`、`LOCAL_ADAPTERS` 替换成你自己的路径。
-4. `Dockerfile.speech` 默认不预装 `deepspeed`。如果你需要它，可以在镜像内再安装 `requirements/deepspeed.txt`。
-5. 如果你的 Docker 需要提权，请在上面的 `docker build` 和 `docker run` 前面加 `sudo`。
+2. `Dockerfile.speech` 现在默认通过 `TRANSFORMERS_VERSION=5.2.0` 显式固定 `transformers==5.2.0`。这是当前已经验证过的语音栈版本，覆盖 `Qwen3-ASR`、`Qwen3` / `Qwen3.5` speech endpointing 和 `FunAudioChat`。
+3. 如果后续为了支持更多新模型需要升级 `transformers`，请先调整 `TRANSFORMERS_VERSION`，重建镜像，再重新跑 smoke test 和 `eval_hf_endpointing.py`，不要直接把升级结果当作安全。
+4. smoke test 会检查 CUDA、FlashAttention-2、音频依赖、`qwen3_asr` / `funaudiochat` 注册，以及 Qwen3.5 endpointing 配置。
+5. 请把 `HF_CACHE`、`LOCAL_MODELS`、`LOCAL_ADAPTERS` 替换成你自己的路径。
+6. `Dockerfile.speech` 默认不预装 `deepspeed`。如果你需要它，可以在镜像内再安装 `requirements/deepspeed.txt`。
+7. 如果你的 Docker 需要提权，请在上面的 `docker build` 和 `docker run` 前面加 `sudo`。
+
+### 在 Docker 里跑 HF endpointing eval
+
+`examples/speech_endpointing/eval_hf_endpointing.py` 已经在 `llamafactory:speech-fa2-20260309` 里做过实测，
+使用本地 merged Qwen3 endpointing 导出模型时，`export_prompt_probe` 通过，结果是：
+
+- top1 `<EOU>`
+- top2 `<CONT_USER>`
+- top3 `<UNADDRESSED>`
+
+推荐直接评估 merged 导出模型：
+
+```bash
+docker run --rm --ipc=host --gpus "\"device=${GPU_ID}\"" \
+    -v /path/to/exported_model:/smoke/model:ro \
+    -v /path/to/eval_jsonl_dir:/smoke/data:ro \
+    -v /path/to/output:/smoke/output \
+    llamafactory:speech-fa2 \
+    python /app/examples/speech_endpointing/eval_hf_endpointing.py \
+      --base-model /smoke/model \
+      --dataset /smoke/data/eval.jsonl \
+      --out-dir /smoke/output \
+      --export-prompt-probe
+```
+
+如果三个特殊标签没有进入 full-vocab top3，默认先排查 export，尤其先看 `tie_word_embeddings`，再判断是不是模型本身的问题。
 
 ### Qwen3-ASR 一键 20-step smoke
 
