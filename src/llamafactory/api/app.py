@@ -40,7 +40,6 @@ from .protocol import (
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
-    from fastapi.security.http import HTTPAuthorizationCredentials
 
 
 def _require_fastapi_components():
@@ -101,7 +100,7 @@ def create_app(chat_model: "ChatModel") -> "FastAPI":
     api_key = os.getenv("API_KEY")
     security = HTTPBearer(auto_error=False)
 
-    async def verify_api_key(auth: "HTTPAuthorizationCredentials | None" = Depends(security)):
+    async def verify_api_key(auth: HTTPAuthorizationCredentials | None = Depends(security)):
         if api_key and (auth is None or auth.credentials != api_key):
             raise_http_error(401, "Invalid API key.")
 
