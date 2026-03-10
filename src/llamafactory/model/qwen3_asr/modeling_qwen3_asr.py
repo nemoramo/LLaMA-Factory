@@ -14,6 +14,7 @@
 # limitations under the License.
 import math
 import os
+from inspect import signature
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, Callable, Optional, Protocol, TypeVar, Union, cast
@@ -88,6 +89,39 @@ def _is_jit_tracing() -> bool:
 
 
 _check_model_inputs = _resolve_check_model_inputs()
+
+
+def _resolve_create_causal_mask_inputs_kwarg(mask_fn: Callable[..., Any]) -> str:
+    try:
+        params = signature(mask_fn).parameters
+    except (TypeError, ValueError):
+        return "inputs_embeds"
+
+    if "inputs_embeds" in params:
+        return "inputs_embeds"
+    if "input_embeds" in params:
+        return "input_embeds"
+    return "inputs_embeds"
+
+
+def _create_causal_mask_compat(
+    *,
+    config: "Qwen3ASRThinkerConfig",
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    cache_position: torch.Tensor,
+    past_key_values: Cache | None,
+    position_ids: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    mask_kwargs: dict[str, Any] = {
+        "config": config,
+        "attention_mask": attention_mask,
+        "cache_position": cache_position,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+    }
+    mask_kwargs[_resolve_create_causal_mask_inputs_kwarg(create_causal_mask)] = inputs_embeds
+    return cast(torch.Tensor | None, create_causal_mask(**mask_kwargs))
 
 
 def _compute_default_rope_parameters(
@@ -1168,7 +1202,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         else:
             text_position_ids = position_ids[0]
 
-        attention_mask = create_causal_mask(
+        attention_mask = _create_causal_mask_compat(
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
