@@ -549,7 +549,7 @@ class MMPluginMixin:
             if _check_video_is_nested_images(video):
                 assert isinstance(video, list)
                 for frame in video:
-                    if not is_valid_image(frame) and not isinstance(frame, dict) and not (
+                    if not is_valid_image(frame) and not isinstance(frame, (bytes, dict)) and not (
                         (_is_path_like(frame) and os.path.exists(frame)) or _is_file_like(frame)
                     ):
                         raise ValueError("Invalid image found in video frames.")
@@ -3125,7 +3125,7 @@ class Qwen2VLPlugin(BasePlugin):
             if _check_video_is_nested_images(video):
                 assert isinstance(video, list)
                 for frame in video:
-                    if not is_valid_image(frame) and not isinstance(frame, dict) and not (
+                    if not is_valid_image(frame) and not isinstance(frame, (bytes, dict)) and not (
                         (_is_path_like(frame) and os.path.exists(frame)) or _is_file_like(frame)
                     ):
                         raise ValueError("Invalid image found in video frames.")

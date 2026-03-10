@@ -82,12 +82,23 @@ resolve_container_network_ip() {
   printf '%s\n' "${container_ip}"
 }
 
+resolve_local_health_host() {
+  case "${VLLM_HOST}" in
+    ""|0.0.0.0|::|[::])
+      printf '127.0.0.1\n'
+      ;;
+    *)
+      printf '%s\n' "${VLLM_HOST}"
+      ;;
+  esac
+}
+
 resolve_health_url() {
   local health_host
 
   case "${RUN_ENV}" in
     local)
-      health_host="127.0.0.1"
+      health_host="$(resolve_local_health_host)"
       ;;
     sagemaker)
       health_host="$(resolve_container_network_ip)"
