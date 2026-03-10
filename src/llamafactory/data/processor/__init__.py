@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .feedback import FeedbackDatasetProcessor
+from .grpo import DynamicPromptGRPODataset
 from .pairwise import PairwiseDatasetProcessor
 from .pretrain import PretrainDatasetProcessor
 from .processor_utils import DatasetProcessor
@@ -27,6 +28,7 @@ from .voxtral import (
 
 __all__ = [
     "DatasetProcessor",
+    "DynamicPromptGRPODataset",
     "FeedbackDatasetProcessor",
     "PackedSupervisedDatasetProcessor",
     "PairwiseDatasetProcessor",

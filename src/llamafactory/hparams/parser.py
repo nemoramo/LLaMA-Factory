@@ -308,8 +308,8 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
     if finetuning_args.stage == "sft" and training_args.do_predict and not training_args.predict_with_generate:
         raise ValueError("Please enable `predict_with_generate` to save model predictions.")
 
-    if finetuning_args.stage in ["rm", "ppo"] and training_args.load_best_model_at_end:
-        raise ValueError("RM and PPO stages do not support `load_best_model_at_end`.")
+    if finetuning_args.stage in ["rm", "ppo", "grpo"] and training_args.load_best_model_at_end:
+        raise ValueError("RM, PPO and GRPO stages do not support `load_best_model_at_end`.")
 
     if finetuning_args.stage == "ppo":
         if not training_args.do_train:
@@ -328,6 +328,25 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
             logger not in ("wandb", "tensorboard", "trackio", "none") for logger in training_args.report_to
         ):
             raise ValueError("PPO only accepts wandb, tensorboard, or trackio logger.")
+
+    if finetuning_args.stage == "grpo":
+        if not training_args.do_train:
+            raise ValueError("GRPO currently requires `do_train=true`.")
+
+        if training_args.do_predict:
+            raise ValueError("GRPO does not support `do_predict`.")
+
+        if data_args.streaming:
+            raise ValueError("GRPO does not support streaming datasets yet.")
+
+        if data_args.packing:
+            raise ValueError("GRPO does not support packing. Please keep `packing=false`.")
+
+        if model_args.use_kt:
+            raise ValueError("KTransformers is not supported in GRPO training.")
+
+        if finetuning_args.grpo_use_vllm and finetuning_args.grpo_vllm_mode != "colocate":
+            raise ValueError("FunAudioChat GRPO currently only supports `grpo_vllm_mode=colocate`.")
 
     if not model_args.use_kt and training_args.parallel_mode == ParallelMode.NOT_DISTRIBUTED:
         raise ValueError("Please launch distributed training with `llamafactory-cli` or `torchrun`.")

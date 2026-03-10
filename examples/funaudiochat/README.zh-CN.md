@@ -41,6 +41,66 @@
 
 参见 `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`。
 
+## 第二阶段 GRPO 强化 ASR
+
+如果你要在一阶段 SFT checkpoint 的基础上继续做二阶段 GRPO，增强 ASR 转写能力，可参考
+`examples/funaudiochat/funaudiochat_grpo_asr_lora.yaml`。
+
+当前约束如下：
+
+- 仅支持 `template: funaudiochat`
+- 必须保持 `packing: false`，因为 prompt 分组 + rollout 采样与 SFT 的 packed batch 不兼容
+- reward 目前是纯文本规则奖励：归一化 WER/CER + 空输出惩罚 + 重复惩罚
+- 推荐起点是 LLM 上做 LoRA，同时全参训练 `multi_modal_projector`，并保持
+  `funaudiochat_freeze_audio_tower: true`
+- 也支持 full-parameter LLM GRPO；如果只想放开语言模型，通常保持
+  `funaudiochat_freeze_audio_tower: true` 且 `freeze_multi_modal_projector: true`
+
+### vLLM rollout engine
+
+FunAudioChat GRPO 可以直接复用已有的 FunAudioChat 版 vLLM rollout 路径，但目前只支持 colocate：
+
+- 设置 `grpo_use_vllm: true`
+- 设置 `grpo_vllm_mode: colocate`
+- 在训练环境里安装支持 FunAudioChat 的 vLLM，例如 `pip install -e /path/to/vllm`
+
+这里没有启用 TRL 的 server 模式，因为 stock TRL 的 vLLM server client 仍然偏 image-only，
+不会正确透传 FunAudioChat 的音频多模态载荷。另外，stock TRL server 模式还依赖
+`/init_communicator`、`/update_named_param` 这类权重同步端点；普通 OpenAI 兼容 vLLM server
+并不能直接用于在线 GRPO policy 更新。
+
+### FunAudioChat 音频 batching 保护开关
+
+本地 vLLM rollout 现在提供 `VLLM_FUNAUDIOCHAT_AUDIO_BATCH_MODE`：
+
+- `auto`（默认）：当 FunAudioChat 音频输入且 `tensor_parallel_size > 1` 时，自动切到 audio MM encoder microbatch
+- `microbatch`：强制把 audio MM encoder batch 拆成单条执行
+- `batch`：强制走原始 batched audio MM encoder 路径
+
+正常训练建议直接用默认的 `auto`。只有在你需要**刻意复现**旧的 `audio batch>1` 挂死问题时，才手动切到
+`batch`。如果要在 LLaMA-Factory 之外直接做最小复现，可用：
+
+```bash
+python ~/projects/vllm/examples/offline_inference/funaudiochat_audio_batch_repro.py \
+  --model /path/to/Fun-Audio-Chat-8B \
+  --audio /path/to/a.wav /path/to/b.wav \
+  --tensor-parallel-size 2 \
+  --batch-mode batch \
+  --debug
+```
+
+### Full-parameter LLM GRPO
+
+参考 `examples/funaudiochat/funaudiochat_grpo_asr_full_llm.yaml`。
+
+实践建议：
+
+- 使用 `deepspeed: examples/deepspeed/ds_z3_config.json`
+- 在 colocate vLLM 下，优先从 `grpo_beta: 0.0` 开始；否则会额外实例化一份 reference model，显存压力会明显上升
+- 保持 `funaudiochat_freeze_audio_tower: true`
+- 如果只想放开 LLM，保持 `freeze_multi_modal_projector: true`
+- 后续如果补上带在线权重同步的 rollout server，再考虑 server-mode 的 full-parameter GRPO
+
 ## 批量评测（prompt_pool + normalized WER/WERE）
 
 如果你的评测数据使用了 `prompt_pool`（例如 `*_norm_text_promptpool_*`），并且希望评测时带上

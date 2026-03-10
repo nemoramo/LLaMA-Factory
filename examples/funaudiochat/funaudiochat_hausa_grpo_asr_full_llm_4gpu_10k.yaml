@@ -1,0 +1,79 @@
+### model
+model_name_or_path: /data2/mayufeng/saves/funaudiochat/hausa_fullsft_llm_plus_projector_freeze_audio_from_h100_ckpt211000_gpus1to4_20260227/checkpoint-60000
+template: funaudiochat
+stage: grpo
+do_train: true
+finetuning_type: full
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  use_orig_params: true
+  transformer_layer_cls_to_wrap: Qwen3DecoderLayer
+  ignored_modules: continuous_audio_tower|audio_tower|audio_invert_tower|multi_modal_projector
+freeze_multi_modal_projector: true
+funaudiochat_freeze_audio_tower: true
+flash_attn: fa2
+bf16: true
+pure_bf16: true
+gradient_checkpointing: false
+disable_gradient_checkpointing: true
+
+### data
+dataset: funaudiochat_hausa_all_full_20260122_avail_train
+dataset_dir: /data2/mayufeng/manifests/llama_data
+cutoff_len: 1024
+packing: false
+dynamic_prompt_sampling: true
+overwrite_cache: false
+preprocessing_num_workers: 8
+
+### audio
+audio_sampling_rate: 16000
+audio_padding: max_length
+
+### output
+output_dir: /data2/mayufeng/saves/funaudiochat/grpo_asr_hausa_full_llm_4gpu_10k_20260309
+logging_steps: 5
+save_strategy: steps
+save_steps: 1000
+eval_strategy: "no"
+save_total_limit: 3
+overwrite_output_dir: false
+save_only_model: false
+plot_loss: false
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-6
+max_steps: 10000
+warmup_ratio: 0.02
+lr_scheduler_type: cosine
+dataloader_num_workers: 0
+ddp_timeout: 180000
+
+### grpo
+grpo_num_generations: 8
+grpo_max_completion_length: 192
+grpo_beta: 0.0
+grpo_temperature: 1.0
+grpo_top_p: 0.95
+grpo_repetition_penalty: 1.0
+grpo_scale_rewards: group
+grpo_loss_type: dapo
+grpo_mask_truncated_completions: true
+grpo_log_completions: true
+grpo_num_completions_to_print: 4
+grpo_use_vllm: true
+grpo_vllm_mode: colocate
+grpo_vllm_tensor_parallel_size: 4
+grpo_vllm_gpu_memory_utilization: 0.22
+grpo_vllm_enable_sleep_mode: true
+grpo_generation_batch_size: 8
+grpo_disable_dropout: true
+grpo_reward_wer_weight: 1.0
+grpo_reward_cer_weight: 0.25
+grpo_empty_penalty: 1.0
+grpo_repeat_penalty: 0.2

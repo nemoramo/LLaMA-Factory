@@ -167,7 +167,7 @@ class OFTArguments:
 
 @dataclass
 class RLHFArguments:
-    r"""Arguments pertaining to the PPO, DPO and KTO training."""
+    r"""Arguments pertaining to the PPO, DPO, KTO and GRPO training."""
 
     pref_beta: float = field(
         default=0.1,
@@ -257,6 +257,186 @@ class RLHFArguments:
                 " the verbose token log-probabilities in responses."
             )
         },
+    )
+    grpo_num_generations: int = field(
+        default=4,
+        metadata={"help": "Number of sampled completions per prompt in GRPO training."},
+    )
+    grpo_max_completion_length: int = field(
+        default=256,
+        metadata={"help": "Maximum number of generated completion tokens in GRPO training."},
+    )
+    grpo_beta: float = field(
+        default=0.04,
+        metadata={"help": "KL coefficient in GRPO training."},
+    )
+    grpo_temperature: float = field(
+        default=0.8,
+        metadata={"help": "Sampling temperature for GRPO rollout generation."},
+    )
+    grpo_top_p: float = field(
+        default=0.95,
+        metadata={"help": "Top-p sampling parameter for GRPO rollout generation."},
+    )
+    grpo_top_k: int | None = field(
+        default=None,
+        metadata={"help": "Top-k sampling parameter for GRPO rollout generation."},
+    )
+    grpo_min_p: float | None = field(
+        default=None,
+        metadata={"help": "Minimum token probability threshold for GRPO rollout generation."},
+    )
+    grpo_repetition_penalty: float = field(
+        default=1.0,
+        metadata={"help": "Repetition penalty used during GRPO rollout generation."},
+    )
+    grpo_num_iterations: int = field(
+        default=1,
+        metadata={"help": "Number of policy update iterations per sampled GRPO batch."},
+    )
+    grpo_epsilon: float = field(
+        default=0.2,
+        metadata={"help": "Lower clipping coefficient used by the GRPO objective."},
+    )
+    grpo_epsilon_high: float | None = field(
+        default=None,
+        metadata={"help": "Upper clipping coefficient used by the GRPO objective."},
+    )
+    grpo_delta: float | None = field(
+        default=None,
+        metadata={"help": "Optional upper cap for two-sided GRPO clipping."},
+    )
+    grpo_scale_rewards: Literal["group", "batch", "none"] = field(
+        default="group",
+        metadata={"help": "Reward normalization strategy used by GRPO."},
+    )
+    grpo_loss_type: Literal["grpo", "bnpo", "dr_grpo", "dapo"] = field(
+        default="dapo",
+        metadata={"help": "Loss variant used by GRPO."},
+    )
+    grpo_mask_truncated_completions: bool = field(
+        default=True,
+        metadata={"help": "Whether truncated completions are masked out from the GRPO loss."},
+    )
+    grpo_sync_ref_model: bool = field(
+        default=False,
+        metadata={"help": "Whether to periodically sync the GRPO reference model."},
+    )
+    grpo_ref_model_mixup_alpha: float = field(
+        default=0.6,
+        metadata={"help": "Reference model mixup coefficient used when syncing GRPO reference weights."},
+    )
+    grpo_ref_model_sync_steps: int = field(
+        default=512,
+        metadata={"help": "Number of steps between GRPO reference model syncs."},
+    )
+    grpo_top_entropy_quantile: float = field(
+        default=1.0,
+        metadata={"help": "Top-entropy token quantile kept by the GRPO loss."},
+    )
+    grpo_generation_batch_size: int | None = field(
+        default=None,
+        metadata={"help": "Optional explicit generation batch size for GRPO."},
+    )
+    grpo_steps_per_generation: int | None = field(
+        default=None,
+        metadata={"help": "Optional number of optimizer steps that reuse the same GRPO rollout batch."},
+    )
+    grpo_generation_kwargs: dict[str, Any] | str | None = field(
+        default=None,
+        metadata={"help": "Optional extra generation kwargs forwarded to GRPO rollout generation."},
+    )
+    grpo_use_vllm: bool = field(
+        default=False,
+        metadata={"help": "Whether to use vLLM-backed rollout generation in GRPO."},
+    )
+    grpo_use_transformers_paged: bool = field(
+        default=False,
+        metadata={"help": "Whether to use transformers paged generation in GRPO."},
+    )
+    grpo_vllm_mode: Literal["server", "colocate"] = field(
+        default="server",
+        metadata={"help": "vLLM mode used by GRPO when `grpo_use_vllm=true`."},
+    )
+    grpo_vllm_gpu_memory_utilization: float = field(
+        default=0.3,
+        metadata={"help": "vLLM GPU memory utilization used by GRPO in colocate mode."},
+    )
+    grpo_vllm_tensor_parallel_size: int = field(
+        default=1,
+        metadata={"help": "vLLM tensor parallel size used by GRPO in colocate mode."},
+    )
+    grpo_vllm_enable_sleep_mode: bool = field(
+        default=False,
+        metadata={"help": "Whether GRPO should enable vLLM sleep mode in colocate mode."},
+    )
+    grpo_vllm_guided_decoding_regex: str | None = field(
+        default=None,
+        metadata={"help": "Optional guided decoding regex for GRPO vLLM generation."},
+    )
+    grpo_vllm_server_base_url: str | None = field(
+        default=None,
+        metadata={"help": "Optional GRPO vLLM server base URL."},
+    )
+    grpo_vllm_server_host: str = field(
+        default="0.0.0.0",
+        metadata={"help": "GRPO vLLM server host when using server mode."},
+    )
+    grpo_vllm_server_port: int = field(
+        default=8000,
+        metadata={"help": "GRPO vLLM server port when using server mode."},
+    )
+    grpo_vllm_server_timeout: float = field(
+        default=240.0,
+        metadata={"help": "GRPO vLLM server connection timeout in seconds."},
+    )
+    grpo_vllm_importance_sampling_correction: bool = field(
+        default=True,
+        metadata={"help": "Whether to apply truncated importance sampling when using vLLM in GRPO."},
+    )
+    grpo_vllm_importance_sampling_cap: float = field(
+        default=2.0,
+        metadata={"help": "Upper bound for truncated importance sampling in GRPO."},
+    )
+    grpo_disable_dropout: bool = field(
+        default=False,
+        metadata={"help": "Whether to disable dropout when running GRPO."},
+    )
+    grpo_ds3_gather_for_generation: bool = field(
+        default=True,
+        metadata={"help": "Whether to gather ZeRO-3 weights for GRPO generation."},
+    )
+    grpo_shuffle_dataset: bool = field(
+        default=True,
+        metadata={"help": "Whether to shuffle prompts before sampling GRPO rollouts."},
+    )
+    grpo_log_completions: bool = field(
+        default=False,
+        metadata={"help": "Whether to print / log sampled GRPO completions."},
+    )
+    grpo_num_completions_to_print: int | None = field(
+        default=None,
+        metadata={"help": "Optional cap on the number of logged GRPO completions."},
+    )
+    grpo_wandb_log_unique_prompts: bool = field(
+        default=False,
+        metadata={"help": "Whether to deduplicate prompts in GRPO wandb completion logs."},
+    )
+    grpo_reward_wer_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight of the normalized WER reward term in GRPO ASR training."},
+    )
+    grpo_reward_cer_weight: float = field(
+        default=0.25,
+        metadata={"help": "Weight of the normalized CER reward term in GRPO ASR training."},
+    )
+    grpo_empty_penalty: float = field(
+        default=1.0,
+        metadata={"help": "Penalty applied to empty GRPO ASR completions."},
+    )
+    grpo_repeat_penalty: float = field(
+        default=0.2,
+        metadata={"help": "Penalty weight applied to repetition-heavy GRPO ASR completions."},
     )
 
 
@@ -458,7 +638,7 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to train model in purely bf16 precision (without AMP)."},
     )
-    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto"] = field(
+    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto", "grpo"] = field(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
@@ -635,6 +815,8 @@ class FinetuningArguments(
 
         if isinstance(self.module_lr_groups, str) and self.module_lr_groups.strip().startswith("["):
             self.module_lr_groups = json.loads(self.module_lr_groups)
+        if isinstance(self.grpo_generation_kwargs, str) and self.grpo_generation_kwargs.strip().startswith("{"):
+            self.grpo_generation_kwargs = json.loads(self.grpo_generation_kwargs)
 
         if self.module_lr_groups is not None:
             if not isinstance(self.module_lr_groups, list):
@@ -721,6 +903,9 @@ class FinetuningArguments(
         if self.stage == "ppo" and self.reward_model_type == "oft" and self.finetuning_type != "oft":
             raise ValueError("`reward_model_type` cannot be oft for Freeze/Full PPO training.")
 
+        if self.stage == "grpo" and self.grpo_num_generations < 2:
+            raise ValueError("GRPO requires at least 2 generations per prompt.")
+
         if self.stage == "dpo" and self.pref_loss != "sigmoid" and self.dpo_label_smoothing > 1e-6:
             raise ValueError("`dpo_label_smoothing` is only valid for sigmoid loss function.")
 
@@ -745,7 +930,7 @@ class FinetuningArguments(
                 "`module_lr_groups` cannot be combined with GaLore/APOLLO/BAdam/LoRA+/Adam-mini/Muon optimizers."
             )
 
-        if self.pissa_init and (self.stage in ["ppo", "kto"] or self.use_ref_model):
+        if self.pissa_init and (self.stage in ["ppo", "kto", "grpo"] or self.use_ref_model):
             raise ValueError("Cannot use PiSSA for current training stage.")
 
         if self.finetuning_type != "lora":

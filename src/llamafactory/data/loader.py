@@ -26,6 +26,7 @@ from .converter import align_dataset, get_dataset_converter
 from .data_utils import get_dataset_module, merge_dataset, read_cloud_json, split_dataset
 from .parser import get_dataset_list
 from .processor import (
+    DynamicPromptGRPODataset,
     FeedbackDatasetProcessor,
     PackedSupervisedDatasetProcessor,
     PairwiseDatasetProcessor,
@@ -380,7 +381,7 @@ def _get_merged_dataset(
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
-    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    stage: Literal["pt", "sft", "rm", "ppo", "kto", "grpo"],
     lazy_align: bool = False,
     return_dict: bool = False,
 ) -> Union["Dataset", "IterableDataset", dict[str, "Dataset"]] | None:
@@ -419,7 +420,7 @@ def _get_merged_dataset(
 
 def _get_dataset_processor(
     data_args: "DataArguments",
-    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    stage: Literal["pt", "sft", "rm", "ppo", "kto", "grpo"],
     template: "Template",
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"],
@@ -467,7 +468,7 @@ def _get_preprocessed_dataset(
     dataset: Union["Dataset", "IterableDataset"] | None,
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
-    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    stage: Literal["pt", "sft", "rm", "ppo", "kto", "grpo"],
     template: "Template",
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"] = None,
@@ -476,6 +477,19 @@ def _get_preprocessed_dataset(
     r"""Preprocesses the dataset, including format checking and tokenization."""
     if dataset is None:
         return None
+
+    if stage == "grpo":
+        if data_args.streaming:
+            raise ValueError("GRPO does not support streaming datasets yet.")
+        return DynamicPromptGRPODataset(
+            dataset,
+            template=template,
+            tokenizer=tokenizer,
+            processor=processor,
+            data_args=data_args,
+            seed=training_args.seed,
+            enable_prompt_sampling=(not is_eval) and bool(getattr(data_args, "dynamic_prompt_sampling", False)),
+        )
 
     if (
         (data_args.dynamic_prompt_sampling or getattr(data_args, "dynamic_prompt_packing", False))
@@ -525,11 +539,14 @@ def get_dataset(
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
-    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    stage: Literal["pt", "sft", "rm", "ppo", "kto", "grpo"],
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"] = None,
 ) -> "DatasetModule":
     r"""Get the train dataset and optionally gets the evaluation dataset."""
+    if stage == "grpo" and data_args.tokenized_path is not None:
+        raise ValueError("GRPO expects aligned raw datasets and does not support `tokenized_path`.")
+
     # Load tokenized dataset if path exists
     if data_args.tokenized_path is not None:
         if has_tokenized_data(data_args.tokenized_path):
@@ -812,50 +829,76 @@ def get_dataset(
         # move front to make sure eval_dataset(if contain or split) can preprocessed appropriately
         train_dict, eval_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
 
-        if "train" in train_dict:
-            train_dict["train"] = _get_preprocessed_dataset(
-                train_dict["train"], data_args, training_args, stage, template, tokenizer, processor, is_eval=False
-            )
+        if stage == "grpo":
+            dataset_module = {}
+            if "train" in train_dict:
+                dataset_module["train_dataset"] = _get_preprocessed_dataset(
+                    train_dict["train"], data_args, training_args, stage, template, tokenizer, processor, is_eval=False
+                )
 
-        for key in eval_dict:
-            eval_dict[key] = _get_preprocessed_dataset(
-                eval_dict[key], data_args, training_args, stage, template, tokenizer, processor, is_eval=True
-            )
-
-        # Combine train and eval dictionaries
-        dataset_dict = DatasetDict({**train_dict, **eval_dict})
-
-        if (
-            data_args.tokenized_path is not None
-            and not data_args.dynamic_prompt_sampling
-            and not getattr(data_args, "dynamic_prompt_packing", False)
-        ):  # save tokenized dataset to disk
-            if training_args.should_save:
-                dataset_dict.save_to_disk(data_args.tokenized_path)
-                logger.info_rank0(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
-                logger.info_rank0(f"Please launch the training with `tokenized_path: {data_args.tokenized_path}`.")
-
-        dataset_module = get_dataset_module(dataset_dict)
-        if (
-            (data_args.dynamic_prompt_sampling or getattr(data_args, "dynamic_prompt_packing", False))
-            and stage == "sft"
-            and not data_args.streaming
-        ):
-            train_ds = dataset_module.get("train_dataset")
-            if train_ds is not None:
-                if getattr(data_args, "dynamic_prompt_packing", False) and not data_args.packing:
-                    raise ValueError("`dynamic_prompt_packing` requires `packing=true` (SFT only).")
-
-                if data_args.packing:
-                    max_samples_per_pack = int(
-                        getattr(data_args, "dynamic_prompt_packing_max_samples_per_pack", 8) or 8
+            if "validation" in eval_dict and len(eval_dict) == 1:
+                dataset_module["eval_dataset"] = _get_preprocessed_dataset(
+                    eval_dict["validation"],
+                    data_args,
+                    training_args,
+                    stage,
+                    template,
+                    tokenizer,
+                    processor,
+                    is_eval=True,
+                )
+            elif len(eval_dict) > 0:
+                dataset_module["eval_dataset"] = {
+                    key[len("validation_") :]: _get_preprocessed_dataset(
+                        value, data_args, training_args, stage, template, tokenizer, processor, is_eval=True
                     )
-                    max_steps = int(getattr(training_args, "max_steps", 0) or 0)
-                    if max_steps <= 0:
-                        raise ValueError(
-                            "Dynamic prompt packing uses an IterableDataset without `__len__`; please set `max_steps` > 0 "
-                            "(and optionally `num_train_epochs=1`)."
+                    for key, value in eval_dict.items()
+                }
+        else:
+            if "train" in train_dict:
+                train_dict["train"] = _get_preprocessed_dataset(
+                    train_dict["train"], data_args, training_args, stage, template, tokenizer, processor, is_eval=False
+                )
+
+            for key in eval_dict:
+                eval_dict[key] = _get_preprocessed_dataset(
+                    eval_dict[key], data_args, training_args, stage, template, tokenizer, processor, is_eval=True
+                )
+
+            # Combine train and eval dictionaries
+            dataset_dict = DatasetDict({**train_dict, **eval_dict})
+
+            if (
+                data_args.tokenized_path is not None
+                and not data_args.dynamic_prompt_sampling
+                and not getattr(data_args, "dynamic_prompt_packing", False)
+            ):  # save tokenized dataset to disk
+                if training_args.should_save:
+                    dataset_dict.save_to_disk(data_args.tokenized_path)
+                    logger.info_rank0(f"Tokenized dataset is saved at {data_args.tokenized_path}.")
+                    logger.info_rank0(f"Please launch the training with `tokenized_path: {data_args.tokenized_path}`.")
+
+            dataset_module = get_dataset_module(dataset_dict)
+            if (
+                (data_args.dynamic_prompt_sampling or getattr(data_args, "dynamic_prompt_packing", False))
+                and stage == "sft"
+                and not data_args.streaming
+            ):
+                train_ds = dataset_module.get("train_dataset")
+                if train_ds is not None:
+                    if getattr(data_args, "dynamic_prompt_packing", False) and not data_args.packing:
+                        raise ValueError("`dynamic_prompt_packing` requires `packing=true` (SFT only).")
+
+                    if data_args.packing:
+                        max_samples_per_pack = int(
+                            getattr(data_args, "dynamic_prompt_packing_max_samples_per_pack", 8) or 8
                         )
+                        max_steps = int(getattr(training_args, "max_steps", 0) or 0)
+                        if max_steps <= 0:
+                            raise ValueError(
+                                "Dynamic prompt packing uses an IterableDataset without `__len__`; please set `max_steps` > 0 "
+                                "(and optionally `num_train_epochs=1`)."
+                            )
 
                     # Prefer per-rank dataloading for dynamic prompt packing. Without this, Accelerate may default to
                     # `dispatch_batches=True` for iterable datasets, which iterates only on rank0 and broadcasts.
@@ -990,43 +1033,43 @@ def get_dataset(
                             "Dynamic prompt packing: dataset is not aligned; will convert to `_prompt/_response/...` on-the-fly."
                         )
 
-                    dataset_module["train_dataset"] = build_dynamic_prompt_packed_iterable_dataset(
-                        train_ds,
-                        template=template,
-                        tokenizer=tokenizer,
-                        processor=processor,
-                        data_args=data_args,
-                        dataset_converter=dataset_converter,
-                        id_key=id_key,
-                        seed=training_args.seed,
-                        buffer_size=buffer_size,
-                        max_samples_per_pack=max_samples_per_pack,
-                        shuffle_packs=shuffle_packs,
-                        num_shards=num_shards,
-                        global_shuffle=global_shuffle,
-                        prefetch_buffers=prefetch_buffers,
-                        carryover_packs=carryover_packs,
-                    )
-                    logger.info_rank0(
-                        "Wrapped train dataset with buffered knapsack packing (on-the-fly encode + on-the-fly pack)."
-                    )
+                        dataset_module["train_dataset"] = build_dynamic_prompt_packed_iterable_dataset(
+                            train_ds,
+                            template=template,
+                            tokenizer=tokenizer,
+                            processor=processor,
+                            data_args=data_args,
+                            dataset_converter=dataset_converter,
+                            id_key=id_key,
+                            seed=training_args.seed,
+                            buffer_size=buffer_size,
+                            max_samples_per_pack=max_samples_per_pack,
+                            shuffle_packs=shuffle_packs,
+                            num_shards=num_shards,
+                            global_shuffle=global_shuffle,
+                            prefetch_buffers=prefetch_buffers,
+                            carryover_packs=carryover_packs,
+                        )
+                        logger.info_rank0(
+                            "Wrapped train dataset with buffered knapsack packing (on-the-fly encode + on-the-fly pack)."
+                        )
 
-                    logger.info_rank0(
-                        "Note: on-the-fly packing changes epoch semantics (raw samples/tokens per step vary); "
-                        "prefer controlling training budget via `max_steps`."
-                    )
-                else:
-                    dataset_module["train_dataset"] = DynamicPromptDataset(
-                        train_ds,
-                        template=template,
-                        tokenizer=tokenizer,
-                        processor=processor,
-                        data_args=data_args,
-                        seed=training_args.seed,
-                    )
-                    logger.info_rank0(
-                        "Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling."
-                    )
+                        logger.info_rank0(
+                            "Note: on-the-fly packing changes epoch semantics (raw samples/tokens per step vary); "
+                            "prefer controlling training budget via `max_steps`."
+                        )
+                    else:
+                        dataset_module["train_dataset"] = DynamicPromptDataset(
+                            train_ds,
+                            template=template,
+                            tokenizer=tokenizer,
+                            processor=processor,
+                            data_args=data_args,
+                            seed=training_args.seed,
+                        )
+                        logger.info_rank0(
+                            "Wrapped train dataset with DynamicPromptDataset for on-the-fly prompt sampling."
+                        )
 
     # NOTE:
     # `training_args.main_process_first` ensures non-rank0 processes wait until rank0 reaches the end of the context,

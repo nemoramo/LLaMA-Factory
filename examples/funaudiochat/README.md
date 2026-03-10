@@ -41,6 +41,67 @@ If `token` is omitted/empty, the plugin needs a 25Hz frame count to build a pad-
 
 See `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`.
 
+## Stage 2 GRPO for ASR
+
+For a second-stage GRPO setup that strengthens ASR transcription quality on top of an SFT checkpoint, see
+`examples/funaudiochat/funaudiochat_grpo_asr_lora.yaml`.
+
+Current constraints:
+
+- Only `template: funaudiochat` is supported.
+- Keep `packing: false`; prompt grouping + sampled rollouts are not compatible with packed SFT batches.
+- The reward is text-only and combines normalized WER/CER with empty-output and repetition penalties.
+- Recommended starting point: LoRA on the LLM plus full tuning of `multi_modal_projector`, while keeping
+  `funaudiochat_freeze_audio_tower: true`.
+- Full-parameter LLM GRPO is also supported. In that setup, keep `funaudiochat_freeze_audio_tower: true` and usually
+  `freeze_multi_modal_projector: true` if you only want to open the language model.
+
+### vLLM rollout engine
+
+FunAudioChat GRPO can reuse the existing FunAudioChat-capable vLLM rollout path, but only in colocated mode:
+
+- Set `grpo_use_vllm: true`
+- Set `grpo_vllm_mode: colocate`
+- Install a FunAudioChat-capable vLLM build into the training environment, e.g. `pip install -e /path/to/vllm`
+
+Server-mode TRL vLLM transport is intentionally not enabled here because the stock TRL server client is still
+image-oriented and does not pass FunAudioChat audio payloads. In addition, stock TRL server mode expects custom
+weight-sync endpoints (`/init_communicator`, `/update_named_param`, etc.); a standard OpenAI-compatible vLLM server is
+not sufficient for online GRPO policy updates.
+
+### FunAudioChat audio batching safeguard
+
+The local vLLM rollout path now exposes `VLLM_FUNAUDIOCHAT_AUDIO_BATCH_MODE` with three modes:
+
+- `auto` (default): for FunAudioChat audio with `tensor_parallel_size > 1`, use audio MM encoder microbatching
+- `microbatch`: always split audio MM encoder batches into single-item runs
+- `batch`: always use the original batched audio MM encoder path
+
+Use `auto` for normal training. `batch` is only for regression diagnosis when you explicitly want to reproduce the old
+`audio batch>1` hang. For direct reproduction outside LLaMA-Factory, use:
+
+```bash
+python ~/projects/vllm/examples/offline_inference/funaudiochat_audio_batch_repro.py \
+  --model /path/to/Fun-Audio-Chat-8B \
+  --audio /path/to/a.wav /path/to/b.wav \
+  --tensor-parallel-size 2 \
+  --batch-mode batch \
+  --debug
+```
+
+### Full-parameter LLM GRPO
+
+See `examples/funaudiochat/funaudiochat_grpo_asr_full_llm.yaml`.
+
+Practical notes:
+
+- Use `deepspeed: examples/deepspeed/ds_z3_config.json`.
+- Start with `grpo_beta: 0.0` under colocated vLLM, otherwise GRPO will instantiate a separate reference model and
+  memory pressure rises sharply.
+- Keep `funaudiochat_freeze_audio_tower: true`.
+- If you only want to open the LLM, keep `freeze_multi_modal_projector: true`.
+- If you later add a dedicated rollout server with online weight sync, you can revisit server-mode full-parameter GRPO.
+
 ## Mixed tuning: LLM LoRA + full audio encoder/adapter
 
 If you want **LoRA on the language model** but **full-parameter tuning on FunAudioChat audio encoder + adapter**:
