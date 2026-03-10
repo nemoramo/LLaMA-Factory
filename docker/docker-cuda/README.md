@@ -138,6 +138,31 @@ Notes:
 5. If your Docker daemon requires elevated privileges, prepend `sudo` to the `docker build` and `docker run`
    commands above.
 
+### One-click Qwen3-ASR 20-step smoke
+
+Use the helper script below if you want a reproducible 20-step `Qwen3-ASR` finetune smoke inside Docker:
+
+```bash
+IMAGE=llamafactory:speech-fa2 \
+GPU_ID=0 \
+HF_CACHE=/path/to/huggingface_cache \
+MODEL_PATH=/path/to/Qwen3-ASR-0.6B \
+DATASET_DIR=/path/to/qwen3_asr_dataset_dir \
+DATASET_NAME=qwen3_asr_hausa100_train \
+EVAL_DATASET=qwen3_asr_hausa100_valid \
+OUTPUT_DIR=/path/to/qwen3_asr_smoke20 \
+MOUNT_MNT=1 \
+scripts/docker/run_qwen3_asr_smoke.sh
+```
+
+Notes:
+
+1. The script mounts the current repo at `/app`, so it always uses your current local code instead of the code baked into the image.
+2. It generates `/path/to/qwen3_asr_smoke20/qwen3_asr_smoke_20step.yaml` and records the exact Docker command in
+   `training_command.txt`.
+3. Set `OFFLINE=1` if `MODEL_PATH` and `HF_CACHE` are already local and you want to forbid network downloads.
+4. Set `DRY_RUN=1` to print the generated Docker command without launching training.
+
 ## Troubleshooting
 
 ### GPU Not Detected

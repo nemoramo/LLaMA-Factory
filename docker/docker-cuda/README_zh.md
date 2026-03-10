@@ -135,6 +135,30 @@ docker run --rm --ipc=host --gpus "\"device=${GPU_ID}\"" \
 4. `Dockerfile.speech` 默认不预装 `deepspeed`。如果你需要它，可以在镜像内再安装 `requirements/deepspeed.txt`。
 5. 如果你的 Docker 需要提权，请在上面的 `docker build` 和 `docker run` 前面加 `sudo`。
 
+### Qwen3-ASR 一键 20-step smoke
+
+如果你想直接在 Docker 里做一个可复现的 `Qwen3-ASR` 20 step 功能验证，可以用这个脚本：
+
+```bash
+IMAGE=llamafactory:speech-fa2 \
+GPU_ID=0 \
+HF_CACHE=/path/to/huggingface_cache \
+MODEL_PATH=/path/to/Qwen3-ASR-0.6B \
+DATASET_DIR=/path/to/qwen3_asr_dataset_dir \
+DATASET_NAME=qwen3_asr_hausa100_train \
+EVAL_DATASET=qwen3_asr_hausa100_valid \
+OUTPUT_DIR=/path/to/qwen3_asr_smoke20 \
+MOUNT_MNT=1 \
+scripts/docker/run_qwen3_asr_smoke.sh
+```
+
+说明：
+
+1. 这个脚本会把当前仓库挂载到容器里的 `/app`，因此实际跑的是你本地当前代码，而不是镜像构建时打进去的旧代码。
+2. 它会在输出目录下生成 `qwen3_asr_smoke_20step.yaml`，并把完整 Docker 命令写入 `training_command.txt`。
+3. 如果 `MODEL_PATH` 和 `HF_CACHE` 都是本地现成目录，可以加 `OFFLINE=1` 禁止联网下载。
+4. 如果你只想看生成的命令而不真正启动训练，可以加 `DRY_RUN=1`。
+
 ## 常见问题
 
 ### 容器里看不到 GPU
