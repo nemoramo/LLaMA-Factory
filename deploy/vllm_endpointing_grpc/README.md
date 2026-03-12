@@ -242,3 +242,22 @@ PY
   - 这是旧 `pb2` 生成代码和较新 protobuf runtime 的兼容性问题
 - `AttributeError: 'list' object has no attribute 'keys'`
   - 这是 deployment-side tokenizer 读取 `extra_special_tokens=list` 时的兼容性问题
+
+## 2026-03-12 补充：`Qwen/Qwen3.5-0.8B-Base` 的 raw `llamafactory-cli export` 现状
+
+- 已实测：当前主线里的 `llamafactory-cli export examples/speech_endpointing/qwen3/generic/qwen3_speech_endpointing_lora_export.yaml` 配合 `template=qwen3_5_nothink`，已经可以把 `Qwen3.5-0.8B-Base` speech endpointing LoRA checkpoint 导出成可被本目录 docker 加载的目录。
+- 当前 export 后处理已经补上：
+- 规范化 `tokenizer_config.json`，避免 `tokenizer_class = "TokenizersBackend"` 和缺失 `extra_special_tokens` / `additional_special_tokens` 的兼容性问题
+- 自动保存 `preprocessor_config.json` / `video_preprocessor_config.json`，避免 `Qwen3_5ForConditionalGeneration` 在 vLLM 多模态初始化阶段缺 processor sidecar
+- 2026-03-12 的 smoke 里，`Qwen3.5-0.8B-Base` 的 raw CLI export 产物已经在 `vllm-endpointing-grpc:v0.17.0` 上拉起：
+- GPU：`5`
+- `gpu_memory_utilization=0.52`
+- `ready in 133s`
+- `gRPC Predict` 返回：`label=<EOU>`, `confidence=1.0`, `latency_ms=423`
+- 这次也顺手验证了一个运行时边界：
+- 对 `Qwen3.5-0.8B-Base` 这种多模态模型，`gpu_memory_utilization=0.15` 太低，vLLM 会在 KV cache 初始化阶段报 `No available memory for the cache blocks`
+- 因此当前推荐把 `Qwen3.5` 的部署参数与 `Qwen3-0.6B` 分开看待，不要直接复用更小模型的 `gpu_memory_utilization`
+- 另外，当前 pinned 的 `vllm/vllm-openai:v0.17.0` 已不再接受旧启动参数 `--disable-log-requests`，deploy 脚本或手工启动命令需要一起更新。
+- 最后要区分两类验证：
+- export / deploy 兼容性：当前已经打通
+- checkpoint 质量：仍需单独看 no-bias label top-k 或离线评估；本次测试的 `checkpoint-1323` 在手工 no-bias top-logprobs 检查里，没有把三类标签打进 top3

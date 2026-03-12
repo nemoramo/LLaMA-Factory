@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import shutil
 import sys
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 import torch.distributed as dist
 from transformers import EarlyStoppingCallback, PreTrainedModel
+from transformers.utils import cached_file
 
 from ..data import get_template_and_fix_tokenizer
 from ..extras import logging
@@ -67,6 +69,112 @@ def _save_training_command(args: Any, training_args: "TrainingArguments") -> Non
         logger.info_rank0(f"Training command saved to {cmd_path}.")
     except Exception as e:  # noqa: BLE001
         logger.warning_rank0(f"Failed to save training command: {e}.")
+
+
+def _read_json(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_json(path: str, data: dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def _load_source_json(
+    model_name_or_path: str | None, filename: str, model_revision: str, cache_dir: str | None, token: str | None
+) -> Optional[dict[str, Any]]:
+    if not model_name_or_path:
+        return None
+
+    local_path = os.path.join(model_name_or_path, filename)
+    if os.path.exists(local_path):
+        return _read_json(local_path)
+
+    try:
+        resolved_path = cached_file(
+            model_name_or_path,
+            filename,
+            revision=model_revision,
+            cache_dir=cache_dir,
+            token=token,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Failed to resolve `{filename}` from `{model_name_or_path}`: {e}.")
+        return None
+
+    if resolved_path and os.path.exists(resolved_path):
+        return _read_json(resolved_path)
+
+    return None
+
+
+def _normalize_exported_tokenizer_config(model_args: Any) -> None:
+    tokenizer_config_path = os.path.join(model_args.export_dir, "tokenizer_config.json")
+    if not os.path.exists(tokenizer_config_path):
+        return
+
+    tokenizer_config = _read_json(tokenizer_config_path)
+    source_tokenizer_config = _load_source_json(
+        model_args.model_name_or_path,
+        "tokenizer_config.json",
+        model_args.model_revision,
+        model_args.cache_dir,
+        model_args.hf_hub_token,
+    )
+    source_tokenizer_config = source_tokenizer_config or {}
+
+    changed = False
+
+    source_tokenizer_class = source_tokenizer_config.get("tokenizer_class")
+    if tokenizer_config.get("tokenizer_class") == "TokenizersBackend" and isinstance(source_tokenizer_class, str):
+        tokenizer_config["tokenizer_class"] = source_tokenizer_class
+        changed = True
+
+    additional_special_tokens = tokenizer_config.get("additional_special_tokens")
+    merged_additional_special_tokens: list[str] = []
+    if isinstance(source_tokenizer_config.get("additional_special_tokens"), list):
+        merged_additional_special_tokens.extend(source_tokenizer_config["additional_special_tokens"])
+    if isinstance(additional_special_tokens, list):
+        merged_additional_special_tokens.extend(additional_special_tokens)
+
+    extra_special_tokens = tokenizer_config.get("extra_special_tokens")
+    if isinstance(extra_special_tokens, list):
+        merged_additional_special_tokens.extend(extra_special_tokens)
+        tokenizer_config.pop("extra_special_tokens", None)
+        changed = True
+
+    if isinstance(getattr(model_args, "add_special_tokens", None), list):
+        merged_additional_special_tokens.extend(model_args.add_special_tokens)
+
+    merged_additional_special_tokens = list(dict.fromkeys(merged_additional_special_tokens))
+    if merged_additional_special_tokens and merged_additional_special_tokens != additional_special_tokens:
+        tokenizer_config["additional_special_tokens"] = merged_additional_special_tokens
+        changed = True
+
+    if not isinstance(tokenizer_config.get("extra_special_tokens"), dict):
+        source_extra_special_tokens = source_tokenizer_config.get("extra_special_tokens")
+        if isinstance(source_extra_special_tokens, dict) and source_extra_special_tokens:
+            tokenizer_config["extra_special_tokens"] = source_extra_special_tokens
+            changed = True
+
+    if changed:
+        _write_json(tokenizer_config_path, tokenizer_config)
+        logger.info_rank0(f"Normalized tokenizer config for export at {tokenizer_config_path}.")
+
+
+def _save_processor_sidecar_configs(processor: Any, export_dir: str) -> None:
+    for attr_name in ("image_processor", "video_processor"):
+        attr = getattr(processor, attr_name, None)
+        if attr is None or not hasattr(attr, "save_pretrained"):
+            continue
+
+        try:
+            attr.save_pretrained(export_dir)
+            logger.info_rank0(f"Saved `{attr_name}` sidecar config to {export_dir}.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning_rank0(f"Cannot save `{attr_name}` sidecar config, please copy it manually: {e}.")
 
 
 def _training_function(config: dict[str, Any]) -> None:
@@ -261,8 +369,11 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
 
         if processor is not None:
             processor.save_pretrained(model_args.export_dir)
+            _save_processor_sidecar_configs(processor, model_args.export_dir)
             if model_args.export_hub_model_id is not None:
                 processor.push_to_hub(model_args.export_hub_model_id, token=model_args.hf_hub_token)
+
+        _normalize_exported_tokenizer_config(model_args)
 
     except Exception as e:
         logger.warning_rank0(f"Cannot save tokenizer, please copy the files manually: {e}.")

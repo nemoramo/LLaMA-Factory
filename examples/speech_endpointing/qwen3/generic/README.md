@@ -226,3 +226,20 @@ PY
 3. **特殊 Token**: 导出时必须使用与训练时相同的 `add_special_tokens` 配置
 
 4. **Neat Packing**: 这是分类任务的关键，确保损失只计算在正确的样本上
+
+#### 2026-03-12 更新：`Qwen/Qwen3.5-0.8B-Base` 原生 `llamafactory-cli export` 实测结论
+
+- 当前主线里的 export 逻辑已经补上了 `Qwen3.5` deployment 所需的 post-process：
+  - 会在 export 结束后规范化 `tokenizer_config.json`
+  - 会自动补齐 `preprocessor_config.json` / `video_preprocessor_config.json`
+- 实测使用仓库内置通用 export YAML 加上 `template=qwen3_5_nothink`，已经可以把 `Qwen3.5-0.8B-Base` speech endpointing LoRA checkpoint 直接导出成可被当前 `vllm-endpointing-grpc:v0.17.0` 加载的目录。
+- 当前导出后的 `tokenizer_config.json` 会被规范到下面这种 deployment-ready 状态：
+  - `tokenizer_class = "Qwen2Tokenizer"`
+  - `extra_special_tokens` 保留为 `dict`
+  - `additional_special_tokens` 保留为 `list`，并包含 `<EOU>` / `<CONT_USER>` / `<UNADDRESSED>`
+- 当前导出目录会包含：
+  - `processor_config.json`
+  - `preprocessor_config.json`
+  - `video_preprocessor_config.json`
+- 2026-03-12 的 smoke 里，这条 raw `llamafactory-cli export -> vllm-endpointing-grpc:v0.17.0` 链路已经在 5 号卡拉起服务，`gRPC Predict` 可正常返回 `<EOU>` 标签。
+- 但要注意，这只说明 export / deploy 兼容性已经打通，不代表任意 checkpoint 的 no-bias label top-k 一定通过。对于本次测试的 `checkpoint-1323`，手工 no-bias top-logprobs 检查没有把三类标签打进 top3，因此仍要把“服务能起”与“checkpoint 质量是否达标”分开评估。
