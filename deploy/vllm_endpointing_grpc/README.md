@@ -188,3 +188,57 @@ PY
 ```
 
 将输出填入 `LOGIT_BIAS_JSON`（key 必须是字符串）。
+
+---
+
+## 已验证的兼容性陷阱
+
+在 `Qwen3-0.6B` speech endpointing 的实际部署测试里，已经遇到过下面这类版本错位问题：
+
+- merge / export 环境使用 `transformers==5.2.0`
+- `vllm-endpointing-grpc` 基于 `vllm 0.12.0`
+- base image 自带 `transformers 4.57.x`
+
+现象：
+
+- `config.json` 可以正常读取
+- 但 `AutoTokenizer.from_pretrained()` 可能在部署镜像里失败，报错类似：
+  - `'list' object has no attribute 'keys'`
+
+原因：
+
+- `transformers 5.2.0` 导出的 `tokenizer_config.json` 里，`extra_special_tokens` 可能是 `list`
+- 旧一点的 deployment-side `transformers` 在读取这个字段时不兼容
+
+另外，**不要简单把当前 `vllm 0.12.0` 镜像里的 `transformers` 直接升级到 `5.2.0`**。我们已经验证过，这样虽然能修复 tokenizer 加载，但会导致：
+
+- `from vllm import LLM`
+- 报 `ImportError: cannot import name 'ALLOWED_LAYER_TYPES'`
+
+也就是：
+
+- 老 `transformers`：tokenizer 读不了
+- 直接升到 `5.2.0`：vLLM 自己 import 不了
+
+推荐处理方式：
+
+1. 优先升级到一个**原生支持更高 transformers 版本**的 vLLM base image，再构建 `vllm-endpointing-grpc`
+2. 如果短期不能换 vLLM base，就在 export 后增加一个 tokenizer config 兼容层，把 `tokenizer_config.json` 规范化到 deployment 镜像可接受的格式
+
+### 当前仓库内已验证可工作的组合
+
+在当前仓库里，我们已经用 `Qwen3-0.6B` 的 speech endpointing merged 模型做过一轮 smoke，下面这组配置可以把服务成功拉起：
+
+- `VLLM_IMAGE=vllm/vllm-openai:v0.17.0`
+- deployment 镜像内使用 `protobuf==5.29.6`
+- deployment 镜像设置 `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`
+- merged 模型目录里的 `tokenizer_config.json` 需要满足：
+  - `additional_special_tokens` 是 `list`
+  - 不要保留 `extra_special_tokens=list` 这种 `transformers 5.2.0` 导出后可能出现的形式
+
+如果你看到下面两类报错，基本可以直接按上面的方向排查：
+
+- `Descriptors cannot be created directly`
+  - 这是旧 `pb2` 生成代码和较新 protobuf runtime 的兼容性问题
+- `AttributeError: 'list' object has no attribute 'keys'`
+  - 这是 deployment-side tokenizer 读取 `extra_special_tokens=list` 时的兼容性问题
