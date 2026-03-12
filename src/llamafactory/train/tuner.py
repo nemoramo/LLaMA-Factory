@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import sys
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -41,8 +42,11 @@ from .trainer_utils import (
 )
 
 
+ray: Any | None = None
 if is_ray_available():
-    import ray
+    import ray as ray_module
+
+    ray = ray_module
 
 
 if TYPE_CHECKING:
@@ -52,6 +56,13 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _require_ray() -> Any:
+    if not is_ray_available():
+        raise ImportError("ray is not installed. Please install it with `pip install ray` or disable Ray training.")
+
+    return ray
 
 
 def _save_training_command(args: Any, training_args: "TrainingArguments") -> None:
@@ -179,7 +190,8 @@ def _save_processor_sidecar_configs(processor: Any, export_dir: str) -> None:
 
 def _training_function(config: dict[str, Any]) -> None:
     args = config.get("args")
-    callbacks: list[Any] = config.get("callbacks")
+    raw_callbacks = config.get("callbacks")
+    callbacks: list[Any] = raw_callbacks if isinstance(raw_callbacks, list) else []
     model_args, data_args, training_args, finetuning_args, generating_args = get_train_args(args)
 
     _save_training_command(args, training_args)
@@ -239,7 +251,7 @@ def _training_function(config: dict[str, Any]) -> None:
     else:
         raise ValueError(f"Unknown task: {finetuning_args.stage}.")
 
-    if is_ray_available() and ray.is_initialized():
+    if is_ray_available() and _require_ray().is_initialized():
         return  # if ray is intialized it will destroy the process group on return
 
     try:
@@ -249,17 +261,19 @@ def _training_function(config: dict[str, Any]) -> None:
         logger.warning(f"Failed to destroy process group: {e}.")
 
 
-def run_exp(args: Optional[dict[str, Any]] = None, callbacks: Optional[list["TrainerCallback"]] = None) -> None:
-    args = read_args(args)
-    if "-h" in args or "--help" in args:
-        get_train_args(args)
+def run_exp(
+    args: Optional[dict[str, Any] | list[str]] = None, callbacks: Optional[list["TrainerCallback"]] = None
+) -> None:
+    parsed_args = read_args(args)
+    if isinstance(parsed_args, list) and ("-h" in parsed_args or "--help" in parsed_args):
+        get_train_args(parsed_args)
 
-    ray_args = get_ray_args(args)
+    ray_args = get_ray_args(parsed_args)
     callbacks = callbacks or []
     if ray_args.use_ray:
-        _ray_training_function(ray_args, config={"args": args, "callbacks": callbacks})
+        _ray_training_function(ray_args, config={"args": parsed_args, "callbacks": callbacks})
     else:
-        _training_function(config={"args": args, "callbacks": callbacks})
+        _training_function(config={"args": parsed_args, "callbacks": callbacks})
 
 
 def export_model(args: Optional[dict[str, Any]] = None) -> None:
@@ -337,7 +351,7 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
         logger.warning_rank0(f"Failed to validate tie_word_embeddings before export: {e}.")
 
     # Prepare save arguments (safe_serialization removed in transformers v5.0.0)
-    save_kwargs = {
+    save_kwargs: dict[str, object] = {
         "save_directory": model_args.export_dir,
         "max_shard_size": f"{model_args.export_size}GB",
     }
@@ -347,7 +361,7 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
     model.save_pretrained(**save_kwargs)
     if model_args.export_hub_model_id is not None:
         # Prepare push arguments (safe_serialization removed in transformers v5.0.0)
-        push_kwargs = {
+        push_kwargs: dict[str, object] = {
             "max_shard_size": f"{model_args.export_size}GB",
         }
         if not is_transformers_version_greater_than("5.0.0"):
@@ -363,6 +377,8 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
         if model_args.adapter_name_or_path is not None:
             vhead_path = model_args.adapter_name_or_path[-1]
         else:
+            if model_args.model_name_or_path is None:
+                raise ValueError("Please provide `model_name_or_path`.")
             vhead_path = model_args.model_name_or_path
 
         if os.path.exists(os.path.join(vhead_path, V_HEAD_SAFE_WEIGHTS_NAME)):
@@ -417,7 +433,8 @@ class Worker:
         is_ray_noset_visible_devices = any(os.environ.get(env_var, None) for env_var in RAY_NOSET_VISIBLE_DEVICES_LIST)
         if is_ray_noset_visible_devices:
             device_name = get_device_name().upper()
-            local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            ray_module = _require_ray()
+            local_rank = str(ray_module.get_runtime_context().get_accelerator_ids()[device_name][0])
             os.environ["LOCAL_RANK"] = local_rank
         else:
             os.environ["LOCAL_RANK"] = "0"
@@ -427,21 +444,25 @@ class Worker:
 
 
 def _ray_training_function(ray_args: "RayArguments", config: dict[str, Any]) -> None:
+    ray_module = _require_ray()
     num_workers = ray_args.ray_num_workers
     master_addr = ray_args.master_addr
     master_port = ray_args.master_port
     logger.info(f"Using ray.remote mode with {num_workers} workers for distributed training.")
 
     # initialize ray
-    if not ray.is_initialized():
+    if not ray_module.is_initialized():
         if ray_args.ray_init_kwargs is not None:
-            ray.init(**ray_args.ray_init_kwargs)
+            if not isinstance(ray_args.ray_init_kwargs, Mapping):
+                raise ValueError("`ray_init_kwargs` must be a mapping or a JSON object string.")
+
+            ray_module.init(**dict(ray_args.ray_init_kwargs))
         else:
-            ray.init()
+            ray_module.init()
 
     # verify resources
     device_name = get_device_name().upper()
-    total_devices = int(ray.cluster_resources().get(device_name, 0))
+    total_devices = int(ray_module.cluster_resources().get(device_name, 0))
     if num_workers > total_devices:
         raise ValueError(
             f"The number of devices in the Ray cluster ({total_devices}) should be greater than num_workers ({num_workers})."
@@ -452,13 +473,13 @@ def _ray_training_function(ray_args: "RayArguments", config: dict[str, Any]) -> 
         master_addr = get_ray_head_node_ip()
         logger.info(f"`master_addr` is not specified, using head node ip: {master_addr}.")
     else:
-        nodes = [node["NodeManagerAddress"] for node in ray.nodes() if node["Alive"]]
+        nodes = [node["NodeManagerAddress"] for node in ray_module.nodes() if node["Alive"]]
         if master_addr not in nodes:
             raise ValueError(f"The `master_addr` ({master_addr}) is not in Ray cluster or not alive ")
 
     # create placementgroup for resource management
     pg, bundle = get_placement_group(total_devices)
-    ray.get(pg.ready())
+    ray_module.get(pg.ready())
     logger.info(f"Create placement group with {num_workers} bundles: {bundle}")
 
     # get sorted_bundle_indices
@@ -474,8 +495,8 @@ def _ray_training_function(ray_args: "RayArguments", config: dict[str, Any]) -> 
     current_env = dict(os.environ.items())
 
     # launch workers
-    RayWorker = ray.remote(Worker)
-    workers = []
+    RayWorker = ray_module.remote(Worker)
+    workers: list[Any] = []
     for rank in range(num_workers):
         remote_config = get_ray_remote_config_for_worker(
             placement_group=pg,
@@ -489,5 +510,5 @@ def _ray_training_function(ray_args: "RayArguments", config: dict[str, Any]) -> 
         worker = RayWorker.options(**remote_config).remote()
         workers.append(worker)
 
-    ray.get([worker._training_function.remote(config=config) for worker in workers])
-    ray.shutdown()
+    ray_module.get([worker._training_function.remote(config=config) for worker in workers])
+    ray_module.shutdown()
