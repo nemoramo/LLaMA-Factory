@@ -297,8 +297,11 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
         model = model.to(output_dtype)
         logger.info_rank0(f"Convert model dtype to: {output_dtype}.")
 
-    # Ensure config is consistent with actual tying state.
-    # This matters when LoRA training saves `embed_tokens` and `lm_head` as separate trainable modules.
+    # Preserve tied embeddings on export when LoRA training materializes
+    # `embed_tokens` and `lm_head` as separate trainable modules.
+    # For Qwen3/Qwen3.5 endpointing this is important: exporting an untied
+    # pair can change the next-token distribution in vLLM even when the model
+    # should conceptually remain tied.
     try:
         if getattr(model.config, "tie_word_embeddings", False):
             input_emb = model.get_input_embeddings()
@@ -310,11 +313,26 @@ def export_model(args: Optional[dict[str, Any]] = None) -> None:
                 and hasattr(output_emb, "weight")
                 and input_emb.weight.data_ptr() != output_emb.weight.data_ptr()
             ):
+                if input_emb.weight.shape != output_emb.weight.shape:
+                    raise ValueError(
+                        "Cannot retie input/output embeddings before export because their shapes differ: "
+                        f"{tuple(input_emb.weight.shape)} vs {tuple(output_emb.weight.shape)}."
+                    )
+
                 logger.warning_rank0(
                     "Detected untied input/output embeddings but `tie_word_embeddings=True` in config; "
-                    "setting it to False for export to avoid incorrect weight tying on load."
+                    "copying `lm_head` weights into input embeddings and re-tying before export."
                 )
-                model.config.tie_word_embeddings = False
+                with torch.no_grad():
+                    input_emb.weight.copy_(output_emb.weight)
+
+                model.tie_weights()
+
+                if input_emb.weight.data_ptr() != output_emb.weight.data_ptr():
+                    logger.warning_rank0(
+                        "`model.tie_weights()` did not restore shared storage for input/output embeddings; "
+                        "export will proceed with copied values but separate tensors."
+                    )
     except Exception as e:
         logger.warning_rank0(f"Failed to validate tie_word_embeddings before export: {e}.")
 

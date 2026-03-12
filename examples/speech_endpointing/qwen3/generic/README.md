@@ -232,6 +232,9 @@ PY
 - 当前主线里的 export 逻辑已经补上了 `Qwen3.5` deployment 所需的 post-process：
   - 会在 export 结束后规范化 `tokenizer_config.json`
   - 会自动补齐 `preprocessor_config.json` / `video_preprocessor_config.json`
+- 当前主线里的 export 逻辑也已经补上了 `tie_word_embeddings` 修复：
+  - 如果 merge 后发现 `embed_tokens` 和 `lm_head` 被 LoRA 物化成了两份不同权重，但 config 仍然是 `tie_word_embeddings=true`
+  - export 会先把 `lm_head` 权重拷回 input embeddings，再执行 re-tie 后保存
 - 实测使用仓库内置通用 export YAML 加上 `template=qwen3_5_nothink`，已经可以把 `Qwen3.5-0.8B-Base` speech endpointing LoRA checkpoint 直接导出成可被当前 `vllm-endpointing-grpc:v0.17.0` 加载的目录。
 - 当前导出后的 `tokenizer_config.json` 会被规范到下面这种 deployment-ready 状态：
   - `tokenizer_class = "Qwen2Tokenizer"`
@@ -241,5 +244,6 @@ PY
   - `processor_config.json`
   - `preprocessor_config.json`
   - `video_preprocessor_config.json`
-- 2026-03-12 的 smoke 里，这条 raw `llamafactory-cli export -> vllm-endpointing-grpc:v0.17.0` 链路已经在 5 号卡拉起服务，`gRPC Predict` 可正常返回 `<EOU>` 标签。
-- 但要注意，这只说明 export / deploy 兼容性已经打通，不代表任意 checkpoint 的 no-bias label top-k 一定通过。对于本次测试的 `checkpoint-1323`，手工 no-bias top-logprobs 检查没有把三类标签打进 top3，因此仍要把“服务能起”与“checkpoint 质量是否达标”分开评估。
+- 2026-03-12 的最终复测里，这条 raw `llamafactory-cli export -> vllm-endpointing-grpc:v0.17.0` 链路已经在 5 号卡拉起服务，`gRPC Predict` 可正常返回 `<EOU>` 标签。
+- 同一轮复测里，使用 canonical prompt 做 no-bias top-logprobs 检查，`<EOU>` / `<CONT_USER>` / `<UNADDRESSED>` 已经重新回到 top3。
+- 这次复测说明，先前 `checkpoint-1323` 的 top-k 异常主因不是 checkpoint 质量本身，而是 export 产物里的 `tie_word_embeddings` / `embed_tokens<->lm_head` 关系不正确。
