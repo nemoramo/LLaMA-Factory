@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -9,6 +10,7 @@ from time import perf_counter
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional
 
+import numpy as np
 import torch
 from accelerate.utils import gather_object
 from transformers import GenerationConfig, Trainer
@@ -418,7 +420,203 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
         log_fn = logger.info if debug_all_ranks else getattr(logger, "info_rank0", logger.info)
         log_fn(f"[rank={getattr(self.accelerator, 'process_index', -1)}] {message}", *args)
 
+    def _pin_current_cuda_device(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        local_rank = int(getattr(self.accelerator, "local_process_index", 0))
+        if torch.cuda.current_device() != local_rank:
+            torch.cuda.set_device(local_rank)
+
+    def _get_audio_sampling_rate(self) -> int:
+        feature_extractor = getattr(self.processor, "feature_extractor", None)
+        return int(
+            getattr(self.model_args, "audio_sampling_rate", None)
+            or getattr(feature_extractor, "sampling_rate", None)
+            or getattr(self.processor, "audio_sampling_rate", None)
+            or getattr(self.processor, "sampling_rate", None)
+            or 16000
+        )
+
+    def _normalize_vllm_audio_payload(self, sample_audios: list[Any]) -> list[tuple[np.ndarray, int]]:
+        if not sample_audios:
+            return []
+
+        audio_data = self.template.mm_plugin._regularize_audios(
+            sample_audios, sampling_rate=self._get_audio_sampling_rate()
+        )
+        normalized_audio_pairs: list[tuple[np.ndarray, int]] = []
+        for wav, sampling_rate in zip(audio_data["audios"], audio_data["sampling_rates"]):
+            if isinstance(wav, torch.Tensor):
+                wav_array = wav.detach().cpu().to(torch.float32).contiguous().numpy()
+            else:
+                wav_array = np.asarray(wav, dtype=np.float32)
+                if not wav_array.flags["C_CONTIGUOUS"]:
+                    wav_array = np.ascontiguousarray(wav_array)
+            normalized_audio_pairs.append((wav_array, int(sampling_rate)))
+
+        return normalized_audio_pairs
+
+    def _build_vllm_request_summary(
+        self, prompt_ids: list[int], normalized_audio_pairs: list[tuple[np.ndarray, int]]
+    ) -> dict[str, Any]:
+        audio_token_id = self.text_tokenizer.convert_tokens_to_ids(AUDIO_PLACEHOLDER)
+        return {
+            "prompt_len": int(len(prompt_ids)),
+            "num_audios": int(len(normalized_audio_pairs)),
+            "audio_num_samples": [int(wav.shape[0]) for wav, _ in normalized_audio_pairs],
+            "audio_sampling_rates": [int(sampling_rate) for _, sampling_rate in normalized_audio_pairs],
+            "num_audio_placeholders": int(sum(1 for token_id in prompt_ids if token_id == audio_token_id)),
+            "has_multi_modal_data": bool(normalized_audio_pairs),
+        }
+
+    def _assert_tp_request_summaries_match(self, request_summaries: list[dict[str, Any]]) -> None:
+        if self.vllm_tensor_parallel_size <= 1 or not torch.distributed.is_initialized():
+            return
+
+        self._pin_current_cuda_device()
+        gathered_summaries = [None for _ in range(self.vllm_tensor_parallel_size)]
+        torch.distributed.all_gather_object(gathered_summaries, request_summaries, group=self.tp_group)
+        baseline = gathered_summaries[0]
+        mismatched_ranks = [rank for rank, summaries in enumerate(gathered_summaries[1:], start=1) if summaries != baseline]
+        if mismatched_ranks:
+            dump_dir = os.getenv("LLAMAFACTORY_GRPO_VLLM_DUMP_DIR")
+            dump_path = None
+            if dump_dir:
+                step_dir = Path(dump_dir) / f"step_{int(self.state.global_step):06d}"
+                step_dir.mkdir(parents=True, exist_ok=True)
+                dump_path = step_dir / (
+                    f"tp_request_summary_mismatch_proc_{int(getattr(self.accelerator, 'process_index', -1)):02d}"
+                    f"_tp_{int(torch.distributed.get_rank(group=self.tp_group)):02d}.json"
+                )
+                dump_payload = {
+                    "global_step": int(self.state.global_step),
+                    "process_index": int(getattr(self.accelerator, "process_index", -1)),
+                    "tp_rank": int(torch.distributed.get_rank(group=self.tp_group)),
+                    "mismatched_ranks": mismatched_ranks,
+                    "gathered_summaries": gathered_summaries,
+                }
+                dump_path.write_text(json.dumps(dump_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            raise RuntimeError(
+                "TP ranks built different FunAudioChat vLLM requests before generate: "
+                f"mismatched_ranks={mismatched_ranks}, local_rank_in_group={torch.distributed.get_rank(group=self.tp_group)}"
+                + (f", dump_path={dump_path}." if dump_path is not None else ".")
+            )
+
+    def _dump_vllm_request(
+        self, request_idx: int, prompt_ids: list[int], normalized_audio_pairs: list[tuple[np.ndarray, int]]
+    ) -> None:
+        dump_dir = os.getenv("LLAMAFACTORY_GRPO_VLLM_DUMP_DIR")
+        if not dump_dir:
+            return
+
+        step_dir = Path(dump_dir) / f"step_{int(self.state.global_step):06d}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        base_name = f"req_{request_idx:04d}"
+        metadata = {
+            "global_step": int(self.state.global_step),
+            "request_idx": int(request_idx),
+            "prompt_len": int(len(prompt_ids)),
+            "prompt_token_ids": prompt_ids,
+            "num_audios": int(len(normalized_audio_pairs)),
+            "audio_num_samples": [int(wav.shape[0]) for wav, _ in normalized_audio_pairs],
+            "audio_sampling_rates": [int(sampling_rate) for _, sampling_rate in normalized_audio_pairs],
+        }
+        (step_dir / f"{base_name}.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        for audio_idx, (wav, sampling_rate) in enumerate(normalized_audio_pairs):
+            np.save(step_dir / f"{base_name}_audio_{audio_idx:02d}_{int(sampling_rate)}.npy", wav)
+
+    def _build_vllm_inputs(
+        self, all_prompt_ids: list[list[int]], all_audios: list[list[Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        self._log_rollout_debug(
+            "GRPO vllm input build start step=%s prompt_lists=%s",
+            self.state.global_step,
+            len(all_prompt_ids),
+        )
+        vllm_inputs: list[dict[str, Any]] = []
+        request_summaries: list[dict[str, Any]] = []
+        for request_idx, (prompt_ids, sample_audios) in enumerate(zip(all_prompt_ids, all_audios)):
+            multi_modal_data = None
+            normalized_audio_pairs: list[tuple[np.ndarray, int]] = []
+            if sample_audios:
+                normalized_audio_pairs = self._normalize_vllm_audio_payload(sample_audios)
+                multi_modal_data = {"audio": normalized_audio_pairs}
+            vllm_inputs.append({"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data})
+            request_summaries.append(self._build_vllm_request_summary(prompt_ids, normalized_audio_pairs))
+            if os.getenv("LLAMAFACTORY_GRPO_VLLM_DUMP_DIR"):
+                self._dump_vllm_request(request_idx, prompt_ids, normalized_audio_pairs)
+        self._log_rollout_debug(
+            "GRPO vllm input build done step=%s requests=%s",
+            self.state.global_step,
+            len(vllm_inputs),
+        )
+        return vllm_inputs, request_summaries
+
+    def _should_use_safe_serial_multimodal_rollout(self, all_audios: list[list[Any]]) -> bool:
+        force_batch = str(os.getenv("LLAMAFACTORY_GRPO_FORCE_BATCH_VLLM", "0")).lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if force_batch:
+            return False
+
+        return (
+            self.use_vllm
+            and self.vllm_tensor_parallel_size > 1
+            and any(len(sample_audios) > 0 for sample_audios in all_audios)
+        )
+
+    def _get_colocate_vllm_model(self):
+        return self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+
+    def _load_weights_into_colocate_vllm(self, weights) -> None:
+        llm_model = self._get_colocate_vllm_model()
+        llm_model.load_weights(weights)
+
+    def _sync_fsdp1_params_to_vllm(self, module: "nn.Module", prefix: str = "", visited=None):
+        if visited is None:
+            visited = set()
+
+        for child_name, child_module in module.named_children():
+            child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+            self._sync_fsdp1_params_to_vllm(child_module, prefix=child_prefix, visited=visited)
+
+        if not isinstance(module, FSDP):
+            return
+
+        with FSDP.summon_full_params(module, recurse=False, writeback=False):
+            def iter_module_weights():
+                for param_name, param in module.named_parameters():
+                    full_name = f"{prefix}.{param_name}" if prefix else param_name
+                    full_name = self._fix_param_name_to_vllm(full_name, extra_prefixes=["_fsdp_wrapped_module."])
+                    if full_name in visited:
+                        continue
+                    visited.add(full_name)
+                    yield full_name, param.data
+
+            if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                for full_name, param in iter_module_weights():
+                    self.vllm_client.update_named_param(full_name, param)
+            elif self.vllm_mode == "colocate":
+                self._load_weights_into_colocate_vllm(iter_module_weights())
+
+    def _sync_fsdp2_params_to_vllm(self, module: "nn.Module"):
+        def iter_state_dict_weights():
+            for name, param in module.state_dict().items():
+                if param.is_cpu:
+                    param = param.to(torch.device("cuda"))
+                yield name, param.full_tensor()
+
+        if self.vllm_mode == "server" and self.accelerator.is_main_process:
+            for name, param in iter_state_dict_weights():
+                self.vllm_client.update_named_param(name, param)
+        elif self.vllm_mode == "colocate":
+            self._load_weights_into_colocate_vllm(iter_state_dict_weights())
+
     def _move_model_to_vllm(self):
+        self._pin_current_cuda_device()
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
         if zero_stage_3:
@@ -440,19 +638,18 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
                     elif fsdp_version == 2:
                         self._sync_fsdp2_params_to_vllm(self.model)
                 else:
-                    for name, param in self.model.named_parameters():
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        if self.model.prefix in name:
-                            continue
-                        if "original_module" in name:
-                            continue
-                        name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+                    def iter_merged_adapter_weights():
+                        for name, param in self.model.named_parameters():
+                            name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                            if self.model.prefix in name or "original_module" in name:
+                                continue
+                            yield self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."]), param.data
 
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
+                    if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                        for name, param in iter_merged_adapter_weights():
+                            self.vllm_client.update_named_param(name, param)
+                    elif self.vllm_mode == "colocate":
+                        self._load_weights_into_colocate_vllm(iter_merged_adapter_weights())
 
                 self.model.unmerge_adapter()
         else:
@@ -464,21 +661,38 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
                 elif fsdp_version == 2:
                     self._sync_fsdp2_params_to_vllm(self.model)
             else:
-                for name, param in self.model.named_parameters():
-                    name = self._fix_param_name_to_vllm(name)
-                    with gather_if_zero3([param]):
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
+                def iter_model_weights():
+                    for name, param in self.model.named_parameters():
+                        fixed_name = self._fix_param_name_to_vllm(name)
+                        with gather_if_zero3([param]):
+                            yield fixed_name, param.data
+
+                if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                    for name, param in iter_model_weights():
+                        self.vllm_client.update_named_param(name, param)
+                elif self.vllm_mode == "colocate":
+                    self._load_weights_into_colocate_vllm(iter_model_weights())
 
     def _reset_vllm_prefix_cache(self):
+        self._pin_current_cuda_device()
         self._log_rollout_debug("GRPO vllm reset-prefix-cache start step=%s", self.state.global_step)
         if self.vllm_mode == "server" and self.accelerator.is_main_process:
             self.vllm_client.reset_prefix_cache()
+            if hasattr(self.vllm_client, "reset_encoder_cache"):
+                self.vllm_client.reset_encoder_cache()
+            elif hasattr(self.vllm_client, "reset_mm_cache"):
+                self.vllm_client.reset_mm_cache()
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
+            llm_engine = getattr(self.llm, "llm_engine", None)
+            if hasattr(self.llm, "reset_encoder_cache"):
+                self.llm.reset_encoder_cache()
+            elif llm_engine is not None and hasattr(llm_engine, "reset_encoder_cache"):
+                llm_engine.reset_encoder_cache()
+            if hasattr(self.llm, "reset_mm_cache"):
+                self.llm.reset_mm_cache()
+            elif llm_engine is not None and hasattr(llm_engine, "reset_mm_cache"):
+                llm_engine.reset_mm_cache()
         self._log_rollout_debug("GRPO vllm reset-prefix-cache done step=%s", self.state.global_step)
 
     @override
@@ -856,6 +1070,7 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
 
             if self.vllm_tensor_parallel_size > 1:
                 original_size = len(prompt_ids_list)
+                self._pin_current_cuda_device()
                 self._log_rollout_debug(
                     "GRPO prompt gather start step=%s local_prompts=%s tp=%s",
                     self.state.global_step,
@@ -877,6 +1092,7 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
                     len(audios),
                 )
                 gathered_audios = [None for _ in range(self.vllm_tensor_parallel_size)]
+                self._pin_current_cuda_device()
                 torch.distributed.all_gather_object(gathered_audios, audios, group=self.tp_group)
                 all_audios = [audio_list for sublist in gathered_audios for audio_list in sublist]
                 self._log_rollout_debug(
@@ -889,28 +1105,34 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
                 all_prompt_ids = prompt_ids_list
                 all_audios = audios
 
-            self._log_rollout_debug(
-                "GRPO vllm input build start step=%s prompt_lists=%s",
-                self.state.global_step,
-                len(all_prompt_ids),
-            )
-            vllm_inputs = []
-            audio_sampling_rate = getattr(
-                self.model_args, "audio_sampling_rate", getattr(self.processor, "audio_sampling_rate", 16000)
-            )
-            for prompt_ids, sample_audios in zip(all_prompt_ids, all_audios):
-                multi_modal_data = None
-                if sample_audios:
-                    audio_data = self.template.mm_plugin._regularize_audios(sample_audios, sampling_rate=audio_sampling_rate)
-                    multi_modal_data = {"audio": list(zip(audio_data["audios"], audio_data["sampling_rates"]))}
-                vllm_inputs.append({"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data})
-            self._log_rollout_debug(
-                "GRPO vllm input build done step=%s requests=%s",
-                self.state.global_step,
-                len(vllm_inputs),
-            )
-
             total_audio_items = sum(len(sample_audios) for sample_audios in all_audios)
+            if self.vllm_tensor_parallel_size > 1 and total_audio_items > 0:
+                local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
+                tp_payload = None
+                if local_rank_in_group == 0:
+                    vllm_inputs, request_summaries = self._build_vllm_inputs(all_prompt_ids, all_audios)
+                    tp_payload = {"vllm_inputs": vllm_inputs, "request_summaries": request_summaries}
+                self._pin_current_cuda_device()
+                gathered_payloads = [None for _ in range(self.vllm_tensor_parallel_size)]
+                torch.distributed.all_gather_object(gathered_payloads, tp_payload, group=self.tp_group)
+                canonical_payload = gathered_payloads[0]
+                if canonical_payload is None:
+                    raise RuntimeError(
+                        "Failed to gather canonical FunAudioChat vLLM inputs within TP group: root payload is None."
+                    )
+                vllm_inputs = canonical_payload["vllm_inputs"]
+                request_summaries = canonical_payload["request_summaries"]
+                self._log_rollout_debug(
+                    "GRPO canonical vllm input broadcast done step=%s requests=%s tp=%s",
+                    self.state.global_step,
+                    len(vllm_inputs),
+                    self.vllm_tensor_parallel_size,
+                )
+            else:
+                vllm_inputs, request_summaries = self._build_vllm_inputs(all_prompt_ids, all_audios)
+
+            self._assert_tp_request_summaries_match(request_summaries)
+
             self._log_rollout_debug(
                 "GRPO rollout start step=%s requests=%s total_audio_items=%s tp=%s",
                 self.state.global_step,
@@ -919,8 +1141,48 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
                 self.vllm_tensor_parallel_size,
             )
             generate_start = perf_counter()
-            with profiling_context(self, "vLLM.generate"):
-                all_outputs = self.llm.generate(vllm_inputs, sampling_params=sampling_params, use_tqdm=False)
+            self._pin_current_cuda_device()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            if self._should_use_safe_serial_multimodal_rollout(all_audios):
+                self._log_rollout_debug(
+                    "GRPO rollout safe-serial mode enabled step=%s requests=%s",
+                    self.state.global_step,
+                    len(vllm_inputs),
+                )
+                all_outputs = []
+                for request_idx, vllm_input in enumerate(vllm_inputs):
+                    normalized_audio_pairs = (
+                        [] if vllm_input["multi_modal_data"] is None else vllm_input["multi_modal_data"]["audio"]
+                    )
+                    self._dump_vllm_request(request_idx, vllm_input["prompt_token_ids"], normalized_audio_pairs)
+                    self._log_rollout_debug(
+                        "GRPO rollout item start step=%s request=%s prompt_len=%s audio_items=%s audio_num_samples=%s",
+                        self.state.global_step,
+                        request_idx,
+                        len(vllm_input["prompt_token_ids"]),
+                        len(normalized_audio_pairs),
+                        [int(wav.shape[0]) for wav, _ in normalized_audio_pairs],
+                    )
+                    item_start = perf_counter()
+                    with profiling_context(self, f"vLLM.generate.item.{request_idx}"):
+                        outputs = self.llm.generate([vllm_input], sampling_params=sampling_params, use_tqdm=False)
+                    if len(outputs) != 1:
+                        raise RuntimeError(
+                            f"Expected exactly one vLLM output in safe-serial mode, got {len(outputs)}."
+                        )
+                    all_outputs.extend(outputs)
+                    self._log_rollout_debug(
+                        "GRPO rollout item done step=%s request=%s duration=%.2fs",
+                        self.state.global_step,
+                        request_idx,
+                        perf_counter() - item_start,
+                    )
+            else:
+                with profiling_context(self, "vLLM.generate"):
+                    all_outputs = self.llm.generate(vllm_inputs, sampling_params=sampling_params, use_tqdm=False)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             self._log_rollout_debug(
                 "GRPO rollout done step=%s requests=%s completions=%s duration=%.2fs",
                 self.state.global_step,
@@ -1211,7 +1473,9 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
         if should_collect_completion_logs:
             gather_start = perf_counter()
             self._log_rollout_debug("GRPO log-gather start step=%s", self.state.global_step)
+            self._pin_current_cuda_device()
             self._logs["prompt"].extend(gather_object(prompts_text))
+            self._pin_current_cuda_device()
             self._logs["completion"].extend(gather_object(completions_text))
             for i, name in enumerate(self.reward_func_names):
                 self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
@@ -1246,6 +1510,13 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)
+        self._log_rollout_debug(
+            "GRPO compute-loss start step=%s local_batch=%s seq_len=%s logits_to_keep=%s",
+            self.state.global_step,
+            input_ids.size(0),
+            input_ids.size(1),
+            logits_to_keep,
+        )
 
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
@@ -1258,6 +1529,12 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
             input_features=inputs.get("input_features"),
             feature_attention_mask=inputs.get("feature_attention_mask"),
             feature_exist_mask=inputs.get("feature_exist_mask"),
+        )
+        self._log_rollout_debug(
+            "GRPO compute-loss token-logps done step=%s logps_shape=%s entropy_shape=%s",
+            self.state.global_step,
+            tuple(per_token_logps.shape),
+            tuple(entropies.shape) if entropies is not None else None,
         )
 
         if self.top_entropy_quantile < 1.0:
@@ -1311,6 +1588,11 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
             loss = (per_token_loss * completion_mask).sum() / normalizer
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
+        self._log_rollout_debug(
+            "GRPO compute-loss scalar ready step=%s loss=%.6f",
+            self.state.global_step,
+            loss.detach().float().item(),
+        )
 
         mode = "train" if self.model.training else "eval"
         completion_token_count = completion_mask.sum().clamp(min=1.0)
@@ -1322,10 +1604,14 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
 
         if self.beta != 0.0:
             mean_kl = masked_batch_mean(per_token_kl)
+            self._log_rollout_debug("GRPO compute-loss kl-gather start step=%s", self.state.global_step)
             self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
+            self._log_rollout_debug("GRPO compute-loss kl-gather done step=%s", self.state.global_step)
 
         mean_entropy = masked_batch_mean(entropies)
+        self._log_rollout_debug("GRPO compute-loss entropy-gather start step=%s", self.state.global_step)
         self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
+        self._log_rollout_debug("GRPO compute-loss entropy-gather done step=%s", self.state.global_step)
 
         is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
         is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
@@ -1333,13 +1619,16 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
         if entropy_mask is not None:
             clip_ratio = clip_ratio * entropy_mask
         clip_ratio = masked_batch_mean(clip_ratio)
+        self._log_rollout_debug("GRPO compute-loss clip-gather start step=%s", self.state.global_step)
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).nanmean().item())
+        self._log_rollout_debug("GRPO compute-loss clip-gather done step=%s", self.state.global_step)
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
             delta = torch.abs(old_per_token_logps - inputs["old_per_token_logps"])
             delta = delta[completion_mask.bool()]
             mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=loss.device)
             max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=loss.device)
+            self._log_rollout_debug("GRPO compute-loss sampling-gathers start step=%s", self.state.global_step)
             self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
                 self.accelerator.gather(mean_delta).mean().item()
             )
@@ -1359,5 +1648,7 @@ class CustomFunAudioChatGRPOTrainer(GRPOTrainer):
             self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
                 nanmax(self.accelerator.gather(max_ratio)).item()
             )
+            self._log_rollout_debug("GRPO compute-loss sampling-gathers done step=%s", self.state.global_step)
 
+        self._log_rollout_debug("GRPO compute-loss done step=%s", self.state.global_step)
         return loss

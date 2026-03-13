@@ -46,6 +46,65 @@ See `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`.
 For a second-stage GRPO setup that strengthens ASR transcription quality on top of an SFT checkpoint, see
 `examples/funaudiochat/funaudiochat_grpo_asr_lora.yaml`.
 
+For the currently validated **full-LLM FunAudioChat + GRPO** reference run, see:
+
+- `examples/funaudiochat/funaudiochat_hausa_grpo_asr_full_llm_4gpu_tp2_stable.yaml`
+- `examples/funaudiochat/GRPO_REFERENCE_EXAMPLE.md`
+
+This reference example was stabilized on branch `feature/funaudiochat-grpo-asr` and matches the first successful
+full-parameter `TP=2` colocated vLLM GRPO run on Hausa.
+
+### Recommended settings (current reference)
+
+For the current validated FunAudioChat GRPO path on this branch, we recommend:
+
+- Use `examples/funaudiochat/funaudiochat_hausa_grpo_asr_full_llm_4gpu_tp2_stable.yaml` as the starting point.
+- Keep `packing: false`.
+- Keep `dynamic_prompt_sampling: true`.
+- Prefer `finetuning_type: full` with:
+  - `funaudiochat_freeze_audio_tower: true`
+  - `freeze_multi_modal_projector: true`
+- Prefer `grpo_use_vllm: true` + `grpo_vllm_mode: colocate`.
+- For the currently stable full-LLM path, use:
+  - `grpo_vllm_tensor_parallel_size: 2`
+  - `grpo_vllm_gpu_memory_utilization: 0.16`
+  - `grpo_vllm_enable_sleep_mode: false`
+  - `grpo_allow_experimental_funaudiochat_colocate_tp: true`
+- Reward / rollout starting point:
+  - `grpo_num_generations: 8`
+  - `grpo_generation_batch_size: 8`
+  - `grpo_loss_type: dapo`
+  - `grpo_scale_rewards: group`
+  - `grpo_beta: 0.0`
+  - `grpo_temperature: 1.0`
+  - `grpo_top_p: 0.95`
+- Optimizer / batch starting point:
+  - `per_device_train_batch_size: 1`
+  - `gradient_accumulation_steps: 8`
+  - `learning_rate: 1e-6`
+  - `warmup_ratio: 0.02`
+  - `lr_scheduler_type: cosine`
+
+### Reference bench (Hausa full-LLM GRPO)
+
+Reference run:
+
+- Train config: `/data2/mayufeng/saves/funaudiochat/grpo_asr_hausa_full_llm_4gpu_tp2_formal10k_20260311/train_config.yaml`
+- Final model: `/data2/mayufeng/saves/funaudiochat/grpo_asr_hausa_full_llm_4gpu_tp2_formal10k_20260311`
+- 4-GPU training runtime: about `1 day 4:24:21`
+- Training throughput during the stable part of the run: about `380~407 tok/s`
+
+Reference eval was run through a local OpenAI-compatible endpoint on port `30005`, with the same `subprompt1` prompt
+format used in training-aligned evaluation.
+
+| Dataset | pre-GRPO WER | GRPO WER | Δ WER | pre-GRPO WERE | GRPO WERE | Δ WERE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| youtube | 28.6652% | 22.2054% | -6.4598 | 21.7512% | 15.4933% | -6.2579 |
+| fleurs | 23.4294% | 22.4374% | -0.9920 | 19.0647% | 18.3940% | -0.6708 |
+| haiwa | 20.8659% | 18.4142% | -2.4517 | 16.3798% | 14.2410% | -2.1388 |
+| return_data | 32.8937% | 29.2270% | -3.6668 | 24.5470% | 20.6015% | -3.9455 |
+| weighted avg | 28.9074% | 25.7980% | -3.1094 | 22.1333% | 19.0125% | -3.1208 |
+
 Current constraints:
 
 - Only `template: funaudiochat` is supported.
@@ -106,6 +165,9 @@ python scripts/repro_funaudiochat_vllm_generate.py \
 ### Full-parameter LLM GRPO
 
 See `examples/funaudiochat/funaudiochat_grpo_asr_full_llm.yaml`.
+
+If you want the exact Hausa reference config that completed a long run on this branch, use
+`examples/funaudiochat/funaudiochat_hausa_grpo_asr_full_llm_4gpu_tp2_stable.yaml` instead of the older bring-up YAMLs.
 
 Practical notes:
 

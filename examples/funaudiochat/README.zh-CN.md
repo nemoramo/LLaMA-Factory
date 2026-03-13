@@ -46,6 +46,66 @@
 如果你要在一阶段 SFT checkpoint 的基础上继续做二阶段 GRPO，增强 ASR 转写能力，可参考
 `examples/funaudiochat/funaudiochat_grpo_asr_lora.yaml`。
 
+如果你要直接参考当前这条已经跑通的 **full-LLM FunAudioChat + GRPO** 配置，优先看：
+
+- `examples/funaudiochat/funaudiochat_hausa_grpo_asr_full_llm_4gpu_tp2_stable.yaml`
+- `examples/funaudiochat/GRPO_REFERENCE_EXAMPLE.md`
+
+这套参考配置是在分支 `feature/funaudiochat-grpo-asr` 上稳定下来的，对应第一条成功完整跑完的
+`TP=2` colocated vLLM Hausa full-parameter GRPO 实验。
+
+### 推荐 setting（当前参考）
+
+当前这条已经验证过的 FunAudioChat GRPO 路径，建议从下面这套设置开始：
+
+- 直接以 `examples/funaudiochat/funaudiochat_hausa_grpo_asr_full_llm_4gpu_tp2_stable.yaml` 为起点
+- 保持 `packing: false`
+- 保持 `dynamic_prompt_sampling: true`
+- 全参 LLM 路径建议：
+  - `finetuning_type: full`
+  - `funaudiochat_freeze_audio_tower: true`
+  - `freeze_multi_modal_projector: true`
+- rollout 建议：
+  - `grpo_use_vllm: true`
+  - `grpo_vllm_mode: colocate`
+  - `grpo_vllm_tensor_parallel_size: 2`
+  - `grpo_vllm_gpu_memory_utilization: 0.16`
+  - `grpo_vllm_enable_sleep_mode: false`
+  - `grpo_allow_experimental_funaudiochat_colocate_tp: true`
+- GRPO 起始参数建议：
+  - `grpo_num_generations: 8`
+  - `grpo_generation_batch_size: 8`
+  - `grpo_loss_type: dapo`
+  - `grpo_scale_rewards: group`
+  - `grpo_beta: 0.0`
+  - `grpo_temperature: 1.0`
+  - `grpo_top_p: 0.95`
+- 训练起始参数建议：
+  - `per_device_train_batch_size: 1`
+  - `gradient_accumulation_steps: 8`
+  - `learning_rate: 1e-6`
+  - `warmup_ratio: 0.02`
+  - `lr_scheduler_type: cosine`
+
+### 参考 bench（Hausa full-LLM GRPO）
+
+参考实验：
+
+- 训练配置：`/data2/mayufeng/saves/funaudiochat/grpo_asr_hausa_full_llm_4gpu_tp2_formal10k_20260311/train_config.yaml`
+- 最终模型：`/data2/mayufeng/saves/funaudiochat/grpo_asr_hausa_full_llm_4gpu_tp2_formal10k_20260311`
+- 4 卡训练总时长：约 `1 day 4:24:21`
+- 稳定阶段训练吞吐：约 `380~407 tok/s`
+
+评测使用本地 OpenAI-compatible 端口 `30005`，并采用与训练对齐的 `subprompt1` 提示格式。
+
+| 数据集 | pre-GRPO WER | GRPO WER | Δ WER | pre-GRPO WERE | GRPO WERE | Δ WERE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| youtube | 28.6652% | 22.2054% | -6.4598 | 21.7512% | 15.4933% | -6.2579 |
+| fleurs | 23.4294% | 22.4374% | -0.9920 | 19.0647% | 18.3940% | -0.6708 |
+| haiwa | 20.8659% | 18.4142% | -2.4517 | 16.3798% | 14.2410% | -2.1388 |
+| return_data | 32.8937% | 29.2270% | -3.6668 | 24.5470% | 20.6015% | -3.9455 |
+| 加权平均 | 28.9074% | 25.7980% | -3.1094 | 22.1333% | 19.0125% | -3.1208 |
+
 当前约束如下：
 
 - 仅支持 `template: funaudiochat`
@@ -106,6 +166,9 @@ python scripts/repro_funaudiochat_vllm_generate.py \
 ### Full-parameter LLM GRPO
 
 参考 `examples/funaudiochat/funaudiochat_grpo_asr_full_llm.yaml`。
+
+如果你想直接复用这次 Hausa 成功实验的参数，不要优先用早期 bring-up YAML，而是使用
+`examples/funaudiochat/funaudiochat_hausa_grpo_asr_full_llm_4gpu_tp2_stable.yaml`。
 
 实践建议：
 
