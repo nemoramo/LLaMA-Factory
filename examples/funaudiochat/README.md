@@ -53,6 +53,7 @@ For the currently validated **full-LLM FunAudioChat + GRPO** reference run, see:
 
 This reference example was stabilized on branch `feature/funaudiochat-grpo-asr` and matches the first successful
 full-parameter `TP=2` colocated vLLM GRPO run on Hausa.
+The same reference doc also records the core branch-side changes and the root-cause / fix path for the earlier rollout hangs.
 
 ### Recommended settings (current reference)
 

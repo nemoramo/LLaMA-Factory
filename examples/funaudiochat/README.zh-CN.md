@@ -53,6 +53,7 @@
 
 这套参考配置是在分支 `feature/funaudiochat-grpo-asr` 上稳定下来的，对应第一条成功完整跑完的
 `TP=2` colocated vLLM Hausa full-parameter GRPO 实验。
+同一份参考文档里也补充记录了这次分支的核心改动，以及之前 rollout hang 的定位和修复路径。
 
 ### 推荐 setting（当前参考）
 
