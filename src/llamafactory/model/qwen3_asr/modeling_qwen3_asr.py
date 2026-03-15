@@ -796,6 +796,16 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         """
         if feature_lens is None:
             raise ValueError("`feature_lens` must be provided for Qwen3-ASR audio encoder.")
+        if input_features.ndim == 2:
+            if feature_lens.numel() != 1:
+                raise ValueError("2D `input_features` expects exactly one `feature_len` value.")
+            batched_input_features = input_features.unsqueeze(0)
+        elif input_features.ndim == 3:
+            if input_features.shape[0] != feature_lens.numel():
+                raise ValueError("3D `input_features` batch dimension must match `feature_lens`.")
+            batched_input_features = input_features
+        else:
+            raise ValueError("`input_features` must be a 2D or 3D tensor.")
 
         aftercnn_lens_tensor = aftercnn_lens
         if aftercnn_lens_tensor is None:
@@ -811,7 +821,17 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
         chunk_lengths[chunk_lengths == 0] = self.n_window * 2
 
-        chunk_list = list(input_features.T.split(chunk_lengths.tolist(), dim=0))
+        chunk_list = []
+        chunk_cursor = 0
+        for input_feature, feature_len, num_chunks in zip(
+            batched_input_features,
+            feature_lens.tolist(),
+            chunk_num.tolist(),
+        ):
+            audio_chunk_lengths = chunk_lengths[chunk_cursor : chunk_cursor + num_chunks].tolist()
+            chunk_list.extend(input_feature[:, :feature_len].T.split(audio_chunk_lengths, dim=0))
+            chunk_cursor += num_chunks
+
         padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
         padded_mask_after_cnn = nn.utils.rnn.pad_sequence(
@@ -1301,7 +1321,21 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         else:
             raise ValueError("Either `feature_attention_mask` or `audio_feature_lengths` must be provided.")
 
-        # audio encoder do not support batch inference to keep precision
+        if (
+            self.training
+            and input_features.ndim == 3
+            and feature_lens.numel() > 1
+            and getattr(self.audio_tower.config, "_attn_implementation", None) == "flash_attention_2"
+        ):
+            audio_output = self.audio_tower(
+                input_features,
+                feature_lens=feature_lens,
+            )
+            audio_features = audio_output.last_hidden_state
+            audio_feature_token_lens = _get_feat_extract_output_lengths(feature_lens).tolist()
+            return audio_features, audio_feature_token_lens
+
+        # Keep eval/predict on the legacy serial path.
         audio_features = []
         audio_feature_token_lens = []
         for input_feature, feature_len in zip(input_features, feature_lens):

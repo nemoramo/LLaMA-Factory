@@ -15,6 +15,222 @@
 import pytest
 
 
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_qwen3_asr_audio_encoder_batched_forward_matches_serial():
+    import torch
+
+    from llamafactory.model.qwen3_asr.configuration_qwen3_asr import Qwen3ASRAudioEncoderConfig
+    from llamafactory.model.qwen3_asr.modeling_qwen3_asr import Qwen3ASRAudioEncoder, _get_feat_extract_output_lengths
+
+    torch.manual_seed(0)
+    config = Qwen3ASRAudioEncoderConfig(
+        num_mel_bins=8,
+        encoder_layers=2,
+        encoder_attention_heads=4,
+        encoder_ffn_dim=64,
+        d_model=32,
+        max_source_positions=64,
+        n_window=4,
+        n_window_infer=8,
+        output_dim=16,
+        downsample_hidden_size=8,
+    )
+    setattr(config, "_attn_implementation", "eager")
+    encoder = Qwen3ASRAudioEncoder(config)
+    encoder.eval()
+
+    feature_lens = torch.tensor([12, 16], dtype=torch.long)
+    input_features = torch.randn(2, config.num_mel_bins, int(feature_lens.max()))
+    expected_lens = _get_feat_extract_output_lengths(feature_lens)
+
+    serial_outputs = []
+    for i, feature_len in enumerate(feature_lens.tolist()):
+        serial_outputs.append(
+            encoder(
+                input_features[i, :, :feature_len],
+                feature_lens=torch.tensor([feature_len], dtype=torch.long),
+            ).last_hidden_state
+        )
+
+    serial_hidden = torch.cat(serial_outputs, dim=0)
+    batched_hidden = encoder(input_features, feature_lens=feature_lens).last_hidden_state
+
+    assert batched_hidden.shape == (int(expected_lens.sum().item()), config.output_dim)
+    assert torch.allclose(batched_hidden, serial_hidden, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_qwen3_asr_get_audio_features_batches_training_audio_tower(monkeypatch):
+    import torch
+    from transformers.modeling_outputs import BaseModelOutput
+
+    from llamafactory.model.qwen3_asr.configuration_qwen3_asr import (
+        Qwen3ASRAudioEncoderConfig,
+        Qwen3ASRTextConfig,
+        Qwen3ASRThinkerConfig,
+    )
+    from llamafactory.model.qwen3_asr.modeling_qwen3_asr import (
+        Qwen3ASRThinkerForConditionalGeneration,
+        _get_feat_extract_output_lengths,
+    )
+
+    thinker_config = Qwen3ASRThinkerConfig(
+        audio_config=Qwen3ASRAudioEncoderConfig(
+            num_mel_bins=8,
+            encoder_layers=2,
+            encoder_attention_heads=4,
+            encoder_ffn_dim=64,
+            d_model=32,
+            max_source_positions=64,
+            n_window=4,
+            n_window_infer=8,
+            output_dim=16,
+            downsample_hidden_size=8,
+        ),
+        text_config=Qwen3ASRTextConfig(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+            max_position_embeddings=128,
+            pad_token_id=0,
+        ),
+    )
+    model = Qwen3ASRThinkerForConditionalGeneration(thinker_config)
+    model.train()
+    setattr(model.audio_tower.config, "_attn_implementation", "flash_attention_2")
+
+    feature_lens = torch.tensor([12, 16], dtype=torch.long)
+    input_features = torch.randn(2, thinker_config.audio_config.num_mel_bins, int(feature_lens.max()))
+    feature_attention_mask = torch.zeros(2, int(feature_lens.max()), dtype=torch.long)
+    for i, feature_len in enumerate(feature_lens.tolist()):
+        feature_attention_mask[i, :feature_len] = 1
+
+    calls = []
+
+    def fake_forward(input_features, feature_lens=None, aftercnn_lens=None):
+        calls.append(
+            {
+                "shape": tuple(input_features.shape),
+                "feature_lens": None if feature_lens is None else feature_lens.clone(),
+                "aftercnn_lens": None if aftercnn_lens is None else aftercnn_lens.clone(),
+            }
+        )
+        assert input_features.ndim == 3
+        assert feature_lens is not None
+        token_lens = _get_feat_extract_output_lengths(feature_lens)
+        total_tokens = int(token_lens.sum().item())
+        hidden = torch.arange(
+            total_tokens * thinker_config.audio_config.output_dim,
+            dtype=torch.float32,
+        ).view(total_tokens, thinker_config.audio_config.output_dim)
+        return BaseModelOutput(last_hidden_state=hidden)
+
+    monkeypatch.setattr(model.audio_tower, "forward", fake_forward)
+
+    audio_features, audio_feature_token_lens = model.get_audio_features(
+        input_features=input_features,
+        feature_attention_mask=feature_attention_mask,
+    )
+
+    expected_token_lens = _get_feat_extract_output_lengths(feature_lens).tolist()
+    assert len(calls) == 1
+    assert calls[0]["shape"] == tuple(input_features.shape)
+    assert torch.equal(calls[0]["feature_lens"], feature_lens)
+    assert calls[0]["aftercnn_lens"] is None
+    assert audio_feature_token_lens == expected_token_lens
+    assert audio_features.shape == (sum(expected_token_lens), thinker_config.audio_config.output_dim)
+
+
+@pytest.mark.runs_on(["cpu", "mps"])
+def test_qwen3_asr_get_audio_features_keeps_serial_training_path_without_fa2(monkeypatch):
+    import torch
+    from transformers.modeling_outputs import BaseModelOutput
+
+    from llamafactory.model.qwen3_asr.configuration_qwen3_asr import (
+        Qwen3ASRAudioEncoderConfig,
+        Qwen3ASRTextConfig,
+        Qwen3ASRThinkerConfig,
+    )
+    from llamafactory.model.qwen3_asr.modeling_qwen3_asr import (
+        Qwen3ASRThinkerForConditionalGeneration,
+        _get_feat_extract_output_lengths,
+    )
+
+    thinker_config = Qwen3ASRThinkerConfig(
+        audio_config=Qwen3ASRAudioEncoderConfig(
+            num_mel_bins=8,
+            encoder_layers=2,
+            encoder_attention_heads=4,
+            encoder_ffn_dim=64,
+            d_model=32,
+            max_source_positions=64,
+            n_window=4,
+            n_window_infer=8,
+            output_dim=16,
+            downsample_hidden_size=8,
+        ),
+        text_config=Qwen3ASRTextConfig(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+            max_position_embeddings=128,
+            pad_token_id=0,
+        ),
+    )
+    model = Qwen3ASRThinkerForConditionalGeneration(thinker_config)
+    model.train()
+    setattr(model.audio_tower.config, "_attn_implementation", "eager")
+
+    feature_lens = torch.tensor([12, 16], dtype=torch.long)
+    input_features = torch.randn(2, thinker_config.audio_config.num_mel_bins, int(feature_lens.max()))
+    feature_attention_mask = torch.zeros(2, int(feature_lens.max()), dtype=torch.long)
+    for i, feature_len in enumerate(feature_lens.tolist()):
+        feature_attention_mask[i, :feature_len] = 1
+
+    calls = []
+
+    def fake_forward(input_features, feature_lens=None, aftercnn_lens=None):
+        calls.append(
+            {
+                "shape": tuple(input_features.shape),
+                "feature_lens": None if feature_lens is None else feature_lens.clone(),
+                "aftercnn_lens": None if aftercnn_lens is None else aftercnn_lens.clone(),
+            }
+        )
+        assert input_features.ndim == 2
+        assert feature_lens is not None
+        token_lens = _get_feat_extract_output_lengths(feature_lens)
+        total_tokens = int(token_lens.sum().item())
+        hidden = torch.zeros(total_tokens, thinker_config.audio_config.output_dim)
+        return BaseModelOutput(last_hidden_state=hidden)
+
+    monkeypatch.setattr(model.audio_tower, "forward", fake_forward)
+
+    audio_features, audio_feature_token_lens = model.get_audio_features(
+        input_features=input_features,
+        feature_attention_mask=feature_attention_mask,
+    )
+
+    expected_token_lens = _get_feat_extract_output_lengths(feature_lens).tolist()
+    assert len(calls) == 2
+    assert calls[0]["shape"] == (thinker_config.audio_config.num_mel_bins, 12)
+    assert calls[1]["shape"] == (thinker_config.audio_config.num_mel_bins, 16)
+    assert torch.equal(calls[0]["feature_lens"], torch.tensor([12]))
+    assert torch.equal(calls[1]["feature_lens"], torch.tensor([16]))
+    assert calls[0]["aftercnn_lens"] is None
+    assert calls[1]["aftercnn_lens"] is None
+    assert audio_feature_token_lens == expected_token_lens
+    assert audio_features.shape == (sum(expected_token_lens), thinker_config.audio_config.output_dim)
+
+
 @pytest.mark.runs_on(["cpu"])
 def test_qwen3_asr_registration_template_plugin():
     from transformers import AutoConfig, AutoModel, AutoProcessor
