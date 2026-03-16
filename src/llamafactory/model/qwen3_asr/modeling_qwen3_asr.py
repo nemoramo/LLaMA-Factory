@@ -1497,6 +1497,8 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         qwen3_asr_audio_token_count = kwargs.pop("qwen3_asr_audio_token_count", None)
         qwen3_asr_audios_per_sample = kwargs.pop("qwen3_asr_audios_per_sample", None)
 
+        labels_for_loss = labels
+
         # 2. Merge text, audios
         if input_features is not None:
             audio_features, audio_feature_token_lens = self.get_audio_features(
@@ -1589,32 +1591,49 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                                 cur_counts_per_sample = None
 
                 if cur_counts_per_sample is not None and len(cur_counts_per_sample) == bsz:
-                    mismatch_indices = [
-                        i
+                    mismatch = [
+                        (i, int(req), int(cur))
                         for i, (req, cur) in enumerate(zip(required_counts, cur_counts_per_sample))
                         if int(req) != int(cur)
                     ]
+                    mismatch_indices = [i for i, _, _ in mismatch]
+                    hard_drop_threshold = max(
+                        0, int(os.getenv("LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_HARD_DIFF", "10"))
+                    )
+                    hard_drop_mismatch = [
+                        (i, req, cur) for i, req, cur in mismatch if abs(int(req) - int(cur)) > hard_drop_threshold
+                    ]
+                    hard_drop_indices = [i for i, _, _ in hard_drop_mismatch]
+                    hard_drop_index_set = set(hard_drop_indices)
 
                     warn_limit = int(os.getenv("LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_WARN_LIMIT", "20"))
                     warned = int(getattr(self, "_qwen3_asr_audio_align_warned", 0))
                     if mismatch_indices and warned < warn_limit:
-                        mismatch = [(i, int(required_counts[i]), int(cur_counts_per_sample[i])) for i in mismatch_indices]
                         pad_n = sum(1 for _, req, cur in mismatch if req > cur)
                         trunc_n = sum(1 for _, req, cur in mismatch if req < cur)
                         max_abs_diff = max(abs(req - cur) for _, req, cur in mismatch)
                         examples = ", ".join(f"{i}:{req}->{cur}" for i, req, cur in mismatch[:8])
+                        hard_drop_examples = ", ".join(f"{i}:{req}->{cur}" for i, req, cur in hard_drop_mismatch[:8])
                         logger.warning_rank0(
                             "Qwen3-ASR audio token/feature length mismatch: mismatched=%d/%d (%.1f%%), "
-                            "pad=%d, truncate=%d, max_abs_diff=%d, examples=[%s]. "
+                            "pad=%d, truncate=%d, hard_drop=%d (threshold=%d), max_abs_diff=%d, examples=[%s]. "
                             "Falling back to per-sample pad/truncate of audio features.",
                             len(mismatch_indices),
                             bsz,
                             100.0 * float(len(mismatch_indices)) / float(max(1, bsz)),
                             pad_n,
                             trunc_n,
+                            len(hard_drop_indices),
+                            hard_drop_threshold,
                             int(max_abs_diff),
                             examples,
                         )
+                        if hard_drop_examples:
+                            logger.warning_rank0(
+                                "Qwen3-ASR hard-dropped alignment outliers: samples=[%s]. "
+                                "Using zero audio features and masking labels with -100 when present.",
+                                hard_drop_examples,
+                            )
                         warned += 1
                         setattr(self, "_qwen3_asr_audio_align_warned", warned)
                         if warned == warn_limit:
@@ -1626,7 +1645,12 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
                     pieces = []
                     offset = 0
-                    for req, cur in zip(required_counts, cur_counts_per_sample):
+                    if hard_drop_indices and labels is not None:
+                        if labels_for_loss is labels:
+                            labels_for_loss = labels.clone()
+                        labels_for_loss[hard_drop_indices] = -100
+
+                    for sample_idx, (req, cur) in enumerate(zip(required_counts, cur_counts_per_sample)):
                         req = int(req)
                         cur = int(cur)
                         if req < 0 or cur < 0:
@@ -1634,7 +1658,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
                         cur_feat = audio_features_flat[offset : offset + cur]
                         offset += cur
-                        if req == cur:
+                        if sample_idx in hard_drop_index_set:
+                            pieces.append(audio_features_flat.new_zeros((req, embed_dim)))
+                        elif req == cur:
                             pieces.append(cur_feat)
                         elif req < cur:
                             pieces.append(cur_feat[:req])
@@ -1723,10 +1749,13 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         logits = self.lm_head(hidden_states)
 
         loss = None
-        if labels is not None:
-            loss = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size
-            )
+        if labels_for_loss is not None:
+            if bool(labels_for_loss.ne(-100).any()):
+                loss = self.loss_function(
+                    logits=logits, labels=labels_for_loss, vocab_size=self.config.get_text_config().vocab_size
+                )
+            else:
+                loss = logits.sum() * 0.0
 
         return Qwen3ASRThinkerCausalLMOutputWithPast(
             loss=loss,
