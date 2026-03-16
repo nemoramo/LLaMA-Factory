@@ -607,6 +607,46 @@ def test_qwen3_asr_plugin_load_single_audio_parses_json_path(monkeypatch):
 
 
 @pytest.mark.runs_on(["cpu"])
+def test_qwen3_asr_plugin_load_single_audio_honors_segment_json(tmp_path):
+    import json
+    import wave
+
+    import numpy as np
+
+    from llamafactory.data.mm_plugin import get_mm_plugin
+
+    plugin = get_mm_plugin(name="qwen3_asr", audio_token="<|audio_pad|>")
+    sample_rate = 16000
+    hop_length = 160
+    samples = np.linspace(-0.75, 0.75, sample_rate, dtype=np.float32)
+    pcm = np.clip(samples * 32767.0, -32768.0, 32767.0).astype(np.int16)
+    stored = pcm.astype(np.float32) / 32768.0
+    wav_path = tmp_path / "segment.wav"
+
+    with wave.open(str(wav_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm.tobytes())
+
+    segment = json.dumps(
+        {
+            "path": f"file://{wav_path}",
+            "offset_sec": 0.25,
+            "duration_sec": 0.5,
+        }
+    )
+    waveform, sr = plugin._load_single_audio(segment, float(sample_rate))
+    expected = stored[int(0.25 * sample_rate) : int(0.75 * sample_rate)]
+    feature_length = plugin._try_get_feature_length(segment, float(sample_rate), hop_length, min_samples=400)
+
+    assert sr == float(sample_rate)
+    assert waveform.shape == expected.shape
+    np.testing.assert_allclose(waveform, expected, atol=1e-4)
+    assert feature_length == max(1, expected.shape[0] // hop_length)
+
+
+@pytest.mark.runs_on(["cpu"])
 def test_qwen3_5_template_registered():
     from llamafactory.data.template import TEMPLATES
 
