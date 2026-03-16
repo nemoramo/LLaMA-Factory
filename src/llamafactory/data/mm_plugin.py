@@ -2177,6 +2177,54 @@ class Qwen3ASRPlugin(BasePlugin):
 
         return None
 
+    @staticmethod
+    def _parse_audio_json(audio: str) -> dict | None:
+        audio = audio.strip()
+        if not (audio.startswith("{") and audio.endswith("}")):
+            return None
+        try:
+            obj = json.loads(audio)
+            return obj if isinstance(obj, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @override
+    def _load_single_audio(self, audio: AudioInput, sampling_rate: float) -> tuple[NDArray, float]:
+        # Mirror FunAudioChat's JSON-aware audio transport so placeholder expansion and
+        # actual waveform loading interpret the same dataset field the same way.
+        if isinstance(audio, dict):
+            arr = audio.get("array")
+            if isinstance(arr, np.ndarray):
+                return arr, float(sampling_rate)
+
+            raw_bytes = audio.get("bytes")
+            if isinstance(raw_bytes, (bytes, bytearray)):
+                audio = BytesIO(bytes(raw_bytes))
+            else:
+                path = audio.get("path") or audio.get("wav_path") or audio.get("audio_path") or audio.get("uri")
+                if isinstance(path, (str, os.PathLike)) and os.fspath(path):
+                    audio = os.fsdecode(path)
+                else:
+                    raw = audio.get("raw")
+                    if raw is not None:
+                        audio = raw
+
+        if isinstance(audio, str):
+            obj = self._parse_audio_json(audio)
+            if obj is not None:
+                path = obj.get("path") or obj.get("wav_path") or obj.get("audio_path") or obj.get("uri") or ""
+                if isinstance(path, str) and path.startswith("file://"):
+                    path = path[7:]
+
+                if isinstance(path, str) and path:
+                    audio = path
+                else:
+                    raw = obj.get("raw")
+                    if raw is not None:
+                        audio = raw
+
+        return super()._load_single_audio(audio, sampling_rate)
+
     @override
     def process_messages(
         self,
