@@ -635,7 +635,6 @@ class FunAudioChatDecoder(FunAudioChatPreTrainedModel):
 
     config_class = FunAudioChatAudioEncoderConfig
     main_input_name = "audio_ids"
-    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: FunAudioChatAudioEncoderConfig):
         super().__init__(config)
@@ -837,6 +836,14 @@ class FunAudioChatDecoder(FunAudioChatPreTrainedModel):
 
 
 class FunAudioChatForConditionalGeneration(FunAudioChatPreTrainedModel, GenerationMixin):
+    # transformers>=5.2 expects a {target: source} mapping when filtering tied
+    # weights during save_pretrained(). The audio invert tower ties its lm_head
+    # against the sibling audio embedding table in tie_weights(), so declare the
+    # cross-module relationship here instead of on the decoder submodule.
+    _tied_weights_keys = {
+        "audio_invert_tower.lm_head.weight": "audio_tower.embed_tokens.weight",
+    }
+
     def __init__(self, config: FunAudioChatConfig):
         super().__init__(config)
         self.continuous_audio_tower = FunAudioChatAudioEncoder(config.audio_config)

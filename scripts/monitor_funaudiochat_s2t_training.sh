@@ -218,14 +218,14 @@ start_sys_monitor() {
       echo "--- rss summary (match) ---"
       # Match against full command line. Keep the computation separate from the top-N listing.
       local rss_total_kb
-      rss_total_kb="$(ps -eo rss,cmd --no-headers | rg "${SYS_MONITOR_MATCH}" | awk '{sum+=$1} END{print sum+0}')"
+      rss_total_kb="$(ps -eo rss,cmd --no-headers | grep -F -- "${SYS_MONITOR_MATCH}" | awk '{sum+=$1} END{print sum+0}')"
       local proc_count
-      proc_count="$(ps -eo rss,cmd --no-headers | rg "${SYS_MONITOR_MATCH}" | wc -l | tr -d ' ')"
+      proc_count="$(ps -eo rss,cmd --no-headers | grep -F -- "${SYS_MONITOR_MATCH}" | wc -l | tr -d ' ')"
       local rss_total_gib
       rss_total_gib="$(awk -v x="${rss_total_kb}" 'BEGIN{printf "%.2f", (x/1024.0/1024.0)}')"
       echo "procs=${proc_count} rss_total_kb=${rss_total_kb} rss_total_gib=${rss_total_gib}"
       echo "--- top rss (${SYS_MONITOR_TOP_N}) ---"
-      ps -eo pid,rss,cmd --sort=-rss | rg -n "${SYS_MONITOR_MATCH}" | head -n "${SYS_MONITOR_TOP_N}" || true
+      ps -eo pid,rss,cmd --sort=-rss | grep -F -- "${SYS_MONITOR_MATCH}" | head -n "${SYS_MONITOR_TOP_N}" || true
       sleep "${SYS_MONITOR_INTERVAL_SEC}"
     done
   ) >>"${mem_log}" 2>&1 &
@@ -234,7 +234,12 @@ start_sys_monitor() {
 
 is_oom_log() {
   local file="$1"
-  rg -n "(CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED)" "${file}" >/dev/null 2>&1
+  grep -E "(CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED)" "${file}" >/dev/null 2>&1
+}
+
+is_pin_memory_crash_log() {
+  local file="$1"
+  grep -F "Pin memory thread exited unexpectedly" "${file}" >/dev/null 2>&1
 }
 
 is_integer() {
@@ -257,6 +262,17 @@ PY
   if [[ "${new_bs}" -lt "${PER_DEVICE_TRAIN_BATCH_SIZE}" ]]; then
     log "WARN" "OOM detected: backing off per_device_train_batch_size ${PER_DEVICE_TRAIN_BATCH_SIZE} -> ${new_bs}"
     PER_DEVICE_TRAIN_BATCH_SIZE="${new_bs}"
+  fi
+}
+
+maybe_disable_pin_memory_on_crash() {
+  local train_log="$1"
+  if [[ "${DATALOADER_PIN_MEMORY}" != "true" ]]; then
+    return 0
+  fi
+  if is_pin_memory_crash_log "${train_log}"; then
+    log "WARN" "Pin-memory crash detected; switching dataloader_pin_memory=true -> false for subsequent restarts."
+    DATALOADER_PIN_MEMORY="false"
   fi
 }
 
@@ -557,6 +573,7 @@ EOF
   if is_oom_log "${train_log}"; then
     maybe_backoff_bs_on_oom
   fi
+  maybe_disable_pin_memory_on_crash "${train_log}"
   return "${rc}"
 }
 

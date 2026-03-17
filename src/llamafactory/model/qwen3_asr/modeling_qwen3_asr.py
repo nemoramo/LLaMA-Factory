@@ -1245,7 +1245,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
 class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditionalGeneration, GenerationMixin):
     base_model_prefix = "thinker"
     config_class = Qwen3ASRThinkerConfig
-    _tied_weights_keys = cast(Any, ["model.embed_tokens.weight", "lm_head.weight"])
+    _tied_weights_keys = cast(Any, {"lm_head.weight": "model.embed_tokens.weight"})
     _no_split_modules = [
         "Qwen3ASRAudioEncoderLayer",
         "Qwen3ASRThinkerTextDecoderLayer",
