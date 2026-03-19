@@ -796,6 +796,16 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         """
         if feature_lens is None:
             raise ValueError("`feature_lens` must be provided for Qwen3-ASR audio encoder.")
+        if input_features.ndim == 2:
+            if feature_lens.numel() != 1:
+                raise ValueError("2D `input_features` expects exactly one `feature_len` value.")
+            batched_input_features = input_features.unsqueeze(0)
+        elif input_features.ndim == 3:
+            if input_features.shape[0] != feature_lens.numel():
+                raise ValueError("3D `input_features` batch dimension must match `feature_lens`.")
+            batched_input_features = input_features
+        else:
+            raise ValueError("`input_features` must be a 2D or 3D tensor.")
 
         aftercnn_lens_tensor = aftercnn_lens
         if aftercnn_lens_tensor is None:
@@ -811,7 +821,17 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
         chunk_lengths[chunk_lengths == 0] = self.n_window * 2
 
-        chunk_list = list(input_features.T.split(chunk_lengths.tolist(), dim=0))
+        chunk_list = []
+        chunk_cursor = 0
+        for input_feature, feature_len, num_chunks in zip(
+            batched_input_features,
+            feature_lens.tolist(),
+            chunk_num.tolist(),
+        ):
+            audio_chunk_lengths = chunk_lengths[chunk_cursor : chunk_cursor + num_chunks].tolist()
+            chunk_list.extend(input_feature[:, :feature_len].T.split(audio_chunk_lengths, dim=0))
+            chunk_cursor += num_chunks
+
         padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
         padded_mask_after_cnn = nn.utils.rnn.pad_sequence(
@@ -1294,14 +1314,109 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
                 The length of feature shape of each audio in LLM.
         """
+        feature_lens = audio_feature_lengths
         if feature_attention_mask is not None:
-            feature_lens = torch.sum(feature_attention_mask, dim=1)
-        elif audio_feature_lengths is not None:
-            feature_lens = audio_feature_lengths
-        else:
+            # Match FunAudioChat's packed-safe path: treat the mask as the authoritative per-audio length
+            # source, then flatten away padding before feeding the encoder.
+            if input_features.dim() == 4:
+                if feature_attention_mask.dim() != 3:
+                    raise ValueError("4D Qwen3-ASR `input_features` expects a 3D `feature_attention_mask`.")
+                if feature_attention_mask.shape[:2] != input_features.shape[:2]:
+                    raise ValueError(
+                        "Packed Qwen3-ASR `feature_attention_mask` must match the sample/audio axes of "
+                        f"`input_features`: mask_shape={tuple(feature_attention_mask.shape)}, "
+                        f"input_shape={tuple(input_features.shape)}."
+                    )
+                if feature_attention_mask.shape[-1] != input_features.shape[-1]:
+                    min_len = min(int(feature_attention_mask.shape[-1]), int(input_features.shape[-1]))
+                    feature_attention_mask = feature_attention_mask[..., :min_len]
+                    input_features = input_features[..., :min_len]
+
+                audio_exist_mask = feature_attention_mask.any(dim=-1)
+                if not bool(audio_exist_mask.any()):
+                    raise ValueError("Packed Qwen3-ASR `feature_attention_mask` does not contain any valid audio.")
+                feature_attention_mask = feature_attention_mask[audio_exist_mask]
+                input_features = input_features[audio_exist_mask]
+
+            if input_features.dim() == 3:
+                if feature_attention_mask.shape[-1] != input_features.shape[-1]:
+                    min_len = min(int(feature_attention_mask.shape[-1]), int(input_features.shape[-1]))
+                    feature_attention_mask = feature_attention_mask[:, :min_len]
+                    input_features = input_features[:, :, :min_len]
+
+                feature_lens = torch.sum(feature_attention_mask, dim=1)
+                input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+            elif input_features.dim() == 2:
+                feature_lens = torch.sum(feature_attention_mask, dim=-1).view(-1)
+
+        if feature_lens is None:
             raise ValueError("Either `feature_attention_mask` or `audio_feature_lengths` must be provided.")
 
-        # audio encoder do not support batch inference to keep precision
+        if input_features.ndim == 2:
+            if feature_lens.numel() == 1:
+                feature_len = int(feature_lens.item())
+                audio_output = self.audio_tower(
+                    input_features[:, :feature_len],
+                    feature_lens=feature_lens.view(1),
+                )
+                audio_feature = audio_output.last_hidden_state
+                return audio_feature, [int(audio_feature.shape[0])]
+
+            if int(feature_lens.sum().item()) != int(input_features.shape[-1]):
+                raise ValueError(
+                    "Flattened Qwen3-ASR `input_features` is inconsistent with `audio_feature_lengths`: "
+                    f"sum(lengths)={int(feature_lens.sum().item())}, feature_width={int(input_features.shape[-1])}."
+                )
+
+            split_features = list(torch.split(input_features, feature_lens.tolist(), dim=-1))
+            if (
+                self.training
+                and feature_lens.numel() > 1
+                and getattr(self.audio_tower.config, "_attn_implementation", None) == "flash_attention_2"
+            ):
+                max_len = int(feature_lens.max().item())
+                batched_input_features = input_features.new_zeros(
+                    (len(split_features), int(input_features.shape[0]), max_len)
+                )
+                for i, (feature, feature_len) in enumerate(zip(split_features, feature_lens.tolist())):
+                    batched_input_features[i, :, : int(feature_len)] = feature[:, : int(feature_len)]
+
+                audio_output = self.audio_tower(
+                    batched_input_features,
+                    feature_lens=feature_lens,
+                )
+                audio_features = audio_output.last_hidden_state
+                audio_feature_token_lens = _get_feat_extract_output_lengths(feature_lens).tolist()
+                return audio_features, audio_feature_token_lens
+
+            audio_features = []
+            audio_feature_token_lens = []
+            for input_feature, feature_len in zip(split_features, feature_lens):
+                audio_output = self.audio_tower(
+                    input_feature[:, :feature_len],
+                    feature_lens=feature_len.unsqueeze(0),
+                )
+                audio_feature = audio_output.last_hidden_state
+                audio_features.append(audio_feature)
+                audio_feature_token_lens.append(int(audio_feature.shape[0]))
+            audio_features = torch.cat(audio_features, dim=0)
+            return audio_features, audio_feature_token_lens
+
+        if (
+            self.training
+            and input_features.ndim == 3
+            and feature_lens.numel() > 1
+            and getattr(self.audio_tower.config, "_attn_implementation", None) == "flash_attention_2"
+        ):
+            audio_output = self.audio_tower(
+                input_features,
+                feature_lens=feature_lens,
+            )
+            audio_features = audio_output.last_hidden_state
+            audio_feature_token_lens = _get_feat_extract_output_lengths(feature_lens).tolist()
+            return audio_features, audio_feature_token_lens
+
+        # Keep eval/predict on the legacy serial path.
         audio_features = []
         audio_feature_token_lens = []
         for input_feature, feature_len in zip(input_features, feature_lens):
@@ -1380,6 +1495,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         inputs_embeds = cast(torch.FloatTensor, inputs_embeds)
 
         qwen3_asr_audio_token_count = kwargs.pop("qwen3_asr_audio_token_count", None)
+        qwen3_asr_audios_per_sample = kwargs.pop("qwen3_asr_audios_per_sample", None)
+
+        labels_for_loss = labels
 
         # 2. Merge text, audios
         if input_features is not None:
@@ -1397,7 +1515,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                 required_counts = [int(x) for x in required_counts]
             elif qwen3_asr_audio_token_count is not None:
                 try:
-                    if isinstance(qwen3_asr_audio_token_count, (list, tuple)) and len(qwen3_asr_audio_token_count) == bsz:
+                    if torch.is_tensor(qwen3_asr_audio_token_count) and qwen3_asr_audio_token_count.numel() == bsz:
+                        required_counts = [int(x) for x in qwen3_asr_audio_token_count.view(-1).to("cpu").tolist()]
+                    elif isinstance(qwen3_asr_audio_token_count, (list, tuple)) and len(qwen3_asr_audio_token_count) == bsz:
                         required_counts = [int(x) for x in qwen3_asr_audio_token_count]
                 except Exception:  # noqa: BLE001
                     required_counts = None
@@ -1427,9 +1547,32 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                 # avoids crashing for rare rounding/decoder discrepancies.
                 cur_counts_per_sample: list[int] | None = None
 
+                if qwen3_asr_audios_per_sample is not None:
+                    try:
+                        if torch.is_tensor(qwen3_asr_audios_per_sample) and qwen3_asr_audios_per_sample.numel() == bsz:
+                            audios_per_sample = [int(x) for x in qwen3_asr_audios_per_sample.view(-1).to("cpu").tolist()]
+                        elif isinstance(qwen3_asr_audios_per_sample, (list, tuple)) and len(qwen3_asr_audios_per_sample) == bsz:
+                            audios_per_sample = [int(x) for x in qwen3_asr_audios_per_sample]
+                        else:
+                            audios_per_sample = None
+                    except Exception:  # noqa: BLE001
+                        audios_per_sample = None
+
+                    if audios_per_sample is not None and int(sum(audios_per_sample)) == len(audio_feature_token_lens):
+                        cur_counts_per_sample = []
+                        idx = 0
+                        for n in audios_per_sample:
+                            n = max(0, int(n))
+                            cur_counts_per_sample.append(
+                                int(sum(int(x) for x in audio_feature_token_lens[idx : idx + n]))
+                            )
+                            idx += n
+                        if idx != len(audio_feature_token_lens):
+                            cur_counts_per_sample = None
+
                 # Infer how many audios are packed in each sample from `audio_start_token_id`, then aggregate
                 # per-audio token lengths into per-sample token lengths.
-                if input_ids is not None:
+                if cur_counts_per_sample is None and input_ids is not None:
                     start_id = getattr(self.config, "audio_start_token_id", None)
                     if isinstance(start_id, int):
                         audios_per_sample = (input_ids == int(start_id)).sum(dim=-1).to("cpu").tolist()
@@ -1448,32 +1591,49 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                                 cur_counts_per_sample = None
 
                 if cur_counts_per_sample is not None and len(cur_counts_per_sample) == bsz:
-                    mismatch_indices = [
-                        i
+                    mismatch = [
+                        (i, int(req), int(cur))
                         for i, (req, cur) in enumerate(zip(required_counts, cur_counts_per_sample))
                         if int(req) != int(cur)
                     ]
+                    mismatch_indices = [i for i, _, _ in mismatch]
+                    hard_drop_threshold = max(
+                        0, int(os.getenv("LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_HARD_DIFF", "10"))
+                    )
+                    hard_drop_mismatch = [
+                        (i, req, cur) for i, req, cur in mismatch if abs(int(req) - int(cur)) > hard_drop_threshold
+                    ]
+                    hard_drop_indices = [i for i, _, _ in hard_drop_mismatch]
+                    hard_drop_index_set = set(hard_drop_indices)
 
                     warn_limit = int(os.getenv("LLAMAFACTORY_QWEN3_ASR_AUDIO_ALIGN_WARN_LIMIT", "20"))
                     warned = int(getattr(self, "_qwen3_asr_audio_align_warned", 0))
                     if mismatch_indices and warned < warn_limit:
-                        mismatch = [(i, int(required_counts[i]), int(cur_counts_per_sample[i])) for i in mismatch_indices]
                         pad_n = sum(1 for _, req, cur in mismatch if req > cur)
                         trunc_n = sum(1 for _, req, cur in mismatch if req < cur)
                         max_abs_diff = max(abs(req - cur) for _, req, cur in mismatch)
                         examples = ", ".join(f"{i}:{req}->{cur}" for i, req, cur in mismatch[:8])
+                        hard_drop_examples = ", ".join(f"{i}:{req}->{cur}" for i, req, cur in hard_drop_mismatch[:8])
                         logger.warning_rank0(
                             "Qwen3-ASR audio token/feature length mismatch: mismatched=%d/%d (%.1f%%), "
-                            "pad=%d, truncate=%d, max_abs_diff=%d, examples=[%s]. "
+                            "pad=%d, truncate=%d, hard_drop=%d (threshold=%d), max_abs_diff=%d, examples=[%s]. "
                             "Falling back to per-sample pad/truncate of audio features.",
                             len(mismatch_indices),
                             bsz,
                             100.0 * float(len(mismatch_indices)) / float(max(1, bsz)),
                             pad_n,
                             trunc_n,
+                            len(hard_drop_indices),
+                            hard_drop_threshold,
                             int(max_abs_diff),
                             examples,
                         )
+                        if hard_drop_examples:
+                            logger.warning_rank0(
+                                "Qwen3-ASR hard-dropped alignment outliers: samples=[%s]. "
+                                "Using zero audio features and masking labels with -100 when present.",
+                                hard_drop_examples,
+                            )
                         warned += 1
                         setattr(self, "_qwen3_asr_audio_align_warned", warned)
                         if warned == warn_limit:
@@ -1485,7 +1645,12 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
                     pieces = []
                     offset = 0
-                    for req, cur in zip(required_counts, cur_counts_per_sample):
+                    if hard_drop_indices and labels is not None:
+                        if labels_for_loss is labels:
+                            labels_for_loss = labels.clone()
+                        labels_for_loss[hard_drop_indices] = -100
+
+                    for sample_idx, (req, cur) in enumerate(zip(required_counts, cur_counts_per_sample)):
                         req = int(req)
                         cur = int(cur)
                         if req < 0 or cur < 0:
@@ -1493,7 +1658,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
                         cur_feat = audio_features_flat[offset : offset + cur]
                         offset += cur
-                        if req == cur:
+                        if sample_idx in hard_drop_index_set:
+                            pieces.append(audio_features_flat.new_zeros((req, embed_dim)))
+                        elif req == cur:
                             pieces.append(cur_feat)
                         elif req < cur:
                             pieces.append(cur_feat[:req])
@@ -1544,11 +1711,6 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                         torch.FloatTensor, inputs_embeds.masked_scatter(audio_mask, audio_features_aligned)
                     )
 
-        if feature_attention_mask is not None:
-            audio_feature_lengths = cast(torch.LongTensor, torch.sum(feature_attention_mask, dim=1))
-        else:
-            audio_feature_lengths = None
-
         if attention_mask is not None and position_ids is None:
             if (
                 cache_position is None
@@ -1587,10 +1749,13 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         logits = self.lm_head(hidden_states)
 
         loss = None
-        if labels is not None:
-            loss = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size
-            )
+        if labels_for_loss is not None:
+            if bool(labels_for_loss.ne(-100).any()):
+                loss = self.loss_function(
+                    logits=logits, labels=labels_for_loss, vocab_size=self.config.get_text_config().vocab_size
+                )
+            else:
+                loss = logits.sum() * 0.0
 
         return Qwen3ASRThinkerCausalLMOutputWithPast(
             loss=loss,
@@ -1609,6 +1774,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         inputs_embeds: Optional[torch.FloatTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         is_first_iteration: Optional[bool] = False,
+        audio_feature_lengths: Optional[torch.Tensor] = None,
+        qwen3_asr_audio_token_count: Optional[torch.Tensor] = None,
+        qwen3_asr_audios_per_sample: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         model_inputs = super().prepare_inputs_for_generation(
@@ -1618,6 +1786,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
             is_first_iteration=is_first_iteration,
+            audio_feature_lengths=audio_feature_lengths,
+            qwen3_asr_audio_token_count=qwen3_asr_audio_token_count,
+            qwen3_asr_audios_per_sample=qwen3_asr_audios_per_sample,
             **kwargs,
         )
 
@@ -1625,6 +1796,16 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
         if cache_position is not None and cache_position[0] != 0:
             model_inputs["input_features"] = None
+            model_inputs.pop("audio_feature_lengths", None)
+            model_inputs.pop("qwen3_asr_audio_token_count", None)
+            model_inputs.pop("qwen3_asr_audios_per_sample", None)
+        else:
+            if audio_feature_lengths is not None:
+                model_inputs["audio_feature_lengths"] = audio_feature_lengths
+            if qwen3_asr_audio_token_count is not None:
+                model_inputs["qwen3_asr_audio_token_count"] = qwen3_asr_audio_token_count
+            if qwen3_asr_audios_per_sample is not None:
+                model_inputs["qwen3_asr_audios_per_sample"] = qwen3_asr_audios_per_sample
 
         return model_inputs
 

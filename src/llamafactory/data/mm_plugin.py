@@ -2083,47 +2083,9 @@ class Qwen3ASRPlugin(BasePlugin):
 
             path = None
             duration_sec = None
-            has_offset = False
+            offset_sec = None
             if obj is not None:
-                path = obj.get("path") or obj.get("wav_path") or obj.get("audio_path")
-                has_offset = any(
-                    k in obj
-                    for k in (
-                        "offset_sec",
-                        "offset_secs",
-                        "offset_seconds",
-                        "offset",
-                        "start_sec",
-                        "start_secs",
-                        "start_seconds",
-                        "start_time",
-                        "start",
-                    )
-                )
-
-                for k in ("duration_sec", "duration_secs", "duration_seconds", "duration"):
-                    if k not in obj:
-                        continue
-                    try:
-                        d = float(obj.get(k))
-                        if math.isfinite(d) and d >= 0:
-                            duration_sec = d
-                            break
-                    except Exception:  # noqa: BLE001
-                        continue
-
-                if duration_sec is None:
-                    for k in ("duration_ms", "duration_msec"):
-                        if k not in obj:
-                            continue
-                        try:
-                            d_ms = float(obj.get(k))
-                            d = d_ms / 1000.0
-                            if math.isfinite(d) and d >= 0:
-                                duration_sec = d
-                                break
-                        except Exception:  # noqa: BLE001
-                            continue
+                path, _, offset_sec, duration_sec = self._extract_audio_json_fields(obj)
             else:
                 path = audio
 
@@ -2134,7 +2096,7 @@ class Qwen3ASRPlugin(BasePlugin):
                 return max(1, n_samples // int(hop_length))
 
             # Segment-based audio without explicit duration: do not probe file-level metadata.
-            if has_offset:
+            if offset_sec is not None:
                 return None
 
             if not isinstance(path, str) or path == "":
@@ -2176,6 +2138,187 @@ class Qwen3ASRPlugin(BasePlugin):
             return None
 
         return None
+
+    @staticmethod
+    def _parse_audio_json(audio: str) -> dict | None:
+        audio = audio.strip()
+        if not (audio.startswith("{") and audio.endswith("}")):
+            return None
+        try:
+            obj = json.loads(audio)
+            return obj if isinstance(obj, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _extract_audio_json_fields(audio_obj: dict[str, Any]) -> tuple[str | None, Any, float | None, float | None]:
+        path = audio_obj.get("path") or audio_obj.get("wav_path") or audio_obj.get("audio_path") or audio_obj.get("uri")
+        if isinstance(path, str) and path.startswith("file://"):
+            path = path[7:]
+
+        offset_sec = None
+        for k in (
+            "offset_sec",
+            "offset_secs",
+            "offset_seconds",
+            "offset",
+            "start_sec",
+            "start_secs",
+            "start_seconds",
+            "start_time",
+            "start",
+        ):
+            if k not in audio_obj:
+                continue
+            try:
+                offset = float(audio_obj.get(k))
+                if math.isfinite(offset) and offset >= 0:
+                    offset_sec = offset
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        duration_sec = None
+        for k in ("duration_sec", "duration_secs", "duration_seconds", "duration"):
+            if k not in audio_obj:
+                continue
+            try:
+                duration = float(audio_obj.get(k))
+                if math.isfinite(duration) and duration >= 0:
+                    duration_sec = duration
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        if duration_sec is None:
+            for k in ("duration_ms", "duration_msec"):
+                if k not in audio_obj:
+                    continue
+                try:
+                    duration_ms = float(audio_obj.get(k))
+                    duration = duration_ms / 1000.0
+                    if math.isfinite(duration) and duration >= 0:
+                        duration_sec = duration
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+        return (
+            path if isinstance(path, str) and path else None,
+            audio_obj.get("raw"),
+            offset_sec,
+            duration_sec,
+        )
+
+    @override
+    def _load_single_audio(self, audio: AudioInput, sampling_rate: float) -> tuple[NDArray, float]:
+        # Mirror FunAudioChat's JSON-aware audio transport so placeholder expansion and
+        # actual waveform loading interpret the same dataset field the same way.
+        offset_sec = None
+        duration_sec = None
+        if isinstance(audio, dict):
+            arr = audio.get("array")
+            if isinstance(arr, np.ndarray):
+                return arr, float(sampling_rate)
+
+            raw_bytes = audio.get("bytes")
+            if isinstance(raw_bytes, (bytes, bytearray)):
+                audio = BytesIO(bytes(raw_bytes))
+            else:
+                path, raw, offset_sec, duration_sec = self._extract_audio_json_fields(audio)
+                if isinstance(path, (str, os.PathLike)) and os.fspath(path):
+                    audio = os.fsdecode(path)
+                else:
+                    if raw is not None:
+                        audio = raw
+
+        if isinstance(audio, str):
+            obj = self._parse_audio_json(audio)
+            if obj is not None:
+                path, raw, offset_sec, duration_sec = self._extract_audio_json_fields(obj)
+                if isinstance(path, str) and path:
+                    audio = path
+                else:
+                    if raw is not None:
+                        audio = raw
+
+        if offset_sec is not None or duration_sec is not None:
+            if isinstance(audio, (str, os.PathLike)):
+                path = os.fsdecode(audio)
+                if path.lower().endswith(".wav") and not path.startswith(("s3://", "tos://")):
+                    import wave
+
+                    try:
+                        with wave.open(path, "rb") as wf:
+                            sr = int(wf.getframerate())
+                            nch = int(wf.getnchannels())
+                            sampwidth = int(wf.getsampwidth())
+                            total_frames = int(wf.getnframes())
+
+                            start_frame = max(0, int(round(float(offset_sec or 0.0) * float(sr))))
+                            if duration_sec is None:
+                                num_frames = max(0, total_frames - start_frame)
+                            else:
+                                num_frames = max(0, int(round(float(duration_sec) * float(sr))))
+
+                            if start_frame >= total_frames or num_frames <= 0:
+                                return np.zeros(0, dtype=np.float32), float(sampling_rate)
+
+                            wf.setpos(min(start_frame, total_frames))
+                            raw_frames = wf.readframes(min(num_frames, max(0, total_frames - start_frame)))
+
+                        if sampwidth == 1:
+                            samples = np.frombuffer(raw_frames, dtype=np.uint8).astype(np.float32)
+                            samples = (samples - 128.0) / 128.0
+                        elif sampwidth == 2:
+                            samples = np.frombuffer(raw_frames, dtype=np.int16).astype(np.float32)
+                            samples = samples / float(1 << 15)
+                        elif sampwidth == 3:
+                            u8 = np.frombuffer(raw_frames, dtype=np.uint8)
+                            if len(u8) % 3 != 0:
+                                u8 = u8[: len(u8) - (len(u8) % 3)]
+                            u8 = u8.reshape(-1, 3)
+                            vals = (
+                                (u8[:, 0].astype(np.int32))
+                                | (u8[:, 1].astype(np.int32) << 8)
+                                | (u8[:, 2].astype(np.int32) << 16)
+                            )
+                            sign = vals & 0x800000
+                            vals = vals - (sign << 1)
+                            samples = vals.astype(np.float32) / float(1 << 23)
+                        elif sampwidth == 4:
+                            samples = np.frombuffer(raw_frames, dtype=np.int32).astype(np.float32)
+                            samples = samples / float(1 << 31)
+                        else:
+                            raise ValueError(f"Unsupported WAV sample width: {sampwidth}")
+
+                        if nch > 1:
+                            samples = samples.reshape(-1, nch).mean(axis=1).astype(np.float32)
+                        else:
+                            samples = samples.astype(np.float32)
+
+                        target_sr = int(sampling_rate) if sampling_rate is not None else sr
+                        if int(sr) != int(target_sr):
+                            if librosa is None:
+                                raise ImportError("Resampling requires `librosa`.")
+                            samples = librosa.resample(samples, orig_sr=int(sr), target_sr=int(target_sr)).astype(
+                                np.float32
+                            )
+                            sr = target_sr
+
+                        return samples, float(sr)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            waveform, sr = super()._load_single_audio(audio, sampling_rate)
+            sample_rate = float(sr)
+            start = max(0, int(round(float(offset_sec or 0.0) * sample_rate)))
+            end = waveform.shape[0]
+            if duration_sec is not None:
+                end = max(start, start + int(round(float(duration_sec) * sample_rate)))
+            return waveform[start:end].astype(np.float32, copy=False), float(sr)
+
+        return super()._load_single_audio(audio, sampling_rate)
 
     @override
     def process_messages(

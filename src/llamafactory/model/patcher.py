@@ -149,6 +149,7 @@ def patch_qwen3_asr_forward(model: "PreTrainedModel") -> None:
         attention_mask=None,
         input_features=None,
         feature_attention_mask=None,
+        audio_feature_lengths=None,
         labels=None,
         **kwargs,
     ):
@@ -157,6 +158,7 @@ def patch_qwen3_asr_forward(model: "PreTrainedModel") -> None:
             attention_mask=attention_mask,
             input_features=input_features,
             feature_attention_mask=feature_attention_mask,
+            audio_feature_lengths=audio_feature_lengths,
             labels=labels,
             **kwargs,
         )

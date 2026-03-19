@@ -686,16 +686,64 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             perf_batch["perf_dl_collate_ms"] = (time.perf_counter() - t_collate0) * 1000.0
             perf_batch["perf_dl_collate_n"] = 1
 
-        # Qwen3-ASR: provide the per-sample count of `<|audio_pad|>` tokens as python ints so the model can
-        # safely pad audio features when audio token expansion length mismatches (e.g. due to audio decoding differences).
-        if self.model is not None and getattr(self.model.config, "model_type", None) == "qwen3_asr":
+        # Qwen3-ASR: keep alignment metadata as tensors so Accelerate can concatenate microbatches.
+        # Keep packed Qwen3-ASR audio transport trainer-safe: Accelerate may slice top-level tensors using the text
+        # batch size, so reshape audio-major features into a sample-major container before returning the batch.
+        model_type = getattr(getattr(self.model, "config", None), "model_type", None)
+        plugin_name = type(getattr(self.template, "mm_plugin", None)).__name__
+        is_qwen3_asr = (isinstance(model_type, str) and model_type.startswith("qwen3_asr")) or (
+            plugin_name == "Qwen3ASRPlugin"
+        )
+        if is_qwen3_asr:
+            if (
+                torch.is_tensor(features.get("input_features"))
+                and torch.is_tensor(features.get("feature_attention_mask"))
+                and features["input_features"].ndim == 3
+                and features["feature_attention_mask"].ndim == 2
+                and features["input_features"].shape[0] == int(sum(batch_audlens))
+                and len(batch_audlens) > 0
+            ):
+                flat_input_features = features["input_features"]
+                flat_feature_attention_mask = features["feature_attention_mask"]
+                batch_size = len(batch_audlens)
+                max_audios_per_sample = max(int(x) for x in batch_audlens)
+                _, num_mel_bins, max_feature_len = flat_input_features.shape
+                packed_input_features = flat_input_features.new_zeros(
+                    (batch_size, max_audios_per_sample, num_mel_bins, max_feature_len)
+                )
+                packed_feature_attention_mask = flat_feature_attention_mask.new_zeros(
+                    (batch_size, max_audios_per_sample, max_feature_len)
+                )
+
+                offset = 0
+                for i, audlen in enumerate(batch_audlens):
+                    audlen = int(audlen)
+                    if audlen <= 0:
+                        continue
+
+                    next_offset = offset + audlen
+                    packed_input_features[i, :audlen] = flat_input_features[offset:next_offset]
+                    packed_feature_attention_mask[i, :audlen] = flat_feature_attention_mask[offset:next_offset]
+                    offset = next_offset
+
+                if offset != int(flat_input_features.shape[0]):
+                    raise ValueError(
+                        "Qwen3-ASR packed audio collation produced inconsistent audio grouping: "
+                        f"consumed={offset}, total={int(flat_input_features.shape[0])}, "
+                        f"batch_audlens={batch_audlens!r}"
+                    )
+
+                features["input_features"] = packed_input_features
+                features["feature_attention_mask"] = packed_feature_attention_mask
+
+            features["qwen3_asr_audios_per_sample"] = torch.tensor(batch_audlens, dtype=torch.long, device="cpu")
             audio_token = getattr(self.template.mm_plugin, "audio_token", None)
             if isinstance(audio_token, str) and audio_token:
                 try:
                     audio_token_id = self.tokenizer.convert_tokens_to_ids(audio_token)
                     if audio_token_id is not None and torch.is_tensor(features.get("input_ids")):
-                        counts = (features["input_ids"] == int(audio_token_id)).sum(dim=-1).to("cpu").tolist()
-                        features["qwen3_asr_audio_token_count"] = [int(x) for x in counts]
+                        counts = (features["input_ids"] == int(audio_token_id)).sum(dim=-1).to(dtype=torch.long, device="cpu")
+                        features["qwen3_asr_audio_token_count"] = counts
                 except Exception:  # noqa: BLE001
                     pass
 
