@@ -16,7 +16,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -28,6 +27,7 @@ from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
 from ...extras.misc import numpify
 from ...extras.packages import is_jieba_available, is_jiwer_available, is_rouge_available
+from ..metric_utils import compute_error_rate, has_cjk, normalize_text
 
 
 if TYPE_CHECKING:
@@ -308,7 +308,7 @@ class ComputeSimilarity:
                 self._printed_examples = True
 
         for pred, label in zip(decoded_preds, decoded_labels):
-            if is_jieba_available() and (_has_cjk(pred) or _has_cjk(label)):
+            if is_jieba_available() and (has_cjk(pred) or has_cjk(label)):
                 hypothesis = [t for t in jieba.cut(pred) if t.strip()]
                 reference = [t for t in jieba.cut(label) if t.strip()]
             else:
@@ -329,10 +329,10 @@ class ComputeSimilarity:
             self.score_dict["bleu-4"].append(round(bleu_score * 100, 4))
 
             if self.compute_wer_cer:
-                pred_norm = _normalize_text(pred)
-                label_norm = _normalize_text(label)
+                pred_norm = normalize_text(pred)
+                label_norm = normalize_text(label)
 
-                if is_jieba_available() and (_has_cjk(pred_norm) or _has_cjk(label_norm)):
+                if is_jieba_available() and (has_cjk(pred_norm) or has_cjk(label_norm)):
                     hypothesis_wer = [t for t in jieba.cut(pred_norm) if t.strip()]
                     reference_wer = [t for t in jieba.cut(label_norm) if t.strip()]
                 else:
@@ -344,58 +344,12 @@ class ComputeSimilarity:
                     cer = jiwer.cer(" ".join(list(label_norm)), " ".join(list(pred_norm)))
                 else:
                     # Word Error Rate (WER) based on segmented tokens
-                    wer = _compute_error_rate(reference_wer, hypothesis_wer)
+                    wer = compute_error_rate(reference_wer, hypothesis_wer)
                     # Character Error Rate (CER) based on raw characters
-                    cer = _compute_error_rate(list(label_norm), list(pred_norm))
+                    cer = compute_error_rate(list(label_norm), list(pred_norm))
 
                 self.score_dict["wer"].append(round(wer * 100, 4))
                 self.score_dict["cer"].append(round(cer * 100, 4))
 
         if compute_result:
             return self._dump()
-
-
-def _compute_error_rate(reference: list[str], hypothesis: list[str]) -> float:
-    r"""Compute normalized edit distance for sequences (WER/CER helper).
-
-    When reference is empty, return 0.0 if hypothesis is also empty, otherwise 1.0.
-    """
-    ref_len = len(reference)
-    hyp_len = len(hypothesis)
-
-    if ref_len == 0:
-        return 0.0 if hyp_len == 0 else 1.0
-
-    # Standard Levenshtein distance
-    dp = [[0] * (hyp_len + 1) for _ in range(ref_len + 1)]
-    for i in range(ref_len + 1):
-        dp[i][0] = i
-    for j in range(hyp_len + 1):
-        dp[0][j] = j
-
-    for i in range(1, ref_len + 1):
-        for j in range(1, hyp_len + 1):
-            cost = 0 if reference[i - 1] == hypothesis[j - 1] else 1
-            dp[i][j] = min(
-                dp[i - 1][j] + 1,  # deletion
-                dp[i][j - 1] + 1,  # insertion
-                dp[i - 1][j - 1] + cost,  # substitution
-            )
-
-    return float(dp[ref_len][hyp_len]) / float(ref_len)
-
-
-def _has_cjk(text: str) -> bool:
-    for char in text:
-        if "\u4e00" <= char <= "\u9fff":
-            return True
-    return False
-
-
-def _normalize_text(text: str) -> str:
-    regex = r"(?<!\d)[.,;:'\"?!](?!\d)"
-    text = re.sub(regex, "", text)
-    text = text.lower()
-    # text = text.translate(str.maketrans("", "", string.punctuation))
-    text = re.sub(r"\s+", " ", text).strip()
-    return text

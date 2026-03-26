@@ -41,6 +41,146 @@
 
 参见 `examples/funaudiochat/funaudiochat_s2t_sft_full.yaml`。
 
+## 第二阶段 GRPO 强化 ASR
+
+如果你要在一阶段 SFT checkpoint 的基础上继续做二阶段 GRPO，增强 ASR 转写能力，可参考
+`examples/funaudiochat/funaudiochat_grpo_asr_lora.yaml`。
+
+如果你要直接参考当前这条已经跑通的 **full-LLM FunAudioChat + GRPO** 配置，优先看：
+
+- `examples/funaudiochat/funaudiochat_hausa_grpo_asr_full_llm_4gpu_tp2_stable.yaml`
+- `examples/funaudiochat/GRPO_REFERENCE_EXAMPLE.md`
+
+这套参考配置是在分支 `feature/funaudiochat-grpo-asr` 上稳定下来的，对应第一条成功完整跑完的
+`TP=2` colocated vLLM Hausa full-parameter GRPO 实验。
+同一份参考文档里也补充记录了这次分支的核心改动，以及之前 rollout hang 的定位和修复路径。
+
+### 推荐 setting（当前参考）
+
+当前这条已经验证过的 FunAudioChat GRPO 路径，建议从下面这套设置开始：
+
+- 直接以 `examples/funaudiochat/funaudiochat_hausa_grpo_asr_full_llm_4gpu_tp2_stable.yaml` 为起点
+- 保持 `packing: false`
+- 保持 `dynamic_prompt_sampling: true`
+- 全参 LLM 路径建议：
+  - `finetuning_type: full`
+  - `funaudiochat_freeze_audio_tower: true`
+  - `freeze_multi_modal_projector: true`
+- rollout 建议：
+  - `grpo_use_vllm: true`
+  - `grpo_vllm_mode: colocate`
+  - `grpo_vllm_tensor_parallel_size: 2`
+  - `grpo_vllm_gpu_memory_utilization: 0.16`
+  - `grpo_vllm_enable_sleep_mode: false`
+  - `grpo_allow_experimental_funaudiochat_colocate_tp: true`
+- GRPO 起始参数建议：
+  - `grpo_num_generations: 8`
+  - `grpo_generation_batch_size: 8`
+  - `grpo_loss_type: dapo`
+  - `grpo_scale_rewards: group`
+  - `grpo_beta: 0.0`
+  - `grpo_temperature: 1.0`
+  - `grpo_top_p: 0.95`
+- 训练起始参数建议：
+  - `per_device_train_batch_size: 1`
+  - `gradient_accumulation_steps: 8`
+  - `learning_rate: 1e-6`
+  - `warmup_ratio: 0.02`
+  - `lr_scheduler_type: cosine`
+
+### 参考 bench（Hausa full-LLM GRPO）
+
+参考实验：
+
+- 训练配置：`/data2/mayufeng/saves/funaudiochat/grpo_asr_hausa_full_llm_4gpu_tp2_formal10k_20260311/train_config.yaml`
+- 最终模型：`/data2/mayufeng/saves/funaudiochat/grpo_asr_hausa_full_llm_4gpu_tp2_formal10k_20260311`
+- 4 卡训练总时长：约 `1 day 4:24:21`
+- 稳定阶段训练吞吐：约 `380~407 tok/s`
+
+评测使用本地 OpenAI-compatible 端口 `30005`，并采用与训练对齐的 `subprompt1` 提示格式。
+
+| 数据集 | pre-GRPO WER | GRPO WER | Δ WER | pre-GRPO WERE | GRPO WERE | Δ WERE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| youtube | 28.6652% | 22.2054% | -6.4598 | 21.7512% | 15.4933% | -6.2579 |
+| fleurs | 23.4294% | 22.4374% | -0.9920 | 19.0647% | 18.3940% | -0.6708 |
+| haiwa | 20.8659% | 18.4142% | -2.4517 | 16.3798% | 14.2410% | -2.1388 |
+| return_data | 32.8937% | 29.2270% | -3.6668 | 24.5470% | 20.6015% | -3.9455 |
+| 加权平均 | 28.9074% | 25.7980% | -3.1094 | 22.1333% | 19.0125% | -3.1208 |
+
+当前约束如下：
+
+- 仅支持 `template: funaudiochat`
+- 必须保持 `packing: false`，因为 prompt 分组 + rollout 采样与 SFT 的 packed batch 不兼容
+- reward 目前是纯文本规则奖励：归一化 WER/CER + 空输出惩罚 + 重复惩罚
+- 推荐起点是 LLM 上做 LoRA，同时全参训练 `multi_modal_projector`，并保持
+  `funaudiochat_freeze_audio_tower: true`
+- 也支持 full-parameter LLM GRPO；如果只想放开语言模型，通常保持
+  `funaudiochat_freeze_audio_tower: true` 且 `freeze_multi_modal_projector: true`
+- `full + colocate vLLM + grpo_vllm_tensor_parallel_size > 1` 仍然是实验路径，默认会 fail-fast；
+  只有显式设置 `grpo_allow_experimental_funaudiochat_colocate_tp: true` 才允许启动
+
+### vLLM rollout engine
+
+FunAudioChat GRPO 可以直接复用已有的 FunAudioChat 版 vLLM rollout 路径，但目前只支持 colocate：
+
+- 设置 `grpo_use_vllm: true`
+- 设置 `grpo_vllm_mode: colocate`
+- 在训练环境里安装支持 FunAudioChat 的 vLLM，例如 `pip install -e /path/to/vllm`
+
+这里没有启用 TRL 的 server 模式，因为 stock TRL 的 vLLM server client 仍然偏 image-only，
+不会正确透传 FunAudioChat 的音频多模态载荷。另外，stock TRL server 模式还依赖
+`/init_communicator`、`/update_named_param` 这类权重同步端点；普通 OpenAI 兼容 vLLM server
+并不能直接用于在线 GRPO policy 更新。
+
+### FunAudioChat 音频 batching 保护开关
+
+本地 vLLM rollout 现在提供 `VLLM_FUNAUDIOCHAT_AUDIO_BATCH_MODE`：
+
+- `auto`（默认）：当 FunAudioChat 音频输入且 `tensor_parallel_size > 1` 时，自动切到 audio MM encoder microbatch
+- `microbatch`：强制把 audio MM encoder batch 拆成单条执行
+- `batch`：强制走原始 batched audio MM encoder 路径
+
+正常训练建议直接用默认的 `auto`。只有在你需要**刻意复现**旧的 `audio batch>1` 挂死问题时，才手动切到
+`batch`。如果要在 LLaMA-Factory 之外直接做最小复现，可用：
+
+```bash
+python ~/projects/vllm/examples/offline_inference/funaudiochat_audio_batch_repro.py \
+  --model /path/to/Fun-Audio-Chat-8B \
+  --audio /path/to/a.wav /path/to/b.wav \
+  --tensor-parallel-size 2 \
+  --batch-mode batch \
+  --debug
+```
+
+如果你要复现后续那个 `vLLM.generate()` 挂住问题、并且**不走 GRPO trainer**，可直接用：
+
+```bash
+python scripts/repro_funaudiochat_vllm_generate.py \
+  --model /path/to/Fun-Audio-Chat-8B \
+  --dataset funaudiochat_asr_hausa_youtube_test_norm_text_promptpool \
+  --dataset-dir /data2/mayufeng/manifests/llama_data \
+  --tensor-parallel-size 2 \
+  --input-mode audio \
+  --batch-mode auto
+```
+
+### Full-parameter LLM GRPO
+
+参考 `examples/funaudiochat/funaudiochat_grpo_asr_full_llm.yaml`。
+
+如果你想直接复用这次 Hausa 成功实验的参数，不要优先用早期 bring-up YAML，而是使用
+`examples/funaudiochat/funaudiochat_hausa_grpo_asr_full_llm_4gpu_tp2_stable.yaml`。
+
+实践建议：
+
+- 使用 `deepspeed: examples/deepspeed/ds_z3_config.json`
+- 在 colocate vLLM 下，优先从 `grpo_beta: 0.0` 开始；否则会额外实例化一份 reference model，显存压力会明显上升
+- 保持 `funaudiochat_freeze_audio_tower: true`
+- 如果只想放开 LLM，保持 `freeze_multi_modal_projector: true`
+- 后续如果补上带在线权重同步的 rollout server，再考虑 server-mode 的 full-parameter GRPO
+- 如果仍要在 colocate 下使用 `grpo_vllm_tensor_parallel_size > 1`，必须同时设置
+  `grpo_allow_experimental_funaudiochat_colocate_tp: true`；这条路径目前只建议用于定位问题，不建议当稳定训练配置
+
 ## 批量评测（prompt_pool + normalized WER/WERE）
 
 如果你的评测数据使用了 `prompt_pool`（例如 `*_norm_text_promptpool_*`），并且希望评测时带上

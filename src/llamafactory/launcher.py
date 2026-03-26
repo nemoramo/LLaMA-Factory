@@ -19,6 +19,31 @@ import sys
 from copy import deepcopy
 
 
+def _register_usr1_faulthandler() -> None:
+    if str(os.getenv("LLAMAFACTORY_ENABLE_USR1_FAULTHANDLER", "0")).lower() not in {"1", "true", "yes", "on"}:
+        return
+    if not hasattr(signal, "SIGUSR1"):
+        return
+
+    try:
+        import faulthandler
+    except Exception:
+        return
+
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    except Exception:
+        pass
+
+    try:
+        faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=False)
+    except Exception:
+        pass
+
+
+_register_usr1_faulthandler()
+
+
 USAGE = (
     "-" * 70
     + "\n"
@@ -57,6 +82,25 @@ def launch():
     command = sys.argv.pop(1) if len(sys.argv) > 1 else "help"
     if is_env_enabled("USE_MCA"):  # force use torchrun
         os.environ["FORCE_TORCHRUN"] = "1"
+
+    def _train_uses_grpo_vllm(argv: list[str]) -> bool:
+        for arg in argv:
+            if arg.startswith("-"):
+                continue
+            if not os.path.isfile(arg):
+                continue
+            if not arg.lower().endswith((".yaml", ".yml", ".json")):
+                continue
+            try:
+                with open(arg, encoding="utf-8") as fp:
+                    text = fp.read().lower()
+            except Exception:
+                continue
+            if ("stage: grpo" in text or 'stage: "grpo"' in text or "stage: 'grpo'" in text) and (
+                "grpo_use_vllm: true" in text or "use_vllm: true" in text
+            ):
+                return True
+        return False
 
     def _kill_process_tree(process: subprocess.Popen, *, timeout: float = 30.0) -> None:
         """Best-effort terminate a process *and* its children (torchrun/DDP workers)."""
@@ -153,7 +197,13 @@ def launch():
         max_nnodes = os.getenv("MAX_NNODES")
 
         env = deepcopy(os.environ)
-        if is_env_enabled("OPTIM_TORCH", "1"):
+        disable_expandable_segments = is_env_enabled("DISABLE_EXPANDABLE_SEGMENTS") or (
+            command == "train" and _train_uses_grpo_vllm(sys.argv)
+        )
+        if disable_expandable_segments:
+            env.pop("PYTORCH_ALLOC_CONF", None)
+            env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        if is_env_enabled("OPTIM_TORCH", "1") and not disable_expandable_segments:
             # optimize DDP, see https://zhuanlan.zhihu.com/p/671834539
             env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
             env["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"

@@ -64,7 +64,7 @@ def launch():
         max_nnodes = os.getenv("MAX_NNODES")
 
         env = deepcopy(os.environ)
-        if is_env_enabled("OPTIM_TORCH", "1"):
+        if is_env_enabled("OPTIM_TORCH", "1") and not is_env_enabled("DISABLE_EXPANDABLE_SEGMENTS"):
             # optimize DDP, see https://zhuanlan.zhihu.com/p/671834539
             env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
             env["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"

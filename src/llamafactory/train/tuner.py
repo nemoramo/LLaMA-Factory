@@ -248,6 +248,10 @@ def _training_function(config: dict[str, Any]) -> None:
         from .kto import run_kto
 
         run_kto(model_args, data_args, training_args, finetuning_args, callbacks)
+    elif finetuning_args.stage == "grpo":
+        from .grpo import run_grpo
+
+        run_grpo(model_args, data_args, training_args, finetuning_args, callbacks)
     else:
         raise ValueError(f"Unknown task: {finetuning_args.stage}.")
 

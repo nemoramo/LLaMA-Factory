@@ -22,6 +22,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForSeq2SeqLM,
+    AutoModelForVision2Seq,
     AutoModelForTextToWaveform,
     AutoProcessor,
     AutoTokenizer,

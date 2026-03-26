@@ -301,12 +301,14 @@ def patch_config(
     # deepspeed zero3 is not compatible with low_cpu_mem_usage
     init_kwargs["low_cpu_mem_usage"] = model_args.low_cpu_mem_usage and (not is_deepspeed_zero3_enabled())
 
-    # Pass `torch_dtype` to `from_pretrained` when a reduced precision is requested.
+    # Pass reduced precision to `from_pretrained` when requested.
     #
-    # Note: The previous behavior skipped setting `torch_dtype` under DeepSpeed ZeRO-3 (without QLoRA),
-    # which can leave the model in fp32 and significantly increase VRAM usage.
+    # On newer transformers versions, `dtype` is the preferred argument and some models
+    # may ignore `torch_dtype` while falling back to the dtype encoded in config.json.
+    # Setting both keeps older codepaths working and avoids fp32 instantiation in inference.
     if model_args.compute_dtype != torch.float32:
         init_kwargs["torch_dtype"] = model_args.compute_dtype
+        init_kwargs["dtype"] = model_args.compute_dtype
 
     # fsdp/deepspeed zero3 does not need device map
     if not (is_deepspeed_zero3_enabled() or is_fsdp_enabled()) and init_kwargs["low_cpu_mem_usage"]:
